@@ -21,6 +21,7 @@ pub mod parse;
 pub(crate) mod context;
 pub(crate) mod fill_tracker;
 pub(crate) mod pending;
+pub(crate) mod position_operations;
 pub(crate) mod reconciliation;
 pub(crate) mod settlement;
 pub(crate) mod submitter;
@@ -45,12 +46,14 @@ use nautilus_common::{
     messages::execution::{
         BatchCancelOrders, CancelAllOrders, CancelOrder, GenerateFillReports,
         GenerateOrderStatusReport, GenerateOrderStatusReports, GeneratePositionStatusReports,
-        ModifyOrder, QueryAccount, QueryOrder, SubmitOrder, SubmitOrderList,
+        ModifyOrder, PositionOperationResult, PositionOperationStartupRecovery,
+        PositionOperationStatus, QueryAccount, QueryOrder, QueryPositionOperation, SubmitOrder,
+        SubmitOrderList, SubmitPositionOperation,
     },
     msgbus::TypedHandler,
 };
 use nautilus_core::{
-    Params, UnixNanos,
+    Params, UUID4, UnixNanos,
     collections::AtomicMap,
     time::{AtomicTime, get_atomic_clock_realtime},
 };
@@ -62,8 +65,9 @@ use nautilus_model::{
     identifiers::{
         AccountId, ClientId, ClientOrderId, InstrumentId, StrategyId, Venue, VenueOrderId,
     },
-    instruments::InstrumentAny,
+    instruments::{Instrument, InstrumentAny},
     orders::{Order, OrderAny},
+    position_operation::PositionOperationLeg,
     reports::{ExecutionMassStatus, FillReport, OrderStatusReport, PositionStatusReport},
     types::{AccountBalance, MarginBalance, Money, Price, Quantity},
 };
@@ -79,13 +83,25 @@ use self::{
     fill_tracker::OrderFillTrackerMap,
     order_builder::PolymarketOrderBuilder,
     pending::{PendingCancelTracker, PendingSubmitTracker},
+    position_operations::{
+        CorePositionOperationRecordGate, CorePositionOperationStore,
+        core_position_operation_recorder,
+    },
     settlement::SettlementRegistry,
     submitter::OrderSubmitter,
 };
 use crate::{
-    common::{consts::POLYMARKET_VENUE, credential::Secrets, enums::PolymarketSignatureType},
+    common::{
+        consts::POLYMARKET_VENUE,
+        credential::{RelayerApiKey, Secrets},
+        enums::PolymarketSignatureType,
+    },
     config::PolymarketExecutionClientConfig,
-    http::{clob::PolymarketClobHttpClient, data_api::PolymarketDataApiHttpClient},
+    http::{
+        clob::PolymarketClobHttpClient,
+        data_api::PolymarketDataApiHttpClient,
+        query::{AssetType, GetBalanceAllowanceParams},
+    },
     signing::eip712::{OrderSigner, parse_address},
     websocket::{
         USER_STREAMS_ENDPOINT, client::PolymarketWebSocketClient, dispatch::WsDispatchState,
@@ -124,6 +140,8 @@ pub struct PolymarketExecutionClient {
     fill_tracker: Arc<OrderFillTrackerMap>,
     settlement: Arc<SettlementRegistry>,
     ws_dispatch_state: Arc<Mutex<WsDispatchState>>,
+    position_client: Option<Arc<crate::positions::PolymarketPositionClient>>,
+    startup_recovery: Vec<PositionOperationStartupRecovery>,
 }
 
 impl PolymarketExecutionClient {
@@ -198,6 +216,58 @@ impl PolymarketExecutionClient {
 
         let settlement = Arc::new(SettlementRegistry::new(core.account_id));
 
+        let clock = get_atomic_clock_realtime();
+        let pusd = get_pusd_currency();
+        let emitter = ExecutionEventEmitter::new(
+            clock,
+            core.trader_id,
+            core.account_id,
+            AccountType::Cash,
+            Some(pusd),
+        );
+
+        let (relayer_key_var, _) = crate::common::credential::relayer_credential_env_vars();
+        let position_operations_enabled = config.relayer_api_key.is_some()
+            || config.relayer_api_key_address.is_some()
+            || std::env::var_os(relayer_key_var).is_some();
+
+        let position_client = if position_operations_enabled {
+            let relayer_key = RelayerApiKey::resolve(
+                config.relayer_api_key.clone(),
+                config.relayer_api_key_address.clone(),
+            )
+            .map_err(|e| anyhow::anyhow!("{e}"))
+            .context("failed to resolve Relayer API key for position operations")?;
+            let funder = secrets.funder.clone().ok_or_else(|| {
+                anyhow::anyhow!("managed position operations require a Deposit Wallet funder")
+            })?;
+            let mut client = crate::positions::PolymarketPositionClient::new(
+                &secrets.private_key,
+                &funder,
+                relayer_key,
+                config.base_url_relayer.clone(),
+                config.base_url_http.clone(),
+                Some(config.http_timeout_secs),
+                proxy_url.clone(),
+            )
+            .map_err(|e| anyhow::anyhow!("{e}"))
+            .context("failed to create position operation client")?;
+            if let Some(rpc_url) = &config.base_url_rpc {
+                client = client.with_rpc_url(rpc_url.clone());
+            }
+            let record_store = Arc::new(CorePositionOperationStore::new(emitter.clone()));
+            Some(Arc::new(
+                client
+                    .with_record_gate(Arc::new(CorePositionOperationRecordGate {
+                        emitter: emitter.clone(),
+                    }))
+                    .with_recorder(core_position_operation_recorder(record_store.clone()))
+                    .with_record_store(record_store),
+            ))
+        } else {
+            None
+        };
+
         let submitter = OrderSubmitter::new(
             http_client.clone(),
             order_builder,
@@ -217,16 +287,6 @@ impl PolymarketExecutionClient {
             Some(*POLYMARKET_VENUE),
             USER_STREAMS_ENDPOINT,
         ));
-
-        let clock = get_atomic_clock_realtime();
-        let pusd = get_pusd_currency();
-        let emitter = ExecutionEventEmitter::new(
-            clock,
-            core.trader_id,
-            core.account_id,
-            AccountType::Cash,
-            Some(pusd),
-        );
 
         let session_tasks = TaskGroup::new();
         let pending_tasks = TaskGroup::new();
@@ -261,7 +321,77 @@ impl PolymarketExecutionClient {
             fill_tracker: Arc::new(OrderFillTrackerMap::new()),
             settlement,
             ws_dispatch_state: Arc::new(Mutex::new(WsDispatchState::default())),
+            position_client,
+            startup_recovery: Vec::new(),
         })
+    }
+
+    fn refresh_position_operation_balances(&self, legs: &[PositionOperationLeg]) {
+        let mut instruments = legs.iter().map(|leg| leg.instrument_id).collect::<Vec<_>>();
+        instruments.sort();
+        instruments.dedup();
+
+        let mut requests = vec![GetBalanceAllowanceParams {
+            asset_type: Some(AssetType::Collateral),
+            token_id: None,
+            signature_type: Some(self.config.signature_type),
+        }];
+        {
+            let cache = self.core.cache();
+            for instrument_id in instruments {
+                let Some(instrument) = cache.instrument(&instrument_id) else {
+                    continue;
+                };
+                let Some(info) = instrument.info() else {
+                    continue;
+                };
+                let Some(token_id) = info.get_str("token_id") else {
+                    continue;
+                };
+                let asset_type = if info.get_str(crate::common::consts::MARKET_VERSION_KEY)
+                    == Some(crate::common::consts::MARKET_VERSION_V2)
+                {
+                    AssetType::ConditionalV2
+                } else {
+                    AssetType::Conditional
+                };
+                requests.push(GetBalanceAllowanceParams {
+                    asset_type: Some(asset_type),
+                    token_id: Some(token_id.to_string()),
+                    signature_type: Some(self.config.signature_type),
+                });
+            }
+        }
+
+        let http_client = self.http_client.clone();
+        let emitter = self.emitter.clone();
+        let clock = self.clock;
+        let signature_type = self.config.signature_type;
+        let collateral_locks = self.collateral_locks.clone();
+        let settlement = self.settlement.clone();
+
+        if let Err(e) = self.pending_tasks.spawn(async move {
+            for request in requests {
+                if let Err(e) = http_client.update_balance_allowance(request).await {
+                    log::warn!("Failed to refresh position operation balance cache: {e}");
+                }
+            }
+
+            if let Err(e) = reports::fetch_and_emit_account_state(
+                &http_client,
+                &emitter,
+                clock,
+                signature_type,
+                &collateral_locks,
+                &settlement,
+            )
+            .await
+            {
+                log::warn!("Failed to refresh position operation account state: {e}");
+            }
+        }) {
+            log::error!("Failed to spawn position operation balance refresh: {e}");
+        }
     }
 
     fn check_not_faulted(&self) -> anyhow::Result<()> {
@@ -371,6 +501,7 @@ impl ExecutionClient for PolymarketExecutionClient {
     }
 
     fn start(&mut self) -> anyhow::Result<()> {
+        self.restore_position_operations()?;
         self.start_client();
         Ok(())
     }
@@ -394,6 +525,144 @@ impl ExecutionClient for PolymarketExecutionClient {
         self.settlement.ensure_submission_allowed()?;
         self.submit_order_list_command(&cmd);
         Ok(())
+    }
+
+    fn submit_position_operation(&self, cmd: SubmitPositionOperation) -> anyhow::Result<()> {
+        self.check_not_faulted()?;
+        self.submit_position_operation_command(&cmd)
+    }
+
+    fn query_position_operation(&self, cmd: QueryPositionOperation) -> anyhow::Result<()> {
+        let Some(position_client) = &self.position_client else {
+            anyhow::bail!("managed position operations are not configured");
+        };
+        let record = position_client
+            .position_operation_record(&cmd.operation_id)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "no known record for position operation {}",
+                    cmd.operation_id
+                )
+            })?;
+
+        let status = match record.application_status {
+            crate::positions::record::PositionOperationApplicationStatus::Applied => {
+                PositionOperationStatus::Applied
+            }
+            _ => match record.venue_status {
+                crate::positions::record::PositionOperationVenueStatus::Prepared
+                | crate::positions::record::PositionOperationVenueStatus::Submitted => {
+                    PositionOperationStatus::Submitted
+                }
+                crate::positions::record::PositionOperationVenueStatus::Confirmed => {
+                    PositionOperationStatus::Confirmed
+                }
+                crate::positions::record::PositionOperationVenueStatus::Failed
+                | crate::positions::record::PositionOperationVenueStatus::Invalid => {
+                    PositionOperationStatus::Failed
+                }
+                crate::positions::record::PositionOperationVenueStatus::Unknown => {
+                    PositionOperationStatus::Unknown
+                }
+            },
+        };
+
+        let ts = self.clock.get_time_ns();
+        self.emitter
+            .send_position_operation_result(PositionOperationResult::new(
+                cmd.trader_id,
+                cmd.strategy_id,
+                self.core.client_id,
+                self.core.account_id,
+                cmd.operation_id,
+                record.operation,
+                status,
+                record.instrument_ids,
+                record.venue_transaction_id,
+                record.transaction_hash,
+                record.message,
+                None,
+                UUID4::new(),
+                ts,
+                ts,
+            ));
+        Ok(())
+    }
+
+    fn on_position_operation_applied(
+        &self,
+        operation_id: UUID4,
+        legs: &[PositionOperationLeg],
+        transaction_hash: Option<&str>,
+    ) {
+        if let Some(position_client) = &self.position_client {
+            position_client.record_operation_applied(operation_id, legs, transaction_hash);
+        }
+        self.refresh_position_operation_balances(legs);
+    }
+
+    async fn prepare_startup_recovery(&mut self) -> anyhow::Result<()> {
+        self.prepare_startup_recovery_inner().await?;
+        Ok(())
+    }
+
+    fn take_startup_recovery(&mut self) -> Vec<PositionOperationStartupRecovery> {
+        std::mem::take(&mut self.startup_recovery)
+    }
+
+    fn on_position_operation_recovery_unresolved(
+        &self,
+        operation_id: UUID4,
+        venue_status: PositionOperationStatus,
+        transaction_id: Option<&str>,
+        transaction_hash: Option<&str>,
+        message: &str,
+    ) {
+        if let Some(position_client) = &self.position_client {
+            position_client.record_recovery_unresolved(
+                operation_id,
+                venue_status,
+                transaction_id,
+                transaction_hash,
+                message,
+            );
+        }
+    }
+
+    fn on_position_operation_recovery_failed(
+        &self,
+        operation_id: UUID4,
+        transaction_id: Option<&str>,
+        transaction_hash: Option<&str>,
+        message: &str,
+    ) {
+        let Some(position_client) = &self.position_client else {
+            return;
+        };
+        position_client.record_recovery_failed(operation_id, message);
+
+        let Some(record) = position_client.position_operation_record(&operation_id) else {
+            return;
+        };
+        let ts = self.clock.get_time_ns();
+        self.emitter
+            .send_position_operation_result(PositionOperationResult::new(
+                record.trader_id,
+                record.strategy_id,
+                self.core.client_id,
+                record.account_id,
+                operation_id,
+                record.operation,
+                PositionOperationStatus::Failed,
+                record.barrier_instrument_ids,
+                transaction_id.map(str::to_string),
+                transaction_hash.map(str::to_string),
+                Some(message.to_string()),
+                None,
+                UUID4::new(),
+                ts,
+                ts,
+            ));
     }
 
     fn modify_order(&self, cmd: ModifyOrder) -> anyhow::Result<()> {
