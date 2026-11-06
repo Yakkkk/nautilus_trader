@@ -674,6 +674,11 @@ income equally across the two closed positions. CTF convert transfers cost from 
 positions to the received YES positions and recognizes the net pUSD return, using exact decimal
 arithmetic and a deterministic remainder allocation.
 
+Managed convert accepts settled YES outputs. Their actual quantity and strategy ownership are
+received, the authoritative contract-expiration payout is applied economically, and the market
+remains nontradable. The physical tokens stay associated with the received position for a later
+redeem, while conversion cash reflects only the actual pUSD returned.
+
 Results arrive as `PositionOperationResult` events. `Confirmed` carries normalized token effects and
 the net pUSD delta; the core then applies the legs and reports `Applied` through
 `on_position_operation_applied`. A confirmed operation without complete effects, ownership, or CTF
@@ -732,6 +737,21 @@ lists every event question with its true on-chain index and both token identifie
 Question indices must be unique and contiguous from zero. Missing metadata, a non-contiguous index,
 different market identifiers across inputs, an inactive instrument, or a missing YES output instrument
 reject the operation without changing cash or positions.
+
+Settled YES outputs are received and economically settled by the core, and the simulated venue credits
+their payout as cash after that application. The payout is the received quantity times the authoritative
+close price, accounted separately from any direct pUSD returned by the conversion; allocated cost affects
+realized PnL only and is not deducted again from the payout cash. Zero-payout outputs add no cash.
+Duplicate results and repeated close evidence do not credit the same shares twice, and `frozen_account`
+keeps its existing no-cash behavior for both components.
+
+Normal expiry cleanup retains a settled YES instrument definition and its authoritative close while the
+same negative-risk event still has an available, unsettled NO instrument that could be converted, a
+confirmed conversion still awaits local application, or an applied output position remains open pending
+payout. If such an output's close arrives after its matching engine was retired, the sandbox
+re-provisions the engine from the retained definition so the settlement fill is produced exactly once.
+Once none of these conditions holds, the retained definition is released through normal cleanup. Reset
+clears this retention state and otherwise keeps its existing instrument and cache behavior.
 
 ### Outcomes and errors
 
@@ -1332,14 +1352,14 @@ settlement report gate.
 
 ### Position management
 
-| Feature              | Binary options | Notes                                                                                       |
-| -------------------- | -------------- | ------------------------------------------------------------------------------------------- |
-| Query positions      | ✓              | Data API user positions, excluding resolved balances.                                       |
-| Split, merge, redeem | ✓              | CTF (`v1`) and V2 through Deposit Wallets; see [Position operations](#position-operations). |
+| Feature              | Binary options | Notes                                                                                         |
+| -------------------- | -------------- | --------------------------------------------------------------------------------------------- |
+| Query positions      | ✓              | Data API user positions, excluding resolved balances.                                         |
+| Split, merge, redeem | ✓              | CTF (`v1`) and V2 through Deposit Wallets; see [Position operations](#position-operations).   |
 | CTF convert          | ✓              | Negative-risk events only; managed path recommended. Backtest and sandbox support simulation. |
-| Position mode        | -              | Binary outcome positions only.                                                              |
-| Leverage control     | -              | No leverage available.                                                                      |
-| Margin mode          | -              | No margin trading.                                                                          |
+| Position mode        | -              | Binary outcome positions only.                                                                |
+| Leverage control     | -              | No leverage available.                                                                        |
+| Margin mode          | -              | No margin trading.                                                                            |
 
 ### Order querying
 

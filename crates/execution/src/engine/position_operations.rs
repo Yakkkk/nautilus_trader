@@ -21,7 +21,7 @@ use ahash::{AHashMap, AHashSet};
 use anyhow::Context;
 use indexmap::IndexSet;
 use nautilus_common::{
-    cache::Cache,
+    cache::{Cache, settled_cycle_id},
     messages::execution::{
         PositionOperationControlRequest, PositionOperationEffects, PositionOperationRecovery,
         PositionOperationRecoveryLeg, PositionOperationRecoveryOutcome, PositionOperationResult,
@@ -32,7 +32,8 @@ use nautilus_common::{
 use nautilus_core::UUID4;
 use nautilus_model::{
     ctf::U256,
-    enums::{OmsType, OrderSide},
+    data::InstrumentClose,
+    enums::{InstrumentCloseType, OmsType, OrderSide},
     events::{PositionChanged, PositionClosed, PositionEvent, PositionOpened},
     identifiers::{AccountId, InstrumentId, PositionId, StrategyId},
     instruments::{Instrument, InstrumentAny},
@@ -58,6 +59,45 @@ struct OperationLegPlan {
     instrument: InstrumentAny,
     prior: Option<Position>,
     leg: PositionOperationLeg,
+    /// Authoritative close to apply to a newly received output in the same application batch.
+    settled_close: Option<InstrumentClose>,
+}
+
+/// A settled payout marker resolved to the archived cycle it consumed.
+#[derive(Debug)]
+struct AppliedSettledLeg {
+    position_id: PositionId,
+    instrument_id: InstrumentId,
+    strategy_id: StrategyId,
+    quantity: Quantity,
+}
+
+impl AppliedSettledLeg {
+    fn matches_fields(&self, leg: &ExpectedOperationLeg) -> bool {
+        self.instrument_id == leg.instrument_id
+            && self.strategy_id == leg.strategy_id
+            && self.quantity.as_decimal() == leg.quantity.as_decimal()
+    }
+
+    fn matches_exact(&self, leg: &ExpectedOperationLeg) -> bool {
+        self.matches_fields(leg) && self.position_id == leg.position_id
+    }
+
+    fn matches_archived(&self, leg: &ExpectedOperationLeg) -> bool {
+        self.matches_fields(leg) && position_cycle_matches(leg.position_id, self.position_id)
+    }
+}
+
+/// One owner of redeemable tokens, either an open position or a settled physical holding.
+#[derive(Debug)]
+struct RedeemSource {
+    position_id: PositionId,
+    strategy_id: StrategyId,
+    account_id: AccountId,
+    size_precision: u8,
+    quantity: Decimal,
+    open_position: Option<Position>,
+    settled: bool,
 }
 
 impl ExecutionEngine {
@@ -168,6 +208,31 @@ impl ExecutionEngine {
                     continue;
                 }
             };
+
+            let account_id: Option<AccountId> = match value
+                .get("account_id")
+                .cloned()
+                .map(serde_json::from_value)
+                .transpose()
+            {
+                Ok(account_id) => account_id,
+                Err(e) => {
+                    log::error!("Invalid position operation account in `{key}`: {e}");
+                    None
+                }
+            };
+
+            if let Some(account_id) = account_id {
+                let mut cache = self.cache.borrow_mut();
+                for instrument_id in &instrument_ids {
+                    if let Err(e) = cache.restore_position_snapshots_for(instrument_id, account_id)
+                    {
+                        log::warn!(
+                            "Cannot restore position snapshots for {instrument_id} during operation recovery: {e}"
+                        );
+                    }
+                }
+            }
 
             let cached_close = {
                 let cache = self.cache.borrow();
@@ -281,11 +346,25 @@ impl ExecutionEngine {
             "position operation recovery has no barrier scope"
         );
 
+        {
+            let mut cache = self.cache.borrow_mut();
+
+            for instrument_id in &recovery.instrument_ids {
+                if let Err(e) =
+                    cache.restore_position_snapshots_for(instrument_id, recovery.account_id)
+                {
+                    log::warn!(
+                        "Cannot restore position snapshots for {instrument_id} during recovery: {e}"
+                    );
+                }
+            }
+        }
+
         let existing = self.operation_replay_legs(recovery)?;
 
         if existing.is_empty()
             && recovery.applied_legs.is_empty()
-            && self.applied_settled_legs(recovery).is_empty()
+            && self.applied_settled_legs(recovery)?.is_empty()
         {
             let Some(effects) = recovery.effects.as_ref() else {
                 return Ok(PositionOperationRecoveryOutcome::Unresolved {
@@ -361,27 +440,48 @@ impl ExecutionEngine {
             }
         }
 
-        for leg in &settled_expected {
-            let consumed = {
-                let cache = self.cache.borrow();
-                let cycle_opened = cache
-                    .position(&leg.position_id)
-                    .map_or(nautilus_core::UnixNanos::default(), |position| {
-                        position.ts_opened
-                    });
-                settled_operation_consumed(
-                    &cache,
-                    recovery.operation_id,
-                    leg.position_id,
-                    cycle_opened,
-                )
-            };
-            anyhow::ensure!(
-                consumed >= leg.quantity.as_decimal(),
-                "settled payout for {} has no verified consumption evidence",
-                leg.instrument_id
-            );
+        self.validate_expected_quantities(recovery, &expected)?;
+
+        let applied_settled = self.applied_settled_legs(recovery)?;
+        let mut matched = vec![false; applied_settled.len()];
+        let mut leg_matched = vec![false; settled_expected.len()];
+
+        // Match exact position identities first so the order of recorded legs cannot let a
+        // base PositionId consume an archived cycle before its exact leg is matched.
+        for (leg_index, leg) in settled_expected.iter().enumerate() {
+            if let Some((index, _)) = applied_settled
+                .iter()
+                .enumerate()
+                .find(|(index, applied)| !matched[*index] && applied.matches_exact(leg))
+            {
+                matched[index] = true;
+                leg_matched[leg_index] = true;
+            }
         }
+
+        // Only then allow a base record leg to match the archived cycle carrying its UUID suffix.
+        for (leg_index, leg) in settled_expected.iter().enumerate() {
+            if leg_matched[leg_index] {
+                continue;
+            }
+            let Some((index, _)) = applied_settled
+                .iter()
+                .enumerate()
+                .find(|(index, applied)| !matched[*index] && applied.matches_archived(leg))
+            else {
+                anyhow::bail!(
+                    "settled payout for {} has no per-cycle consumption evidence",
+                    leg.instrument_id
+                );
+            };
+            matched[index] = true;
+            leg_matched[leg_index] = true;
+        }
+        anyhow::ensure!(
+            matched.iter().all(|matched| *matched) && leg_matched.iter().all(|matched| *matched),
+            "settled consumption evidence for {} has no matching recorded leg",
+            recovery.operation_id
+        );
 
         let settled_legs = settled_expected
             .iter()
@@ -406,6 +506,7 @@ impl ExecutionEngine {
             }
             legs.extend(settled_legs);
 
+            self.complete_recovered_settlements(recovery, &expected, &existing)?;
             let result = self.recovery_result(recovery, recovery.effects.as_ref());
             self.finish_recovered_operation(recovery, &legs, &result);
             return Ok(PositionOperationRecoveryOutcome::Applied {
@@ -451,11 +552,178 @@ impl ExecutionEngine {
         }
         legs.extend(settled_legs);
 
+        self.complete_recovered_settlements(recovery, &expected, &existing)?;
         let result = self.recovery_result(recovery, recovery.effects.as_ref());
         self.finish_recovered_operation(recovery, &legs, &result);
         Ok(PositionOperationRecoveryOutcome::Applied {
             legs: recovery_legs(&legs),
         })
+    }
+
+    /// Completes the economic settlement of already received convert outputs during recovery.
+    ///
+    /// The received leg, cost allocation, and payout basis are already retained. This method only
+    /// applies the missing settlement and records the physical source; it never re-applies the
+    /// opening leg. A cycle that is already settled is left unchanged.
+    fn complete_recovered_settlements(
+        &self,
+        recovery: &PositionOperationRecovery,
+        expected: &[ExpectedOperationLeg],
+        existing: &AHashMap<
+            (UUID4, PositionOperationDirection, InstrumentId, PositionId),
+            PositionOperationLeg,
+        >,
+    ) -> anyhow::Result<()> {
+        if recovery.operation != PositionOperationType::Convert {
+            return Ok(());
+        }
+
+        let ts_init = self.clock.borrow().timestamp_ns();
+        let mut events = Vec::new();
+        {
+            let mut cache = self.cache.borrow_mut();
+            for leg in expected
+                .iter()
+                .filter(|leg| !leg.settled && leg.direction == PositionOperationDirection::Open)
+            {
+                let Some(close) = settled_output_close(&cache, &leg.instrument_id)? else {
+                    continue;
+                };
+                let Some(replayed) = existing.get(&(
+                    recovery.operation_id,
+                    leg.direction,
+                    leg.instrument_id,
+                    leg.position_id,
+                )) else {
+                    // A missing leg is completed through the normal apply path, which also
+                    // settles the output and records its source.
+                    continue;
+                };
+
+                let Some(position) = cache
+                    .position(&leg.position_id)
+                    .map(|position| position.cloned())
+                else {
+                    anyhow::bail!(
+                        "recovered settle output {} is missing its position",
+                        leg.instrument_id
+                    );
+                };
+
+                match output_cycle_settlement_state(&position, replayed) {
+                    OutputSettlementState::Missing => {}
+                    OutputSettlementState::Settled => {
+                        if current_cycle_settled(&position, replayed)
+                            && let Some(physical) = settled_physical_quantity(&position)
+                            && let Err(e) =
+                                cache.record_settled_position_source(&position, physical)
+                        {
+                            log::error!(
+                                "Failed to backfill settled source for {}: {e}",
+                                leg.instrument_id
+                            );
+                        }
+                    }
+                    OutputSettlementState::Unsettled => {
+                        let Some(pending) = output_cycle_pending_quantity(&position, replayed)
+                        else {
+                            anyhow::bail!(
+                                "recovered settle output {} has indeterminate pending quantity",
+                                leg.instrument_id
+                            );
+                        };
+
+                        if pending.is_zero() {
+                            anyhow::ensure!(
+                                !position.is_open(),
+                                "settle output {} has no pending quantity but remains open",
+                                leg.instrument_id
+                            );
+                            // The received shares were fully sold or consumed before the market
+                            // resolved, so there is no physical holding left to settle.
+                            continue;
+                        }
+                        anyhow::ensure!(
+                            position.is_open(),
+                            "settle output {} replay is not settled but its position is closed",
+                            leg.instrument_id
+                        );
+                        let last_qty = position.quantity;
+                        let confirmation = ts_init.max(position.ts_opened).max(close.ts_event);
+                        let settled = cache.update_position_from_instrument_close_at(
+                            leg.position_id,
+                            close,
+                            confirmation,
+                        )?;
+                        let mut event_close = close;
+                        event_close.ts_event = confirmation;
+                        events.push(PositionEvent::PositionClosed(
+                            PositionClosed::create_from_instrument_close(
+                                &settled,
+                                &event_close,
+                                last_qty,
+                                UUID4::new(),
+                                ts_init,
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
+        self.publish_position_events(events);
+        Ok(())
+    }
+
+    /// Checks that the recovered legs account for every token quantity in the receipt.
+    fn validate_expected_quantities(
+        &self,
+        recovery: &PositionOperationRecovery,
+        expected: &[ExpectedOperationLeg],
+    ) -> anyhow::Result<()> {
+        let Some(effects) = recovery.effects.as_ref() else {
+            return Ok(());
+        };
+
+        let tokens = self.token_instrument_map(&recovery.instrument_ids);
+        let spent = resolve_effects(&effects.spent, &tokens)?;
+        let received = resolve_effects(&effects.received, &tokens)?;
+        let mut expected_spent = AHashMap::<InstrumentId, Decimal>::new();
+        let mut expected_received = AHashMap::<InstrumentId, Decimal>::new();
+
+        for leg in expected {
+            let target = match leg.direction {
+                PositionOperationDirection::Open => &mut expected_received,
+                PositionOperationDirection::Close => &mut expected_spent,
+            };
+            *target.entry(leg.instrument_id).or_default() += leg.quantity.as_decimal();
+        }
+
+        for (instrument, quantity) in spent {
+            let expected = expected_spent.remove(&instrument.id()).unwrap_or_default();
+            anyhow::ensure!(
+                expected == quantity.as_decimal(),
+                "recovered legs spend {expected} of {}, receipt spent {}",
+                instrument.id(),
+                quantity.as_decimal()
+            );
+        }
+
+        for (instrument, quantity) in received {
+            let expected = expected_received
+                .remove(&instrument.id())
+                .unwrap_or_default();
+            anyhow::ensure!(
+                expected == quantity.as_decimal(),
+                "recovered legs receive {expected} of {}, receipt received {}",
+                instrument.id(),
+                quantity.as_decimal()
+            );
+        }
+        anyhow::ensure!(
+            expected_spent.is_empty() && expected_received.is_empty(),
+            "recovered legs contain instruments outside the receipt"
+        );
+        Ok(())
     }
 
     fn recovery_result(
@@ -539,46 +807,82 @@ impl ExecutionEngine {
     fn applied_settled_legs(
         &self,
         recovery: &PositionOperationRecovery,
-    ) -> Vec<(PositionId, InstrumentId, StrategyId, Quantity)> {
-        let prefix = format!("{SETTLED_CONSUMPTION_PREFIX}:{}:", recovery.operation_id);
-        let entries = self.cache.borrow().general_entries_with_prefix(&prefix);
+    ) -> anyhow::Result<Vec<AppliedSettledLeg>> {
+        let prefix = format!(
+            "{SETTLED_CONSUMPTION_PREFIX}:operation:{}:",
+            recovery.operation_id
+        );
+        let legacy_prefix = format!("{SETTLED_CONSUMPTION_PREFIX}:{}:", recovery.operation_id);
+        let mut entries = self.cache.borrow().general_entries_with_prefix(&prefix);
+        entries.extend(
+            self.cache
+                .borrow()
+                .general_entries_with_prefix(&legacy_prefix),
+        );
         let cache = self.cache.borrow();
         let mut legs = Vec::new();
+        let mut seen = AHashSet::new();
+
         for (key, bytes) in entries {
-            let mut parts = key.rsplitn(3, ':');
-            let Some(cycle) = parts.next() else {
+            let position = if let Some(cycle_id) = key.strip_prefix(&prefix) {
+                settled_source_by_cycle(&cache, cycle_id, recovery.account_id).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "settled payout marker for {} references missing cycle {cycle_id}",
+                        recovery.operation_id
+                    )
+                })?
+            } else if let Some(legacy) = key.strip_prefix(&legacy_prefix) {
+                let mut parts = legacy.rsplitn(2, ':');
+                let cycle = parts
+                    .next()
+                    .and_then(|cycle| nautilus_core::UnixNanos::from_str(cycle).ok())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "legacy settled payout marker for {} has an invalid cycle",
+                            recovery.operation_id
+                        )
+                    })?;
+                let position_id = parts.next().map(PositionId::from).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "legacy settled payout marker for {} has no position",
+                        recovery.operation_id
+                    )
+                })?;
+                legacy_settled_source(&cache, position_id, cycle, recovery.account_id)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "legacy settled payout marker for {} references missing cycle {position_id}@{cycle}",
+                            recovery.operation_id
+                        )
+                    })?
+            } else {
                 continue;
             };
-            let Some(position_id) = parts.next() else {
-                continue;
-            };
-            let position_id = PositionId::from(position_id);
-            let Some(position) = cache.position(&position_id) else {
-                continue;
-            };
-            let Ok(cycle) = nautilus_core::UnixNanos::from_str(cycle) else {
-                continue;
-            };
-            if position.ts_opened != cycle {
+
+            if !seen.insert(settled_cycle_id(&position)) {
                 continue;
             }
-            let Some(value) = std::str::from_utf8(&bytes)
+
+            let value = std::str::from_utf8(&bytes)
                 .ok()
                 .and_then(|value| Decimal::from_str(value).ok())
-            else {
-                continue;
-            };
-            let Ok(quantity) = Quantity::from_decimal_dp(value, position.size_precision) else {
-                continue;
-            };
-            legs.push((
-                position_id,
-                position.instrument_id,
-                position.strategy_id,
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "settled payout marker for {} cycle {} is invalid",
+                        recovery.operation_id,
+                        position.id
+                    )
+                })?;
+            let quantity = Quantity::from_decimal_dp(value, position.size_precision)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            legs.push(AppliedSettledLeg {
+                position_id: position.id,
+                instrument_id: position.instrument_id,
+                strategy_id: position.strategy_id,
                 quantity,
-            ));
+            });
         }
-        legs
+        Ok(legs)
     }
 
     fn expected_from_effects(
@@ -705,22 +1009,33 @@ impl ExecutionEngine {
                         "redeem payout must be non-negative"
                     );
 
-                    if let Some((position_id, _, strategy_id, settled_quantity)) = self
-                        .applied_settled_legs(recovery)
+                    let applied_settled: Vec<_> = self
+                        .applied_settled_legs(recovery)?
                         .into_iter()
-                        .find(|(_, id, _, _)| *id == instrument.id())
-                    {
-                        return Ok(vec![ExpectedOperationLeg {
-                            position_id,
-                            instrument_id: instrument.id(),
-                            strategy_id,
-                            direction: PositionOperationDirection::Close,
-                            quantity: settled_quantity,
-                            cost: Some(Decimal::ZERO),
-                            income_known: true,
-                            income: Some(collateral),
-                            settled: true,
-                        }]);
+                        .filter(|leg| leg.instrument_id == instrument.id())
+                        .collect();
+
+                    if !applied_settled.is_empty() {
+                        let weights = applied_settled
+                            .iter()
+                            .map(|leg| leg.quantity.as_decimal())
+                            .collect::<Vec<_>>();
+                        let incomes = allocate(collateral, &weights);
+                        return Ok(applied_settled
+                            .into_iter()
+                            .zip(incomes)
+                            .map(|(leg, income)| ExpectedOperationLeg {
+                                position_id: leg.position_id,
+                                instrument_id: instrument.id(),
+                                strategy_id: leg.strategy_id,
+                                direction: PositionOperationDirection::Close,
+                                quantity: leg.quantity,
+                                cost: Some(Decimal::ZERO),
+                                income_known: true,
+                                income: Some(income),
+                                settled: true,
+                            })
+                            .collect());
                     }
 
                     let position = self.existing_position(
@@ -781,7 +1096,7 @@ impl ExecutionEngine {
                     }]);
                 }
 
-                let applied_settled = self.applied_settled_legs(recovery);
+                let applied_settled = self.applied_settled_legs(recovery)?;
                 let mut total_income = Decimal::ZERO;
                 let mut legs = Vec::with_capacity(spent.len());
                 for (instrument, quantity) in spent {
@@ -806,7 +1121,7 @@ impl ExecutionEngine {
                         .collect();
                     let settled_applied: Vec<_> = applied_settled
                         .iter()
-                        .filter(|(_, id, _, _)| *id == instrument.id())
+                        .filter(|leg| leg.instrument_id == instrument.id())
                         .collect();
 
                     if !replayed.is_empty() || !settled_applied.is_empty() {
@@ -828,11 +1143,9 @@ impl ExecutionEngine {
                                     false,
                                 )
                             })
-                            .chain(settled_applied.iter().map(
-                                |(position_id, _, strategy_id, quantity)| {
-                                    (*position_id, *strategy_id, *quantity, None, true)
-                                },
-                            ))
+                            .chain(settled_applied.iter().map(|leg| {
+                                (leg.position_id, leg.strategy_id, leg.quantity, None, true)
+                            }))
                             .collect::<Vec<_>>();
                         entries.sort_by_key(|(position_id, _, _, _, _)| position_id.to_string());
                         let weights = entries
@@ -1200,10 +1513,19 @@ impl ExecutionEngine {
                 ts_init: ts,
             };
 
+            let settled_close = if recovery.operation == PositionOperationType::Convert
+                && leg.direction == PositionOperationDirection::Open
+            {
+                settled_output_close(&cache, &leg.instrument_id)?
+            } else {
+                None
+            };
+
             plans.push(OperationLegPlan {
                 instrument,
                 prior,
                 leg: position_leg,
+                settled_close,
             });
         }
         Ok(plans)
@@ -1233,11 +1555,32 @@ impl ExecutionEngine {
 
         if operation != PositionOperationType::Redeem {
             let cache = self.cache.borrow();
-            for instrument_id in instrument_ids {
-                if cache.instrument_close(instrument_id).is_some_and(|close| {
-                    close.close_type == nautilus_model::enums::InstrumentCloseType::ContractExpired
-                }) {
+            let now = self.clock.borrow().timestamp_ns();
+
+            // Convert inputs must remain unsettled, while expected YES outputs may already be
+            // settled. Split and merge require every instrument in scope to remain unsettled.
+            let input_ids: &[InstrumentId] = match (operation, inputs) {
+                (PositionOperationType::Convert, Some(inputs)) => &inputs.instrument_ids,
+                _ => instrument_ids,
+            };
+
+            for instrument_id in input_ids {
+                if cache
+                    .instrument_close(instrument_id)
+                    .is_some_and(|close| close.close_type == InstrumentCloseType::ContractExpired)
+                {
                     anyhow::bail!("instrument {instrument_id} is already economically settled");
+                }
+            }
+
+            if operation == PositionOperationType::Convert
+                && let Some(inputs) = inputs
+            {
+                for instrument_id in instrument_ids {
+                    if inputs.instrument_ids.contains(instrument_id) {
+                        continue;
+                    }
+                    ensure_output_settlement_evidence(&cache, instrument_id, now)?;
                 }
             }
         }
@@ -1528,6 +1871,28 @@ impl ExecutionEngine {
             result.transaction_hash.as_deref(),
         );
 
+        let ts = self.clock.borrow().timestamp_ns();
+        let applied = PositionOperationResult::new(
+            result.trader_id,
+            result.strategy_id,
+            result.client_id,
+            result.account_id,
+            result.operation_id,
+            result.operation,
+            PositionOperationStatus::Applied,
+            result.instrument_ids.clone(),
+            result.venue_transaction_id.clone(),
+            result.transaction_hash.clone(),
+            None,
+            None,
+            UUID4::new(),
+            ts,
+            ts,
+        );
+        adapter
+            .client
+            .on_position_operation_applied_result(&applied, legs);
+
         // Refresh venue balances through the normal account-state path so the applied token and
         // collateral effects reach the account without adding a second cash ledger.
         let query = QueryAccount::new(
@@ -1547,13 +1912,29 @@ impl ExecutionEngine {
         result: &PositionOperationResult,
         effects: &PositionOperationEffects,
     ) -> anyhow::Result<Option<Vec<PositionOperationLeg>>> {
+        let tokens = self.token_instrument_map(&result.instrument_ids);
+        let received = resolve_effects(&effects.received, &tokens)?;
+        let spent = resolve_effects(&effects.spent, &tokens)?;
+
         if result.operation != PositionOperationType::Redeem {
             let deferred = self.deferred_instrument_closes.borrow();
             let cache = self.cache.borrow();
-            for instrument_id in &result.instrument_ids {
-                if cache.instrument_close(instrument_id).is_some_and(|close| {
-                    close.close_type == nautilus_model::enums::InstrumentCloseType::ContractExpired
-                }) && !deferred.contains(instrument_id)
+
+            // A convert may receive settled YES outputs, but its NO inputs must remain
+            // unsettled. Split and merge continue to require the whole scope unsettled.
+            let settled_scope: Vec<InstrumentId> = match result.operation {
+                PositionOperationType::Convert => spent
+                    .iter()
+                    .map(|(instrument, _)| instrument.id())
+                    .collect(),
+                _ => result.instrument_ids.clone(),
+            };
+
+            for instrument_id in &settled_scope {
+                if cache
+                    .instrument_close(instrument_id)
+                    .is_some_and(|close| close.close_type == InstrumentCloseType::ContractExpired)
+                    && !deferred.contains(instrument_id)
                 {
                     log::warn!(
                         "Position operation {} cannot apply to settled instrument {instrument_id}",
@@ -1564,9 +1945,6 @@ impl ExecutionEngine {
             }
         }
 
-        let tokens = self.token_instrument_map(&result.instrument_ids);
-        let received = resolve_effects(&effects.received, &tokens)?;
-        let spent = resolve_effects(&effects.spent, &tokens)?;
         let collateral = Decimal::from_str(&effects.collateral_delta)
             .context("invalid collateral delta in position operation effects")?;
         let ts_event = result.ts_event;
@@ -1610,15 +1988,24 @@ impl ExecutionEngine {
 
     fn record_settled_consumption(&self, legs: &[PositionOperationLeg]) -> anyhow::Result<()> {
         let mut errors = Vec::new();
+
         for leg in legs.iter().filter(|leg| leg.settled) {
-            let cycle_opened = self
-                .cache
-                .borrow()
-                .position(&leg.position_id)
-                .map_or(nautilus_core::UnixNanos::default(), |position| {
-                    position.ts_opened
-                });
-            let key = settled_consumption_key(leg.position_id, cycle_opened);
+            let (key, cycle_id) = {
+                let cache = self.cache.borrow();
+                let Some(position) =
+                    settled_source_position(&cache, leg.position_id, leg.account_id)
+                else {
+                    log::error!(
+                        "Cannot record settled consumption for unknown position {}",
+                        leg.position_id
+                    );
+                    continue;
+                };
+                (
+                    settled_consumption_key(&position),
+                    settled_cycle_id(&position),
+                )
+            };
             let current = {
                 let cache = self.cache.borrow();
                 cache
@@ -1627,8 +2014,7 @@ impl ExecutionEngine {
                     .and_then(|value| Decimal::from_str(value).ok())
                     .unwrap_or_default()
             };
-            let operation_key =
-                settled_operation_key(&leg.operation_id, leg.position_id, cycle_opened);
+            let operation_key = settled_operation_key(&leg.operation_id, &cycle_id);
             let operation_current = {
                 let cache = self.cache.borrow();
                 cache
@@ -1768,6 +2154,7 @@ impl ExecutionEngine {
                 instrument,
                 prior,
                 leg,
+                settled_close: None,
             });
         }
         Ok(plans)
@@ -1817,6 +2204,7 @@ impl ExecutionEngine {
                 instrument,
                 prior: Some(prior),
                 leg,
+                settled_close: None,
             });
         }
         Ok(plans)
@@ -1874,9 +2262,9 @@ impl ExecutionEngine {
                     return Ok(None);
                 };
 
-                let (positions, settled_positions) = {
-                    let cache = self.cache.borrow();
-                    let mut positions = cache
+                let (open_positions, settled_sources) = {
+                    let mut cache = self.cache.borrow_mut();
+                    let mut open_positions = cache
                         .positions_open(
                             None,
                             Some(&instrument.id()),
@@ -1888,46 +2276,27 @@ impl ExecutionEngine {
                         .filter(|position| position.is_long())
                         .map(|position| position.cloned())
                         .collect::<Vec<_>>();
-                    positions.sort_by_key(|position| position.id.to_string());
+                    open_positions.sort_by_key(|position| position.id.to_string());
 
-                    let mut settled_positions = Vec::new();
-                    for position in cache.positions(
+                    let Some(settled_sources) = settled_redeem_sources(
+                        &mut cache,
+                        &instrument.id(),
+                        result.account_id,
                         None,
-                        Some(&instrument.id()),
-                        None,
-                        Some(&result.account_id),
-                        None,
-                    ) {
-                        if !position.is_closed() {
-                            continue;
-                        }
-                        let Some(physical) = settled_physical_quantity(&position) else {
-                            if position.replay_events.iter().any(|event| {
-                                matches!(event, PositionReplayEvent::InstrumentClosed(_))
-                            }) {
-                                return Ok(None);
-                            }
-                            continue;
-                        };
-                        let consumed = settled_consumed(&cache, &position);
-                        let remaining = physical.as_decimal() - consumed;
-                        if remaining > Decimal::ZERO {
-                            settled_positions.push((position.cloned(), remaining));
-                        }
-                    }
-                    settled_positions.sort_by_key(|(position, _)| position.id.to_string());
-                    (positions, settled_positions)
+                        instrument.size_precision(),
+                    ) else {
+                        return Ok(None);
+                    };
+                    (open_positions, settled_sources)
                 };
 
-                let open_available: Decimal = positions
+                let open_available: Decimal = open_positions
                     .iter()
                     .map(|position| position.quantity.as_decimal())
                     .sum();
-                let settled_available: Decimal = settled_positions
-                    .iter()
-                    .map(|(_, quantity)| *quantity)
-                    .sum();
-                if positions.is_empty() && settled_positions.is_empty() {
+                let settled_available: Decimal =
+                    settled_sources.iter().map(|source| source.quantity).sum();
+                if open_positions.is_empty() && settled_sources.is_empty() {
                     return Ok(None);
                 }
                 if open_available + settled_available != quantity.as_decimal() {
@@ -1939,51 +2308,37 @@ impl ExecutionEngine {
                     nautilus_model::ctf::ctf_payout_amount(quantity, numerator, denominator)?;
                 total_income += token_payout;
 
-                let mut entries = positions
+                let mut sources = open_positions
                     .into_iter()
-                    .map(|position| (position, false))
-                    .chain(
-                        settled_positions
-                            .into_iter()
-                            .map(|(position, _)| (position, true)),
-                    )
-                    .collect::<Vec<_>>();
-                entries.sort_by_key(|(position, _)| position.id.to_string());
-                let weights: Vec<Decimal> = entries
-                    .iter()
-                    .map(|(position, settled)| {
-                        if *settled {
-                            let physical = settled_physical_quantity(position).unwrap_or_default();
-                            physical.as_decimal() - settled_consumed(&self.cache.borrow(), position)
-                        } else {
-                            position.quantity.as_decimal()
-                        }
+                    .map(|position| RedeemSource {
+                        position_id: position.id,
+                        strategy_id: position.strategy_id,
+                        account_id: position.account_id,
+                        size_precision: position.size_precision,
+                        quantity: position.quantity.as_decimal(),
+                        open_position: Some(position),
+                        settled: false,
                     })
-                    .collect();
+                    .chain(settled_sources)
+                    .collect::<Vec<_>>();
+                sources.sort_by_key(|source| source.position_id.to_string());
+                let weights: Vec<Decimal> = sources.iter().map(|source| source.quantity).collect();
                 let incomes = allocate(token_payout, &weights);
 
-                for ((position, settled), income) in entries.into_iter().zip(incomes) {
-                    if settled {
-                        let physical = settled_physical_quantity(&position).ok_or_else(|| {
-                            anyhow::anyhow!(
-                                "cannot reconstruct settled physical quantity for {}",
-                                position.id
-                            )
-                        })?;
-                        let remaining = physical.as_decimal()
-                            - settled_consumed(&self.cache.borrow(), &position);
+                for (source, income) in sources.into_iter().zip(incomes) {
+                    if source.settled {
                         let quantity =
-                            Quantity::from_decimal_dp(remaining, position.size_precision)
+                            Quantity::from_decimal_dp(source.quantity, source.size_precision)
                                 .map_err(|e| anyhow::anyhow!("{e}"))?;
                         settled_legs.push(PositionOperationLeg {
                             operation_id: result.operation_id,
                             operation: result.operation,
                             direction: PositionOperationDirection::Close,
-                            trader_id: position.trader_id,
-                            strategy_id: position.strategy_id,
-                            account_id: position.account_id,
+                            trader_id: result.trader_id,
+                            strategy_id: source.strategy_id,
+                            account_id: source.account_id,
                             instrument_id: instrument.id(),
-                            position_id: position.id,
+                            position_id: source.position_id,
                             quantity,
                             cost: Decimal::ZERO,
                             income: Some(income),
@@ -1993,6 +2348,9 @@ impl ExecutionEngine {
                             ts_init,
                         });
                     } else {
+                        let position = source
+                            .open_position
+                            .expect("an open redeem source carries its position");
                         let position_quantity = position.quantity;
                         let cost = release_cost(&position, position_quantity)?;
                         let leg = build_position_leg(
@@ -2010,6 +2368,7 @@ impl ExecutionEngine {
                             instrument: instrument.clone(),
                             prior: Some(position),
                             leg,
+                            settled_close: None,
                         });
                     }
                 }
@@ -2023,64 +2382,121 @@ impl ExecutionEngine {
         }
 
         let (instrument, quantity) = spent.into_iter().next().expect("one spent token");
+        let requested = quantity.as_decimal();
         let Some(prior) =
             self.existing_position(&instrument.id(), result.strategy_id, result.account_id)?
         else {
             return Ok(None);
         };
-        if prior.is_closed() {
-            let Some(physical) = settled_physical_quantity(&prior) else {
-                return Ok(None);
-            };
-            let consumed = {
-                let cache = self.cache.borrow();
-                settled_consumed(&cache, &prior)
-            };
-            let remaining = physical.as_decimal() - consumed;
-            if quantity.as_decimal() > remaining {
-                return Ok(None);
-            }
-            let leg = PositionOperationLeg {
-                operation_id: result.operation_id,
-                operation: result.operation,
-                direction: PositionOperationDirection::Close,
-                trader_id: prior.trader_id,
+
+        let mut sources = Vec::new();
+        if prior.is_open() {
+            sources.push(RedeemSource {
+                position_id: prior.id,
                 strategy_id: prior.strategy_id,
                 account_id: prior.account_id,
-                instrument_id: instrument.id(),
-                position_id: prior.id,
-                quantity,
-                cost: Decimal::ZERO,
-                income: Some(collateral),
-                settled: true,
-                event_id: UUID4::new(),
-                ts_event,
-                ts_init,
-            };
-            return Ok(Some((Vec::new(), vec![leg])));
+                size_precision: prior.size_precision,
+                quantity: prior.quantity.as_decimal(),
+                open_position: Some(prior),
+                settled: false,
+            });
+        }
+        let settled_sources = {
+            let mut cache = self.cache.borrow_mut();
+            settled_redeem_sources(
+                &mut cache,
+                &instrument.id(),
+                result.account_id,
+                Some(result.strategy_id),
+                instrument.size_precision(),
+            )
+        };
+        let Some(mut settled_sources) = settled_sources else {
+            return Ok(None);
+        };
+        sources.append(&mut settled_sources);
+        sources.sort_by_key(|source| source.position_id.to_string());
+
+        let available: Decimal = sources.iter().map(|source| source.quantity).sum();
+        if requested <= Decimal::ZERO || requested > available {
+            return Ok(None);
         }
 
-        let cost = release_cost(&prior, quantity)?;
-        let position_id = prior.id;
-        let leg = build_leg(
-            result,
-            PositionOperationDirection::Close,
-            &instrument,
-            position_id,
-            quantity,
-            cost,
-            Some(collateral),
-            ts_event,
-            ts_init,
-        );
-        Ok(Some((
-            vec![OperationLegPlan {
-                instrument,
-                prior: Some(prior),
-                leg,
-            }],
-            Vec::new(),
-        )))
+        let mut remaining = requested;
+        let mut consumed_sources = Vec::new();
+
+        for source in sources {
+            if remaining.is_zero() {
+                break;
+            }
+            let take = source.quantity.min(remaining);
+            if take > Decimal::ZERO {
+                remaining -= take;
+                consumed_sources.push((source, take));
+            }
+        }
+
+        if remaining > Decimal::ZERO {
+            return Ok(None);
+        }
+
+        let weights: Vec<Decimal> = consumed_sources.iter().map(|(_, take)| *take).collect();
+        let incomes = allocate(collateral, &weights);
+        let mut plans = Vec::new();
+        let mut settled_legs = Vec::new();
+
+        for ((source, take), income) in consumed_sources.into_iter().zip(incomes) {
+            let leg_quantity = Quantity::from_decimal(take).map_err(|e| anyhow::anyhow!("{e}"))?;
+            anyhow::ensure!(
+                leg_quantity.precision <= source.size_precision,
+                "redeem quantity {} exceeds instrument precision {}",
+                leg_quantity,
+                source.size_precision
+            );
+
+            if source.settled {
+                settled_legs.push(PositionOperationLeg {
+                    operation_id: result.operation_id,
+                    operation: result.operation,
+                    direction: PositionOperationDirection::Close,
+                    trader_id: result.trader_id,
+                    strategy_id: source.strategy_id,
+                    account_id: source.account_id,
+                    instrument_id: instrument.id(),
+                    position_id: source.position_id,
+                    quantity: leg_quantity,
+                    cost: Decimal::ZERO,
+                    income: Some(income),
+                    settled: true,
+                    event_id: UUID4::new(),
+                    ts_event,
+                    ts_init,
+                });
+            } else {
+                let position = source
+                    .open_position
+                    .expect("an open redeem source carries its position");
+                let cost = release_cost(&position, leg_quantity)?;
+                let leg = build_position_leg(
+                    result,
+                    PositionOperationDirection::Close,
+                    &instrument,
+                    &position,
+                    leg_quantity,
+                    cost,
+                    Some(income),
+                    ts_event,
+                    ts_init,
+                );
+                plans.push(OperationLegPlan {
+                    instrument: instrument.clone(),
+                    prior: Some(position),
+                    leg,
+                    settled_close: None,
+                });
+            }
+        }
+        Ok(Some((plans, settled_legs)))
     }
 
     fn plan_convert(
@@ -2153,6 +2569,7 @@ impl ExecutionEngine {
                 instrument,
                 prior: Some(prior),
                 leg,
+                settled_close: None,
             });
         }
 
@@ -2180,10 +2597,15 @@ impl ExecutionEngine {
                     ts_event,
                     ts_init,
                 );
+                let settled_close = {
+                    let cache = self.cache.borrow();
+                    settled_output_close(&cache, &instrument.id())?
+                };
                 plans.push(OperationLegPlan {
                     instrument,
                     prior,
                     leg,
+                    settled_close,
                 });
             }
         }
@@ -2202,7 +2624,7 @@ impl ExecutionEngine {
 
         for plan in plans {
             let before_flat = plan.prior.as_ref().is_none_or(Position::is_closed);
-            let position = match &plan.prior {
+            let mut position = match &plan.prior {
                 Some(prior) => {
                     let mut position = prior.clone();
                     position
@@ -2222,7 +2644,32 @@ impl ExecutionEngine {
                 }
             };
 
-            let event = if before_flat && position.is_open() {
+            let settled_output = plan.settled_close.is_some();
+            let settled_quantity = settled_output.then_some(position.quantity);
+            let mut event_leg = plan.leg.clone();
+            if let Some(close) = plan.settled_close {
+                let confirmation = plan.leg.ts_event.max(close.ts_event);
+                event_leg.ts_event = confirmation;
+                position
+                    .apply_instrument_close_at(close, confirmation)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                anyhow::ensure!(
+                    position.is_closed(),
+                    "settled conversion output {} was not fully closed",
+                    plan.instrument.id()
+                );
+            }
+
+            // A settled output is received and economically settled in one batch. Only the final
+            // closed state is published; no intermediate tradable position is exposed.
+            let event = if settled_output {
+                PositionEvent::PositionClosed(PositionClosed::create_from_operation(
+                    &position,
+                    &event_leg,
+                    UUID4::new(),
+                    ts_init,
+                ))
+            } else if before_flat && position.is_open() {
                 PositionEvent::PositionOpened(PositionOpened::create_from_operation(
                     &position,
                     &plan.leg,
@@ -2245,20 +2692,20 @@ impl ExecutionEngine {
                 ))
             };
 
-            updates.push((position, plan.prior));
+            updates.push((position, plan.prior, settled_quantity));
             events.push(event);
             legs.push(plan.leg);
         }
 
         {
             let cache = self.cache.borrow();
-            for (position, _) in &updates {
+            for (position, _, _) in &updates {
                 cache.validate_position_update(position, OmsType::Netting)?;
             }
         }
 
         // Archive any prior closed cycles before their NETTING position ID is reused.
-        for (_, prior) in &updates {
+        for (_, prior, _) in &updates {
             if let Some(prior) = prior
                 && prior.is_closed()
             {
@@ -2269,7 +2716,8 @@ impl ExecutionEngine {
         let mut persistence_errors = Vec::new();
         {
             let mut cache = self.cache.borrow_mut();
-            for (position, prior) in &updates {
+
+            for (position, prior, settled_quantity) in &updates {
                 let result = if prior.is_some() {
                     cache.replace_position(position, OmsType::Netting, false, false)
                 } else {
@@ -2281,13 +2729,21 @@ impl ExecutionEngine {
                         position.id
                     );
                     persistence_errors.push(e.to_string());
+                } else if let Some(quantity) = settled_quantity
+                    && let Err(e) = cache.record_settled_position_source(position, *quantity)
+                {
+                    log::error!(
+                        "Settled output source for {} was applied in memory but not persisted: {e}",
+                        position.id
+                    );
                 }
             }
         }
 
         {
             let cache = self.cache.borrow();
-            for (position, _) in &updates {
+
+            for (position, _, _) in &updates {
                 anyhow::ensure!(
                     cache
                         .position(&position.id)
@@ -2491,48 +2947,311 @@ fn recovery_legs(legs: &[PositionOperationLeg]) -> Vec<PositionOperationRecovery
 
 const SETTLED_CONSUMPTION_PREFIX: &str = "position-operation-settled";
 
-fn settled_consumption_key(
-    position_id: PositionId,
-    cycle_opened: nautilus_core::UnixNanos,
-) -> String {
-    format!("{SETTLED_CONSUMPTION_PREFIX}:{position_id}:{cycle_opened}")
+fn settled_consumption_key(position: &Position) -> String {
+    // Archived NETTING cycles receive a new PositionId, so consumption follows the cycle's
+    // stable identity across snapshots instead of the mutable position ID.
+    format!(
+        "{SETTLED_CONSUMPTION_PREFIX}:cycle:{}",
+        settled_cycle_id(position)
+    )
 }
 
-fn settled_operation_key(
-    operation_id: &UUID4,
-    position_id: PositionId,
-    cycle_opened: nautilus_core::UnixNanos,
-) -> String {
-    format!("{SETTLED_CONSUMPTION_PREFIX}:{operation_id}:{position_id}:{cycle_opened}")
+fn position_cycle_matches(recorded: PositionId, source: PositionId) -> bool {
+    if recorded == source {
+        return true;
+    }
+
+    // A record stores the NETTING base ID while the archived cycle carries a UUID suffix.
+    let prefix = format!("{recorded}-");
+    source
+        .as_str()
+        .strip_prefix(&prefix)
+        .is_some_and(|suffix| UUID4::from_str(suffix).is_ok())
 }
 
-fn settled_operation_consumed(
+fn settled_source_position(
     cache: &Cache,
-    operation_id: UUID4,
+    position_id: PositionId,
+    account_id: AccountId,
+) -> Option<Position> {
+    cache
+        .position(&position_id)
+        .map(|position| position.cloned())
+        .or_else(|| {
+            cache
+                .position_snapshots(None, Some(&account_id))
+                .into_iter()
+                .find(|position| position.id == position_id)
+        })
+}
+
+fn settled_source_by_cycle(
+    cache: &Cache,
+    cycle_id: &str,
+    account_id: AccountId,
+) -> Option<Position> {
+    cache
+        .positions(None, None, None, Some(&account_id), None)
+        .into_iter()
+        .map(|position| position.cloned())
+        .chain(cache.position_snapshots(None, Some(&account_id)))
+        .find(|position| position.is_closed() && settled_cycle_id(position) == cycle_id)
+}
+
+fn legacy_settled_source(
+    cache: &Cache,
     position_id: PositionId,
     cycle_opened: nautilus_core::UnixNanos,
-) -> Decimal {
+    account_id: AccountId,
+) -> Option<Position> {
+    let snapshot_prefix = format!("{position_id}-");
     cache
-        .get(&settled_operation_key(
-            &operation_id,
-            position_id,
-            cycle_opened,
-        ))
-        .ok()
-        .flatten()
-        .and_then(|bytes| std::str::from_utf8(bytes).ok())
-        .and_then(|value| Decimal::from_str(value).ok())
-        .unwrap_or_default()
+        .positions(None, None, None, Some(&account_id), None)
+        .into_iter()
+        .map(|position| position.cloned())
+        .chain(cache.position_snapshots(None, Some(&account_id)))
+        .find(|position| {
+            position.is_closed()
+                && position.ts_opened == cycle_opened
+                && (position.id == position_id
+                    || position
+                        .id
+                        .as_str()
+                        .strip_prefix(&snapshot_prefix)
+                        .is_some_and(|suffix| UUID4::from_str(suffix).is_ok()))
+        })
+}
+
+fn settled_operation_key(operation_id: &UUID4, cycle_id: &str) -> String {
+    format!("{SETTLED_CONSUMPTION_PREFIX}:operation:{operation_id}:{cycle_id}")
 }
 
 fn settled_consumed(cache: &Cache, position: &Position) -> Decimal {
     cache
-        .get(&settled_consumption_key(position.id, position.ts_opened))
+        .get(&settled_consumption_key(position))
         .ok()
         .flatten()
         .and_then(|bytes| std::str::from_utf8(bytes).ok())
         .and_then(|value| Decimal::from_str(value).ok())
         .unwrap_or_default()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OutputSettlementState {
+    Missing,
+    Unsettled,
+    Settled,
+}
+
+/// Returns whether the recovered output leg's cycle has an authoritative economic settlement.
+fn output_cycle_settlement_state(
+    position: &Position,
+    replayed: &PositionOperationLeg,
+) -> OutputSettlementState {
+    let identity = replayed.identity();
+    let mut found = false;
+
+    for event in &position.replay_events {
+        match event {
+            PositionReplayEvent::Operation(leg) if leg.identity() == identity => found = true,
+            PositionReplayEvent::InstrumentClosed(_) if found => {
+                return OutputSettlementState::Settled;
+            }
+            _ => {}
+        }
+    }
+
+    if found {
+        OutputSettlementState::Unsettled
+    } else {
+        OutputSettlementState::Missing
+    }
+}
+
+/// Returns the physical quantity still held by the cycle containing the recovered output leg.
+///
+/// Sales and operation closes after the received leg reduce the holding. A zero result means the
+/// output was fully disposed before the market resolved, so no further settlement is required.
+/// `None` means adjustments, voids, or negative history prevent a reliable calculation.
+fn output_cycle_pending_quantity(
+    position: &Position,
+    replayed: &PositionOperationLeg,
+) -> Option<Decimal> {
+    if !position.adjustments.is_empty() || !position.fill_voids.is_empty() {
+        return None;
+    }
+
+    let identity = replayed.identity();
+    let mut found = false;
+    let mut quantity = Decimal::ZERO;
+
+    for event in &position.replay_events {
+        match event {
+            PositionReplayEvent::Operation(leg) => {
+                if leg.identity() == identity {
+                    found = true;
+                }
+
+                match leg.direction {
+                    PositionOperationDirection::Open => quantity += leg.quantity.as_decimal(),
+                    PositionOperationDirection::Close => quantity -= leg.quantity.as_decimal(),
+                }
+            }
+            PositionReplayEvent::Filled(fill) => match fill.order_side {
+                OrderSide::Buy => quantity += fill.last_qty.as_decimal(),
+                OrderSide::Sell => quantity -= fill.last_qty.as_decimal(),
+            },
+            PositionReplayEvent::InstrumentClosed(_) => {
+                if found {
+                    return Some(Decimal::ZERO);
+                }
+                quantity = Decimal::ZERO;
+            }
+            PositionReplayEvent::Adjusted(_) => return None,
+        }
+
+        if quantity < Decimal::ZERO {
+            return None;
+        }
+    }
+
+    found.then_some(quantity)
+}
+
+/// Returns whether the recovered leg belongs to the position's last settled cycle.
+fn current_cycle_settled(position: &Position, replayed: &PositionOperationLeg) -> bool {
+    let identity = replayed.identity();
+    let mut found = false;
+    let mut closed = false;
+
+    for event in &position.replay_events {
+        match event {
+            PositionReplayEvent::Operation(leg) if leg.identity() == identity => {
+                if closed {
+                    return false;
+                }
+                found = true;
+            }
+            PositionReplayEvent::InstrumentClosed(_) if found => closed = true,
+            PositionReplayEvent::Operation(_) | PositionReplayEvent::Filled(_) if closed => {
+                return false;
+            }
+            _ => {}
+        }
+    }
+
+    closed
+}
+
+/// Returns redeemable physical holdings from settled cycles for an instrument and account.
+///
+/// Cycles are deduplicated by their stable identity so a source record and a retained current or
+/// snapshot position never count the same physical tokens twice. `None` means the available
+/// history is inconsistent and the redeem must remain unresolved.
+fn settled_redeem_sources(
+    cache: &mut Cache,
+    instrument_id: &InstrumentId,
+    account_id: AccountId,
+    strategy_id: Option<StrategyId>,
+    size_precision: u8,
+) -> Option<Vec<RedeemSource>> {
+    if let Err(e) = cache.restore_position_snapshots_for(instrument_id, account_id) {
+        log::warn!("Cannot restore position snapshots for {instrument_id}: {e}");
+        return None;
+    }
+
+    let mut cycles = AHashMap::new();
+
+    for position in closed_position_cycles(cache, instrument_id, account_id) {
+        if strategy_id.is_some_and(|strategy| position.strategy_id != strategy) {
+            continue;
+        }
+        cycles
+            .entry(settled_cycle_id(&position))
+            .or_insert(position);
+    }
+
+    let mut seen = AHashSet::new();
+    let mut sources = Vec::new();
+
+    for (key, position) in &cycles {
+        let Some(physical) = settled_physical_quantity(position) else {
+            if position
+                .replay_events
+                .iter()
+                .any(|event| matches!(event, PositionReplayEvent::InstrumentClosed(_)))
+            {
+                return None;
+            }
+            continue;
+        };
+        let consumed = settled_consumed(cache, position);
+        let remaining = physical.as_decimal() - consumed;
+        if remaining > Decimal::ZERO && seen.insert(key.clone()) {
+            sources.push(RedeemSource {
+                position_id: position.id,
+                strategy_id: position.strategy_id,
+                account_id: position.account_id,
+                size_precision: position.size_precision,
+                quantity: remaining,
+                open_position: None,
+                settled: true,
+            });
+        }
+    }
+
+    for source in cache.settled_position_source_records(instrument_id, account_id) {
+        if strategy_id.is_some_and(|strategy| source.strategy_id != strategy) {
+            continue;
+        }
+        let key = source.cycle_id.clone();
+        if !seen.insert(key.clone()) {
+            continue;
+        }
+        let position = cycles.get(&key)?;
+        let position_id = position.id;
+        let consumed = settled_consumed(cache, position);
+        let remaining = source.quantity.as_decimal() - consumed;
+        if remaining > Decimal::ZERO {
+            sources.push(RedeemSource {
+                position_id,
+                strategy_id: source.strategy_id,
+                account_id: source.account_id,
+                size_precision,
+                quantity: remaining,
+                open_position: None,
+                settled: true,
+            });
+        }
+    }
+    sources.sort_by_key(|source| source.position_id.to_string());
+    Some(sources)
+}
+
+/// Returns every closed cycle that can hold physical tokens for an instrument and account.
+///
+/// NETTING cycles archived before a reopen live as snapshot frames with their own `PositionId`, so
+/// a wallet-scoped redeem must inspect both the current position and those frames.
+fn closed_position_cycles(
+    cache: &Cache,
+    instrument_id: &InstrumentId,
+    account_id: AccountId,
+) -> Vec<Position> {
+    let mut sources = cache
+        .positions(None, Some(instrument_id), None, Some(&account_id), None)
+        .into_iter()
+        .filter(|position| position.is_closed())
+        .map(|position| position.cloned())
+        .collect::<Vec<_>>();
+    sources.extend(
+        cache
+            .position_snapshots(None, Some(&account_id))
+            .into_iter()
+            .filter(|position| position.instrument_id == *instrument_id && position.is_closed()),
+    );
+    sources.sort_by_key(|position| position.id.to_string());
+    sources.dedup_by_key(|position| position.id);
+    sources
 }
 
 /// Returns the physical quantity held when the position was economically settled.
@@ -2590,6 +3309,52 @@ fn settled_physical_quantity(position: &Position) -> Option<Quantity> {
     }
 
     Quantity::from_decimal_dp(settled?, position.size_precision).ok()
+}
+
+/// Returns the authoritative contract-expiration close for a settled conversion output.
+///
+/// A cached close of another type is not a settlement and cannot be used to compute the output's
+/// economic result.
+fn settled_output_close(
+    cache: &Cache,
+    instrument_id: &InstrumentId,
+) -> anyhow::Result<Option<InstrumentClose>> {
+    let Some(close) = cache.instrument_close(instrument_id) else {
+        return Ok(None);
+    };
+    anyhow::ensure!(
+        close.close_type == InstrumentCloseType::ContractExpired,
+        "instrument {instrument_id} has a non-settlement close and cannot be a settled conversion output"
+    );
+    Ok(Some(*close))
+}
+
+/// Validates the settlement basis of an expected conversion output before signing.
+///
+/// An expired output without an authoritative contract-expiration close cannot be classified as
+/// settled or unsettled, so the operation must be rejected before submission.
+fn ensure_output_settlement_evidence(
+    cache: &Cache,
+    instrument_id: &InstrumentId,
+    now: nautilus_core::UnixNanos,
+) -> anyhow::Result<()> {
+    if cache.instrument_close(instrument_id).is_some() {
+        settled_output_close(cache, instrument_id)?;
+        return Ok(());
+    }
+
+    let instrument = cache
+        .instrument(instrument_id)
+        .ok_or_else(|| anyhow::anyhow!("instrument {instrument_id} is not in the cache"))?;
+    if instrument
+        .expiration_ns()
+        .is_some_and(|expiration| !expiration.is_zero() && now >= expiration)
+    {
+        anyhow::bail!(
+            "conversion output {instrument_id} has expired without authoritative settlement evidence"
+        );
+    }
+    Ok(())
 }
 
 fn resolve_effects(
@@ -2759,7 +3524,7 @@ mod tests {
         instruments::{BinaryOption, InstrumentAny},
         orders::{OrderTestBuilder, stubs::TestOrderEventStubs},
         position_operation::{PositionOperationDirection, PositionOperationLeg},
-        types::{Currency, Price, Quantity},
+        types::{Currency, Money, Price, Quantity},
     };
     use rstest::rstest;
     use rust_decimal_macros::dec;
@@ -3774,7 +4539,7 @@ mod tests {
         assert_eq!(consumed, dec!(100));
 
         let settled_entries = cache.borrow().general_entries_with_prefix(&format!(
-            "{SETTLED_CONSUMPTION_PREFIX}:{}:",
+            "{SETTLED_CONSUMPTION_PREFIX}:operation:{}:",
             result.operation_id
         ));
         assert!(
@@ -3848,7 +4613,7 @@ mod tests {
             .add_position_without_order(&position, OmsType::Netting)
             .unwrap();
         let position_id = position.id;
-        let cycle_opened = position.ts_opened;
+        let cycle_id = settled_cycle_id(&position);
         let operation_id = UUID4::new();
         let leg = PositionOperationLeg {
             operation_id,
@@ -3877,11 +4642,7 @@ mod tests {
         let position = cache.position(&position_id).unwrap();
         assert_eq!(settled_consumed(&cache, &position), dec!(40));
         let operation_consumed = cache
-            .get(&settled_operation_key(
-                &operation_id,
-                position_id,
-                cycle_opened,
-            ))
+            .get(&settled_operation_key(&operation_id, &cycle_id))
             .unwrap()
             .and_then(|bytes| std::str::from_utf8(bytes).ok().map(str::to_string))
             .and_then(|value| Decimal::from_str(&value).ok())
@@ -4305,7 +5066,7 @@ mod tests {
         cache
             .borrow_mut()
             .add(
-                &settled_consumption_key(position.id, position.ts_opened),
+                &settled_consumption_key(&position),
                 bytes::Bytes::from_static(b"40"),
             )
             .unwrap();
@@ -4363,7 +5124,13 @@ mod tests {
     }
 
     #[rstest]
-    fn test_convert_rejects_settled_output_before_operation() {
+    #[case("0", dec!(-40))]
+    #[case("0.5", dec!(10))]
+    #[case("1", dec!(60))]
+    fn test_convert_receives_and_settles_output_with_known_payout(
+        #[case] close_price: &str,
+        #[case] expected_pnl: Decimal,
+    ) {
         let no = option("750", "No");
         let yes = option("751", "Yes");
         let (mut engine, cache) = engine_with(&[no.clone(), yes.clone()]);
@@ -4378,7 +5145,7 @@ mod tests {
             .borrow_mut()
             .add_instrument_close(InstrumentClose::new(
                 yes.id(),
-                Price::from("0"),
+                Price::from(close_price),
                 InstrumentCloseType::ContractExpired,
                 UnixNanos::from(5),
                 UnixNanos::from(5),
@@ -4397,19 +5164,38 @@ mod tests {
         );
         engine.process_position_operation(&result);
 
-        // The ample input position isolates the settled-output rejection: without the check the
-        // convert would otherwise apply successfully.
         let cache = cache.borrow();
         let no_position = cache
             .position(&netting_position_id(&no.id(), strategy))
             .expect("input position must remain");
-        assert!(!no_position.is_closed());
-        assert_eq!(no_position.quantity, Quantity::from("100"));
-        assert!(
-            cache
-                .position(&netting_position_id(&yes.id(), strategy))
-                .is_none()
+        assert!(no_position.is_closed());
+        assert_eq!(
+            no_position.realized_pnl,
+            Some(Money::zero(Currency::pUSD()))
         );
+
+        let yes_position = cache
+            .position(&netting_position_id(&yes.id(), strategy))
+            .expect("settled output must be received");
+        assert!(yes_position.is_closed());
+        assert!(yes_position.is_settled());
+        assert_eq!(yes_position.quantity, Quantity::from("0"));
+        assert_eq!(yes_position.cost_open, Decimal::ZERO);
+        assert_eq!(
+            yes_position.realized_pnl,
+            Some(Money::from_decimal(expected_pnl, Currency::pUSD()).unwrap())
+        );
+        assert_eq!(
+            settled_physical_quantity(&yes_position),
+            Some(Quantity::from("100"))
+        );
+        assert!(matches!(
+            yes_position.replay_events.as_slice(),
+            [
+                PositionReplayEvent::Operation(_),
+                PositionReplayEvent::InstrumentClosed(_)
+            ]
+        ));
     }
 
     #[rstest]
@@ -4564,9 +5350,282 @@ mod tests {
     }
 
     #[rstest]
-    fn test_barrier_rejects_settled_convert_scope_but_allows_redeem() {
-        let yes = option("790", "Yes");
-        let (engine, cache) = engine_with(std::slice::from_ref(&yes));
+    fn test_convert_mixes_settled_and_unsettled_outputs() {
+        let no = option("820", "No");
+        let settled_yes = option("821", "Yes");
+        let open_yes = option("822", "Yes");
+        let (mut engine, cache) = engine_with(&[no.clone(), settled_yes.clone(), open_yes.clone()]);
+        let strategy = StrategyId::from("STRATEGY-001");
+        let account = AccountId::from("ACCOUNT-001");
+        let position = input_position(&no, strategy, account, Quantity::from("100"), dec!(150));
+        cache
+            .borrow_mut()
+            .add_position_without_order(&position, OmsType::Netting)
+            .unwrap();
+        cache
+            .borrow_mut()
+            .add_instrument_close(InstrumentClose::new(
+                settled_yes.id(),
+                Price::from("1"),
+                InstrumentCloseType::ContractExpired,
+                UnixNanos::from(5),
+                UnixNanos::from(5),
+            ))
+            .unwrap();
+
+        let result = result(
+            PositionOperationType::Convert,
+            vec![no.id(), settled_yes.id(), open_yes.id()],
+            PositionOperationEffects {
+                received: vec![amount("821", "99"), amount("822", "99")],
+                spent: vec![amount("820", "100")],
+                collateral_delta: "0".into(),
+                payouts: Vec::new(),
+            },
+        );
+        engine.process_position_operation(&result);
+
+        let cache = cache.borrow();
+        let settled = cache
+            .position(&netting_position_id(&settled_yes.id(), strategy))
+            .expect("settled output must be received")
+            .clone();
+        assert!(settled.is_closed());
+        assert!(settled.is_settled());
+        assert_eq!(
+            settled.realized_pnl,
+            Some(Money::new(24.0, Currency::pUSD()))
+        );
+        assert_eq!(
+            settled_physical_quantity(&settled),
+            Some(Quantity::from("99"))
+        );
+
+        let open = cache
+            .position(&netting_position_id(&open_yes.id(), strategy))
+            .expect("unsettled output must open")
+            .clone();
+        assert!(open.is_open());
+        assert_eq!(open.quantity, Quantity::from("99"));
+        assert_eq!(open.cost_open, dec!(75));
+    }
+
+    #[rstest]
+    fn test_convert_settles_output_once_when_close_arrives_during_operation() {
+        let no = option("840", "No");
+        let yes = option("841", "Yes");
+        let (mut engine, cache) = engine_with(&[no.clone(), yes.clone()]);
+        let strategy = StrategyId::from("STRATEGY-001");
+        let account = AccountId::from("ACCOUNT-001");
+        let position = input_position(&no, strategy, account, Quantity::from("100"), dec!(50));
+        cache
+            .borrow_mut()
+            .add_position_without_order(&position, OmsType::Netting)
+            .unwrap();
+
+        let operation_id = UUID4::new();
+        let inputs = BarrierInputs {
+            strategy_id: strategy,
+            account_id: account,
+            quantity: Some(Quantity::from("100")),
+            instrument_ids: vec![no.id()],
+        };
+        engine
+            .establish_full_barrier(
+                operation_id,
+                PositionOperationType::Convert,
+                &[no.id(), yes.id()],
+                Some(&inputs),
+            )
+            .unwrap();
+        engine.settle_instrument_close(&InstrumentClose::new(
+            yes.id(),
+            Price::from("0"),
+            InstrumentCloseType::ContractExpired,
+            UnixNanos::from(5),
+            UnixNanos::from(5),
+        ));
+
+        let mut result = result(
+            PositionOperationType::Convert,
+            vec![no.id(), yes.id()],
+            PositionOperationEffects {
+                received: vec![amount("841", "99")],
+                spent: vec![amount("840", "100")],
+                collateral_delta: "0".into(),
+                payouts: Vec::new(),
+            },
+        );
+        result.operation_id = operation_id;
+        engine.process_position_operation(&result);
+
+        assert_eq!(engine.position_operation_barrier(&no.id()), None);
+        assert_eq!(engine.position_operation_barrier(&yes.id()), None);
+
+        let yes_position_id = netting_position_id(&yes.id(), strategy);
+        let yes_position = cache
+            .borrow()
+            .position(&yes_position_id)
+            .expect("settled output must be received")
+            .cloned();
+        assert!(yes_position.is_closed());
+        assert!(yes_position.is_settled());
+        assert_eq!(
+            yes_position.realized_pnl,
+            Some(Money::new(-50.0, Currency::pUSD()))
+        );
+        assert_eq!(
+            settled_physical_quantity(&yes_position),
+            Some(Quantity::from("99"))
+        );
+        assert_eq!(yes_position.ts_opened, UnixNanos::from(1_000_000_000));
+        assert_eq!(yes_position.ts_last, yes_position.ts_opened);
+        assert_eq!(yes_position.ts_closed, Some(yes_position.ts_opened));
+        assert_eq!(
+            yes_position
+                .replay_events
+                .iter()
+                .filter(|event| matches!(event, PositionReplayEvent::InstrumentClosed(_)))
+                .count(),
+            1
+        );
+        assert_eq!(
+            cache
+                .borrow()
+                .instrument_close(&yes.id())
+                .map(|close| close.ts_event),
+            Some(UnixNanos::from(5)),
+            "the original market result timestamp must be retained"
+        );
+        let close_event = yes_position
+            .replay_events
+            .iter()
+            .find_map(|event| match event {
+                PositionReplayEvent::InstrumentClosed(close) => Some(close),
+                _ => None,
+            })
+            .expect("settlement replay event must exist");
+        assert_eq!(close_event.ts_event, yes_position.ts_opened);
+        assert_eq!(close_event.ts_init, UnixNanos::from(5));
+        assert_eq!(close_event.close_price, Price::from("0"));
+
+        engine.process_position_operation(&result);
+
+        let after = cache
+            .borrow()
+            .position(&yes_position_id)
+            .expect("settled output must remain")
+            .cloned();
+        assert_eq!(after, yes_position);
+
+        engine.settle_instrument_close(&InstrumentClose::new(
+            yes.id(),
+            Price::from("0"),
+            InstrumentCloseType::ContractExpired,
+            UnixNanos::from(5),
+            UnixNanos::from(5),
+        ));
+        assert_eq!(
+            cache
+                .borrow()
+                .position(&yes_position_id)
+                .expect("settled output must remain")
+                .cloned(),
+            yes_position,
+            "repeated close evidence must not settle the output twice"
+        );
+    }
+
+    #[rstest]
+    fn test_recovery_applies_unapplied_settled_convert_output() {
+        let no = option("812", "No");
+        let yes = option("813", "Yes");
+        let (mut engine, cache) = engine_with(&[no.clone(), yes.clone()]);
+        let strategy = StrategyId::from("STRATEGY-001");
+        let account = AccountId::from("ACCOUNT-001");
+        let position = input_position(&no, strategy, account, Quantity::from("100"), dec!(40));
+        cache
+            .borrow_mut()
+            .add_position_without_order(&position, OmsType::Netting)
+            .unwrap();
+        cache
+            .borrow_mut()
+            .add_instrument_close(InstrumentClose::new(
+                yes.id(),
+                Price::from("0"),
+                InstrumentCloseType::ContractExpired,
+                UnixNanos::from(5),
+                UnixNanos::from(5),
+            ))
+            .unwrap();
+
+        let effects = PositionOperationEffects {
+            received: vec![amount("813", "99")],
+            spent: vec![amount("812", "100")],
+            collateral_delta: "0".into(),
+            payouts: Vec::new(),
+        };
+        let result = result(
+            PositionOperationType::Convert,
+            vec![no.id(), yes.id()],
+            effects.clone(),
+        );
+        let recovery = recovery_request(&result, effects, Vec::new());
+        let outcome = engine
+            .reconcile_recovered_position_operation(&recovery)
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            PositionOperationRecoveryOutcome::Applied { .. }
+        ));
+
+        let yes_position = cache
+            .borrow()
+            .position(&netting_position_id(&yes.id(), strategy))
+            .expect("settled output must be received")
+            .cloned();
+        assert!(yes_position.is_settled());
+        assert_eq!(
+            yes_position.realized_pnl,
+            Some(Money::new(-40.0, Currency::pUSD()))
+        );
+        assert_eq!(
+            settled_physical_quantity(&yes_position),
+            Some(Quantity::from("99"))
+        );
+    }
+
+    #[rstest]
+    fn test_convert_output_adds_to_existing_settled_holding_and_redeems_both() {
+        let no = option("830", "No");
+        let yes = option("831", "Yes");
+        let (mut engine, cache) = engine_with(&[no.clone(), yes.clone()]);
+        let strategy = StrategyId::from("STRATEGY-001");
+        let account = AccountId::from("ACCOUNT-001");
+        let input = input_position(&no, strategy, account, Quantity::from("100"), dec!(40));
+        cache
+            .borrow_mut()
+            .add_position_without_order(&input, OmsType::Netting)
+            .unwrap();
+
+        let mut existing = input_position(&yes, strategy, account, Quantity::from("50"), dec!(20));
+        existing
+            .apply_instrument_close(InstrumentClose::new(
+                yes.id(),
+                Price::from("1"),
+                InstrumentCloseType::ContractExpired,
+                UnixNanos::from(5),
+                UnixNanos::from(5),
+            ))
+            .unwrap();
+        cache
+            .borrow_mut()
+            .add_position_without_order(&existing, OmsType::Netting)
+            .unwrap();
+        cache
+            .borrow_mut()
+            .record_settled_position_source(&existing, Quantity::from("50"))
+            .unwrap();
         cache
             .borrow_mut()
             .add_instrument_close(InstrumentClose::new(
@@ -4578,16 +5637,1339 @@ mod tests {
             ))
             .unwrap();
 
-        assert!(
-            engine
-                .establish_full_barrier(
-                    UUID4::new(),
-                    PositionOperationType::Convert,
-                    &[yes.id()],
-                    None,
-                )
-                .is_err()
+        let convert = result(
+            PositionOperationType::Convert,
+            vec![no.id(), yes.id()],
+            PositionOperationEffects {
+                received: vec![amount("831", "99")],
+                spent: vec![amount("830", "100")],
+                collateral_delta: "0".into(),
+                payouts: Vec::new(),
+            },
         );
+        engine.process_position_operation(&convert);
+
+        let redeem = result(
+            PositionOperationType::Redeem,
+            vec![yes.id()],
+            PositionOperationEffects {
+                received: Vec::new(),
+                spent: vec![amount("831", "149")],
+                collateral_delta: "149".into(),
+                payouts: vec![PositionOperationTokenPayout {
+                    token_id: "831".into(),
+                    numerator: "1".into(),
+                    denominator: "1".into(),
+                }],
+            },
+        );
+        engine.process_position_operation(&redeem);
+
+        let cache = cache.borrow();
+        let current = cache
+            .position(&netting_position_id(&yes.id(), strategy))
+            .expect("new settled cycle must exist");
+        assert_eq!(settled_consumed(&cache, &current), dec!(99));
+        let snapshots = cache.position_snapshots(Some(&current.id), Some(&account));
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(settled_consumed(&cache, &snapshots[0]), dec!(50));
+    }
+
+    #[rstest]
+    #[case(false)]
+    #[case(true)]
+    fn test_recovery_completes_saved_receive_missing_settlement(#[case] recorded_legs: bool) {
+        let no = option("814", "No");
+        let yes = option("815", "Yes");
+        let (mut engine, cache) = engine_with(&[no.clone(), yes.clone()]);
+        let strategy = StrategyId::from("STRATEGY-001");
+        let account = AccountId::from("ACCOUNT-001");
+        let position = input_position(&no, strategy, account, Quantity::from("100"), dec!(40));
+        cache
+            .borrow_mut()
+            .add_position_without_order(&position, OmsType::Netting)
+            .unwrap();
+
+        let effects = PositionOperationEffects {
+            received: vec![amount("815", "99")],
+            spent: vec![amount("814", "100")],
+            collateral_delta: "0".into(),
+            payouts: Vec::new(),
+        };
+        let result = result(
+            PositionOperationType::Convert,
+            vec![no.id(), yes.id()],
+            effects.clone(),
+        );
+        engine.process_position_operation(&result);
+
+        let yes_position_id = netting_position_id(&yes.id(), strategy);
+        {
+            let cache = cache.borrow();
+            let open = cache.position(&yes_position_id).unwrap();
+            assert!(open.is_open(), "receive is saved without its settlement");
+        }
+
+        cache
+            .borrow_mut()
+            .add_instrument_close(InstrumentClose::new(
+                yes.id(),
+                Price::from("0"),
+                InstrumentCloseType::ContractExpired,
+                UnixNanos::from(5),
+                UnixNanos::from(5),
+            ))
+            .unwrap();
+
+        let applied_legs = if recorded_legs {
+            recovery_legs(&replay_legs(&cache, result.operation_id))
+        } else {
+            Vec::new()
+        };
+        let recovery = recovery_request(&result, effects, applied_legs);
+        let outcome = engine
+            .reconcile_recovered_position_operation(&recovery)
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            PositionOperationRecoveryOutcome::Applied { .. }
+        ));
+
+        let settled = cache
+            .borrow()
+            .position(&yes_position_id)
+            .expect("received output must remain")
+            .cloned();
+        assert!(settled.is_closed());
+        assert!(settled.is_settled());
+        assert_eq!(settled.quantity, Quantity::from("0"));
+        assert_eq!(
+            settled.realized_pnl,
+            Some(Money::new(-40.0, Currency::pUSD()))
+        );
+        assert_eq!(
+            settled_physical_quantity(&settled),
+            Some(Quantity::from("99"))
+        );
+        assert_eq!(settled.ts_opened, UnixNanos::from(1_000_000_000));
+        assert_eq!(settled.ts_last, settled.ts_opened);
+        assert_eq!(settled.ts_closed, Some(settled.ts_opened));
+        assert!(
+            settled.ts_closed >= Some(settled.ts_opened),
+            "settlement confirmation must not precede the receive"
+        );
+        assert_eq!(
+            settled
+                .replay_events
+                .iter()
+                .filter(|event| matches!(event, PositionReplayEvent::Operation(_)))
+                .count(),
+            1,
+            "recovery must not receive the output again"
+        );
+        assert_eq!(
+            settled
+                .replay_events
+                .iter()
+                .filter(|event| matches!(event, PositionReplayEvent::InstrumentClosed(_)))
+                .count(),
+            1
+        );
+        assert_eq!(
+            cache
+                .borrow()
+                .instrument_close(&yes.id())
+                .map(|close| close.ts_event),
+            Some(UnixNanos::from(5))
+        );
+        let close_event = settled
+            .replay_events
+            .iter()
+            .find_map(|event| match event {
+                PositionReplayEvent::InstrumentClosed(close) => Some(close),
+                _ => None,
+            })
+            .expect("settlement replay event must exist");
+        assert_eq!(close_event.ts_event, settled.ts_opened);
+        assert_eq!(close_event.ts_init, UnixNanos::from(5));
+        assert_eq!(close_event.close_price, Price::from("0"));
+
+        let before = settled;
+        let outcome = engine
+            .reconcile_recovered_position_operation(&recovery)
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            PositionOperationRecoveryOutcome::Applied { .. }
+        ));
+        assert_eq!(
+            cache.borrow().position(&yes_position_id).unwrap().cloned(),
+            before,
+            "repeated recovery must not change the settled position"
+        );
+    }
+
+    #[rstest]
+    fn test_restore_operation_barriers_restores_archived_cycle_index() {
+        let yes = option("818", "Yes");
+        let strategy = StrategyId::from("STRATEGY-001");
+        let account = AccountId::from("ACCOUNT-001");
+        let mut position = input_position(&yes, strategy, account, Quantity::from("100"), dec!(40));
+        position
+            .apply_instrument_close(InstrumentClose::new(
+                yes.id(),
+                Price::from("1"),
+                InstrumentCloseType::ContractExpired,
+                UnixNanos::from(5),
+                UnixNanos::from(5),
+            ))
+            .unwrap();
+        let position_id = position.id;
+
+        let source_cache = Rc::new(RefCell::new(Cache::default()));
+        source_cache
+            .borrow_mut()
+            .add_instrument(yes.clone())
+            .unwrap();
+        source_cache
+            .borrow_mut()
+            .add_position_without_order(&position, OmsType::Netting)
+            .unwrap();
+        source_cache
+            .borrow_mut()
+            .snapshot_position(&position)
+            .unwrap();
+        let frames = source_cache
+            .borrow()
+            .position_snapshot_bytes(&position_id)
+            .expect("snapshot frames must exist");
+
+        let rebuilt = Rc::new(RefCell::new(Cache::default()));
+        rebuilt.borrow_mut().add_instrument(yes.clone()).unwrap();
+        rebuilt
+            .borrow_mut()
+            .add_position_without_order(&position, OmsType::Netting)
+            .unwrap();
+
+        for (index, bytes) in frames.into_iter().enumerate() {
+            let key = format!(
+                "{}{}/{}",
+                nautilus_common::cache::CacheSnapshotRef::POSITION_PREFIX,
+                position_id,
+                index
+            );
+            rebuilt
+                .borrow_mut()
+                .add(&key, bytes::Bytes::from(bytes))
+                .unwrap();
+        }
+        assert!(
+            rebuilt
+                .borrow()
+                .position_snapshots(Some(&position_id), Some(&account))
+                .is_empty()
+        );
+
+        let operation_id = UUID4::new();
+        let record = serde_json::json!({
+            "operation_id": operation_id,
+            "account_id": account,
+            "application_status": "Pending",
+            "venue_status": "Submitted",
+            "barrier_instrument_ids": [yes.id()],
+        });
+        rebuilt
+            .borrow_mut()
+            .add(
+                &format!("position-operation:{operation_id}"),
+                serde_json::to_vec(&record).unwrap().into(),
+            )
+            .unwrap();
+        let engine = ExecutionEngine::new(
+            Rc::new(RefCell::new(VirtualClock::new())),
+            rebuilt.clone(),
+            None,
+        );
+
+        engine.restore_position_operation_barriers();
+
+        assert_eq!(
+            rebuilt
+                .borrow()
+                .position_snapshots(Some(&position_id), Some(&account))
+                .len(),
+            1
+        );
+        assert_eq!(
+            engine.position_operation_barrier(&yes.id()),
+            Some(operation_id)
+        );
+    }
+
+    #[rstest]
+    fn test_recovery_completes_output_sold_before_market_settlement() {
+        let no = option("816", "No");
+        let yes = option("817", "Yes");
+        let (mut engine, cache) = engine_with(&[no.clone(), yes.clone()]);
+        let strategy = StrategyId::from("STRATEGY-001");
+        let account = AccountId::from("ACCOUNT-001");
+        let position = input_position(&no, strategy, account, Quantity::from("100"), dec!(40));
+        cache
+            .borrow_mut()
+            .add_position_without_order(&position, OmsType::Netting)
+            .unwrap();
+
+        let effects = PositionOperationEffects {
+            received: vec![amount("817", "99")],
+            spent: vec![amount("816", "100")],
+            collateral_delta: "0".into(),
+            payouts: Vec::new(),
+        };
+        let result = result(
+            PositionOperationType::Convert,
+            vec![no.id(), yes.id()],
+            effects.clone(),
+        );
+        engine.process_position_operation(&result);
+
+        let yes_position_id = netting_position_id(&yes.id(), strategy);
+        let sell_order = OrderTestBuilder::new(OrderType::Market)
+            .instrument_id(yes.id())
+            .side(OrderSide::Sell)
+            .quantity(Quantity::from("99"))
+            .build();
+        let sell_event = TestOrderEventStubs::filled(
+            &sell_order,
+            &yes,
+            Some(TradeId::new("SELL-YES")),
+            Some(yes_position_id),
+            Some(Price::from("0.50")),
+            Some(Quantity::from("99")),
+            Some(LiquiditySide::Taker),
+            None,
+            None,
+            Some(account),
+        );
+        let OrderEventAny::Filled(sell_fill) = sell_event else {
+            panic!("expected a filled sell event");
+        };
+        let mut sold = cache
+            .borrow()
+            .position(&yes_position_id)
+            .expect("received output must exist")
+            .cloned();
+        sold.try_apply(&sell_fill).unwrap();
+        cache
+            .borrow_mut()
+            .replace_position(&sold, OmsType::Netting, false, false)
+            .unwrap();
+        assert!(sold.is_closed());
+        assert!(!sold.is_settled());
+
+        cache
+            .borrow_mut()
+            .add_instrument_close(InstrumentClose::new(
+                yes.id(),
+                Price::from("0"),
+                InstrumentCloseType::ContractExpired,
+                UnixNanos::from(5),
+                UnixNanos::from(5),
+            ))
+            .unwrap();
+        let record = serde_json::json!({
+            "operation_id": result.operation_id,
+            "application_status": "Pending",
+            "venue_status": "Submitted",
+            "barrier_instrument_ids": [no.id(), yes.id()],
+        });
+        cache
+            .borrow_mut()
+            .add(
+                &format!("position-operation:{}", result.operation_id),
+                serde_json::to_vec(&record).unwrap().into(),
+            )
+            .unwrap();
+        engine.restore_position_operation_barriers();
+        assert_eq!(
+            engine.position_operation_barrier(&yes.id()),
+            Some(result.operation_id)
+        );
+
+        let recovery = recovery_request(&result, effects, Vec::new());
+        let outcome = engine
+            .reconcile_recovered_position_operation(&recovery)
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            PositionOperationRecoveryOutcome::Applied { .. }
+        ));
+
+        assert_eq!(engine.position_operation_barrier(&no.id()), None);
+        assert_eq!(engine.position_operation_barrier(&yes.id()), None);
+        let after = cache
+            .borrow()
+            .position(&yes_position_id)
+            .expect("sold output must remain")
+            .cloned();
+        assert_eq!(after, sold, "recovery must not change the completed sale");
+        assert_eq!(after.realized_pnl, Some(Money::new(9.5, Currency::pUSD())));
+        assert!(!after.is_settled());
+        assert!(
+            !after
+                .replay_events
+                .iter()
+                .any(|event| matches!(event, PositionReplayEvent::InstrumentClosed(_)))
+        );
+    }
+
+    #[rstest]
+    fn test_recovery_of_settled_convert_output_does_not_duplicate() {
+        let no = option("810", "No");
+        let yes = option("811", "Yes");
+        let (mut engine, cache) = engine_with(&[no.clone(), yes.clone()]);
+        let strategy = StrategyId::from("STRATEGY-001");
+        let account = AccountId::from("ACCOUNT-001");
+        let position = input_position(&no, strategy, account, Quantity::from("100"), dec!(40));
+        cache
+            .borrow_mut()
+            .add_position_without_order(&position, OmsType::Netting)
+            .unwrap();
+        cache
+            .borrow_mut()
+            .add_instrument_close(InstrumentClose::new(
+                yes.id(),
+                Price::from("1"),
+                InstrumentCloseType::ContractExpired,
+                UnixNanos::from(5),
+                UnixNanos::from(5),
+            ))
+            .unwrap();
+        let effects = PositionOperationEffects {
+            received: vec![amount("811", "100")],
+            spent: vec![amount("810", "100")],
+            collateral_delta: "0".into(),
+            payouts: Vec::new(),
+        };
+        let result = result(
+            PositionOperationType::Convert,
+            vec![no.id(), yes.id()],
+            effects.clone(),
+        );
+        engine.process_position_operation(&result);
+
+        let yes_position_id = netting_position_id(&yes.id(), strategy);
+        let before = cache.borrow().position(&yes_position_id).unwrap().cloned();
+        let recovery = recovery_request(&result, effects, Vec::new());
+        let outcome = engine
+            .reconcile_recovered_position_operation(&recovery)
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            PositionOperationRecoveryOutcome::Applied { .. }
+        ));
+        let after = cache.borrow().position(&yes_position_id).unwrap().cloned();
+        assert_eq!(before, after);
+        assert_eq!(replay_legs(&cache, result.operation_id).len(), 2);
+    }
+
+    #[rstest]
+    #[case(false)]
+    #[case(true)]
+    fn test_repeated_settled_convert_outputs_redeem_all_cycles(#[case] same_timestamp: bool) {
+        let no1 = option("800", "No");
+        let no2 = option("802", "No");
+        let yes = option("801", "Yes");
+        let (mut engine, cache) = engine_with(&[no1.clone(), no2.clone(), yes.clone()]);
+        let strategy = StrategyId::from("STRATEGY-001");
+        let account = AccountId::from("ACCOUNT-001");
+
+        for instrument in [&no1, &no2] {
+            let position = input_position(
+                instrument,
+                strategy,
+                account,
+                Quantity::from("100"),
+                dec!(40),
+            );
+            cache
+                .borrow_mut()
+                .add_position_without_order(&position, OmsType::Netting)
+                .unwrap();
+        }
+        cache
+            .borrow_mut()
+            .add_instrument_close(InstrumentClose::new(
+                yes.id(),
+                Price::from("1"),
+                InstrumentCloseType::ContractExpired,
+                UnixNanos::from(5),
+                UnixNanos::from(5),
+            ))
+            .unwrap();
+        let yes_position_id = netting_position_id(&yes.id(), strategy);
+
+        let first = result(
+            PositionOperationType::Convert,
+            vec![no1.id(), yes.id()],
+            PositionOperationEffects {
+                received: vec![amount("801", "100")],
+                spent: vec![amount("800", "100")],
+                collateral_delta: "0".into(),
+                payouts: Vec::new(),
+            },
+        );
+        engine.process_position_operation(&first);
+
+        let partial = result(
+            PositionOperationType::Redeem,
+            vec![yes.id()],
+            PositionOperationEffects {
+                received: Vec::new(),
+                spent: vec![amount("801", "40")],
+                collateral_delta: "40".into(),
+                payouts: Vec::new(),
+            },
+        );
+        engine.process_position_operation(&partial);
+        {
+            let cache = cache.borrow();
+            let position = cache.position(&yes_position_id).unwrap();
+            assert_eq!(settled_consumed(&cache, &position), dec!(40));
+        }
+
+        let mut second = result(
+            PositionOperationType::Convert,
+            vec![no2.id(), yes.id()],
+            PositionOperationEffects {
+                received: vec![amount("801", "100")],
+                spent: vec![amount("802", "100")],
+                collateral_delta: "0".into(),
+                payouts: Vec::new(),
+            },
+        );
+
+        if !same_timestamp {
+            second.ts_event = UnixNanos::from(2_000_000_000);
+            second.ts_init = UnixNanos::from(2_000_000_001);
+        }
+        engine.process_position_operation(&second);
+
+        let snapshots = cache
+            .borrow()
+            .position_snapshots(Some(&yes_position_id), Some(&account));
+        assert_eq!(snapshots.len(), 1, "the first settled cycle is archived");
+        assert_eq!(
+            cache
+                .borrow()
+                .settled_position_source_records(&yes.id(), account)
+                .len(),
+            2,
+            "same-timestamp operations must retain distinct physical sources"
+        );
+
+        let redeem_effects = PositionOperationEffects {
+            received: Vec::new(),
+            spent: vec![amount("801", "160")],
+            collateral_delta: "160".into(),
+            payouts: vec![PositionOperationTokenPayout {
+                token_id: "801".into(),
+                numerator: "1".into(),
+                denominator: "1".into(),
+            }],
+        };
+        let full = result(
+            PositionOperationType::Redeem,
+            vec![yes.id()],
+            redeem_effects.clone(),
+        );
+
+        // Persist the position, its source records, consumption state, and snapshot bytes into a
+        // fresh cache. The normal load path restores blobs without their frame index.
+        let rebuilt_cache = Rc::new(RefCell::new(Cache::default()));
+        for instrument in [&no1, &no2, &yes] {
+            rebuilt_cache
+                .borrow_mut()
+                .add_instrument(instrument.clone())
+                .unwrap();
+        }
+        let persisted_position = cache
+            .borrow()
+            .position(&yes_position_id)
+            .expect("current position must exist")
+            .cloned();
+        rebuilt_cache
+            .borrow_mut()
+            .add_position_without_order(&persisted_position, OmsType::Netting)
+            .unwrap();
+        let mut persisted_entries = cache
+            .borrow()
+            .general_entries_with_prefix("position-settlement-source:");
+        persisted_entries.extend(
+            cache
+                .borrow()
+                .general_entries_with_prefix("position-operation-settled:"),
+        );
+
+        for (key, bytes) in persisted_entries {
+            rebuilt_cache.borrow_mut().add(&key, bytes).unwrap();
+        }
+
+        if let Some(frames) = cache.borrow().position_snapshot_bytes(&yes_position_id) {
+            for (index, bytes) in frames.into_iter().enumerate() {
+                let key = format!(
+                    "{}{}/{}",
+                    nautilus_common::cache::CacheSnapshotRef::POSITION_PREFIX,
+                    yes_position_id,
+                    index
+                );
+                rebuilt_cache
+                    .borrow_mut()
+                    .add(&key, bytes::Bytes::from(bytes))
+                    .unwrap();
+            }
+        }
+        assert!(
+            rebuilt_cache
+                .borrow()
+                .position_snapshots(Some(&yes_position_id), Some(&account))
+                .is_empty(),
+            "the rebuilt cache must not have a restored snapshot index"
+        );
+        let mut rebuilt_engine = ExecutionEngine::new(
+            Rc::new(RefCell::new(VirtualClock::new())),
+            rebuilt_cache.clone(),
+            None,
+        );
+
+        engine.process_position_operation(&full);
+
+        {
+            let cache = cache.borrow();
+            let current = cache.position(&yes_position_id).unwrap();
+            assert_eq!(settled_consumed(&cache, &current), dec!(100));
+            assert_eq!(settled_consumed(&cache, &snapshots[0]), dec!(100));
+        }
+        assert!(replay_legs(&cache, full.operation_id).is_empty());
+
+        let rebuilt_full = result(
+            PositionOperationType::Redeem,
+            vec![yes.id()],
+            redeem_effects,
+        );
+        rebuilt_engine.process_position_operation(&rebuilt_full);
+
+        {
+            let cache = rebuilt_cache.borrow();
+            let current = cache.position(&yes_position_id).unwrap();
+            assert_eq!(
+                settled_consumed(&cache, &current),
+                dec!(100),
+                "rebuilt cache must consume the current cycle"
+            );
+            let restored = cache.position_snapshots(Some(&yes_position_id), Some(&account));
+            assert_eq!(restored.len(), 1, "snapshot frame index must be restored");
+            assert_eq!(
+                settled_consumed(&cache, &restored[0]),
+                dec!(100),
+                "rebuilt cache must consume the archived cycle"
+            );
+        }
+    }
+
+    #[rstest]
+    #[case(false, false)]
+    #[case(false, true)]
+    #[case(true, false)]
+    #[case(true, true)]
+    fn test_recover_old_redeem_uses_archived_cycle(
+        #[case] recorded_legs: bool,
+        #[case] legacy_marker: bool,
+    ) {
+        let no1 = option("850", "No");
+        let no2 = option("852", "No");
+        let yes = option("851", "Yes");
+        let (mut engine, cache) = engine_with(&[no1.clone(), no2.clone(), yes.clone()]);
+        let strategy = StrategyId::from("STRATEGY-001");
+        let account = AccountId::from("ACCOUNT-001");
+
+        for instrument in [&no1, &no2] {
+            let position = input_position(
+                instrument,
+                strategy,
+                account,
+                Quantity::from("100"),
+                dec!(40),
+            );
+            cache
+                .borrow_mut()
+                .add_position_without_order(&position, OmsType::Netting)
+                .unwrap();
+        }
+        cache
+            .borrow_mut()
+            .add_instrument_close(InstrumentClose::new(
+                yes.id(),
+                Price::from("1"),
+                InstrumentCloseType::ContractExpired,
+                UnixNanos::from(5),
+                UnixNanos::from(5),
+            ))
+            .unwrap();
+        let yes_position_id = netting_position_id(&yes.id(), strategy);
+
+        let first = result(
+            PositionOperationType::Convert,
+            vec![no1.id(), yes.id()],
+            PositionOperationEffects {
+                received: vec![amount("851", "100")],
+                spent: vec![amount("850", "100")],
+                collateral_delta: "0".into(),
+                payouts: Vec::new(),
+            },
+        );
+        engine.process_position_operation(&first);
+
+        let redeem_effects = PositionOperationEffects {
+            received: Vec::new(),
+            spent: vec![amount("851", "100")],
+            collateral_delta: "100".into(),
+            payouts: Vec::new(),
+        };
+        let redeem = result(
+            PositionOperationType::Redeem,
+            vec![yes.id()],
+            redeem_effects.clone(),
+        );
+        engine.process_position_operation(&redeem);
+
+        let mut second = result(
+            PositionOperationType::Convert,
+            vec![no2.id(), yes.id()],
+            PositionOperationEffects {
+                received: vec![amount("851", "100")],
+                spent: vec![amount("852", "100")],
+                collateral_delta: "0".into(),
+                payouts: Vec::new(),
+            },
+        );
+        second.ts_event = UnixNanos::from(2_000_000_000);
+        second.ts_init = UnixNanos::from(2_000_000_001);
+        engine.process_position_operation(&second);
+
+        let current = cache
+            .borrow()
+            .position(&yes_position_id)
+            .expect("new cycle must exist")
+            .cloned();
+        let mut rebuilt_cache = Cache::default();
+        rebuilt_cache.add_instrument(yes.clone()).unwrap();
+        rebuilt_cache
+            .add_position_without_order(&current, OmsType::Netting)
+            .unwrap();
+        let mut persisted_entries = cache
+            .borrow()
+            .general_entries_with_prefix("position-settlement-source:");
+        persisted_entries.extend(
+            cache
+                .borrow()
+                .general_entries_with_prefix("position-operation-settled:"),
+        );
+        let archived_cycle = cache
+            .borrow()
+            .position_snapshots(Some(&yes_position_id), Some(&account))
+            .first()
+            .expect("archived cycle must exist")
+            .ts_opened;
+        let new_marker_prefix = format!(
+            "{SETTLED_CONSUMPTION_PREFIX}:operation:{}:",
+            redeem.operation_id
+        );
+        let legacy_marker_key = format!(
+            "{SETTLED_CONSUMPTION_PREFIX}:{}:{}:{}",
+            redeem.operation_id, yes_position_id, archived_cycle
+        );
+
+        for (key, bytes) in persisted_entries {
+            if legacy_marker && key.starts_with(&new_marker_prefix) {
+                rebuilt_cache.add(&legacy_marker_key, bytes).unwrap();
+            } else {
+                rebuilt_cache.add(&key, bytes).unwrap();
+            }
+        }
+
+        if let Some(frames) = cache.borrow().position_snapshot_bytes(&yes_position_id) {
+            for (index, bytes) in frames.into_iter().enumerate() {
+                let key = format!(
+                    "{}{}/{}",
+                    nautilus_common::cache::CacheSnapshotRef::POSITION_PREFIX,
+                    yes_position_id,
+                    index
+                );
+                rebuilt_cache.add(&key, bytes::Bytes::from(bytes)).unwrap();
+            }
+        }
+        let record = serde_json::json!({
+            "operation_id": redeem.operation_id,
+            "account_id": account,
+            "application_status": "Pending",
+            "venue_status": "Submitted",
+            "barrier_instrument_ids": [yes.id()],
+        });
+        rebuilt_cache
+            .add(
+                &format!("position-operation:{}", redeem.operation_id),
+                serde_json::to_vec(&record).unwrap().into(),
+            )
+            .unwrap();
+
+        let rebuilt = Rc::new(RefCell::new(rebuilt_cache));
+        let mut rebuilt_engine = ExecutionEngine::new(
+            Rc::new(RefCell::new(VirtualClock::new())),
+            rebuilt.clone(),
+            None,
+        );
+        rebuilt_engine.restore_position_operation_barriers();
+        assert_eq!(
+            rebuilt_engine.position_operation_barrier(&yes.id()),
+            Some(redeem.operation_id)
+        );
+
+        let applied_legs = if recorded_legs {
+            vec![PositionOperationRecoveryLeg {
+                position_id: yes_position_id,
+                instrument_id: yes.id(),
+                strategy_id: Some(strategy),
+                direction: PositionOperationDirection::Close,
+                quantity: Quantity::from("100"),
+                cost: Decimal::ZERO,
+                income: Some(dec!(100)),
+                settled: true,
+            }]
+        } else {
+            Vec::new()
+        };
+        let recovery = recovery_request(&redeem, redeem_effects, applied_legs);
+        let outcome = rebuilt_engine
+            .reconcile_recovered_position_operation(&recovery)
+            .unwrap();
+        assert!(
+            matches!(outcome, PositionOperationRecoveryOutcome::Applied { .. }),
+            "old redeem recovery must complete from its archived cycle"
+        );
+        assert_eq!(
+            rebuilt_engine.position_operation_barrier(&yes.id()),
+            None,
+            "recovery must release the barrier"
+        );
+
+        {
+            let cache = rebuilt.borrow();
+            let current = cache.position(&yes_position_id).unwrap();
+            assert_eq!(
+                settled_consumed(&cache, &current),
+                Decimal::ZERO,
+                "old redeem must not consume the new cycle"
+            );
+            let restored = cache.position_snapshots(Some(&yes_position_id), Some(&account));
+            assert_eq!(restored.len(), 1);
+            assert_eq!(
+                settled_consumed(&cache, &restored[0]),
+                dec!(100),
+                "archived cycle must retain the original consumption"
+            );
+        }
+
+        let outcome = rebuilt_engine
+            .reconcile_recovered_position_operation(&recovery)
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            PositionOperationRecoveryOutcome::Applied { .. }
+        ));
+        let cache = rebuilt.borrow();
+        let current = cache.position(&yes_position_id).unwrap();
+        assert_eq!(settled_consumed(&cache, &current), Decimal::ZERO);
+        let restored = cache.position_snapshots(Some(&yes_position_id), Some(&account));
+        assert_eq!(settled_consumed(&cache, &restored[0]), dec!(100));
+    }
+
+    #[rstest]
+    #[case(false, false)]
+    #[case(true, false)]
+    #[case(true, true)]
+    fn test_recover_complete_multicycle_redeem_is_order_independent(
+        #[case] recorded_legs: bool,
+        #[case] reverse_legs: bool,
+    ) {
+        let no1 = option("856", "No");
+        let no2 = option("858", "No");
+        let yes = option("857", "Yes");
+        let (mut engine, cache) = engine_with(&[no1.clone(), no2.clone(), yes.clone()]);
+        let strategy = StrategyId::from("STRATEGY-001");
+        let account = AccountId::from("ACCOUNT-001");
+
+        for instrument in [&no1, &no2] {
+            let position = input_position(
+                instrument,
+                strategy,
+                account,
+                Quantity::from("100"),
+                dec!(40),
+            );
+            cache
+                .borrow_mut()
+                .add_position_without_order(&position, OmsType::Netting)
+                .unwrap();
+        }
+        cache
+            .borrow_mut()
+            .add_instrument_close(InstrumentClose::new(
+                yes.id(),
+                Price::from("1"),
+                InstrumentCloseType::ContractExpired,
+                UnixNanos::from(5),
+                UnixNanos::from(5),
+            ))
+            .unwrap();
+        let yes_position_id = netting_position_id(&yes.id(), strategy);
+
+        let first = result(
+            PositionOperationType::Convert,
+            vec![no1.id(), yes.id()],
+            PositionOperationEffects {
+                received: vec![amount("857", "100")],
+                spent: vec![amount("856", "100")],
+                collateral_delta: "0".into(),
+                payouts: Vec::new(),
+            },
+        );
+        engine.process_position_operation(&first);
+        let mut second = result(
+            PositionOperationType::Convert,
+            vec![no2.id(), yes.id()],
+            PositionOperationEffects {
+                received: vec![amount("857", "100")],
+                spent: vec![amount("858", "100")],
+                collateral_delta: "0".into(),
+                payouts: Vec::new(),
+            },
+        );
+        second.ts_event = UnixNanos::from(2_000_000_000);
+        second.ts_init = UnixNanos::from(2_000_000_001);
+        engine.process_position_operation(&second);
+
+        let archived = cache
+            .borrow()
+            .position_snapshots(Some(&yes_position_id), Some(&account))
+            .first()
+            .expect("first cycle must be archived")
+            .clone();
+        let archived_id = archived.id;
+        let archived_cycle_id = settled_cycle_id(&archived);
+
+        let redeem_effects = PositionOperationEffects {
+            received: Vec::new(),
+            spent: vec![amount("857", "200")],
+            collateral_delta: "200".into(),
+            payouts: Vec::new(),
+        };
+        let redeem = result(
+            PositionOperationType::Redeem,
+            vec![yes.id()],
+            redeem_effects.clone(),
+        );
+        engine.process_position_operation(&redeem);
+
+        let current = cache
+            .borrow()
+            .position(&yes_position_id)
+            .expect("second cycle must exist")
+            .cloned();
+        let mut rebuilt_cache = Cache::default();
+        rebuilt_cache.add_instrument(yes.clone()).unwrap();
+        rebuilt_cache
+            .add_position_without_order(&current, OmsType::Netting)
+            .unwrap();
+        let mut persisted_entries = cache
+            .borrow()
+            .general_entries_with_prefix("position-settlement-source:");
+        persisted_entries.extend(
+            cache
+                .borrow()
+                .general_entries_with_prefix("position-operation-settled:"),
+        );
+
+        for (key, bytes) in persisted_entries {
+            rebuilt_cache.add(&key, bytes).unwrap();
+        }
+
+        if let Some(frames) = cache.borrow().position_snapshot_bytes(&yes_position_id) {
+            for (index, bytes) in frames.into_iter().enumerate() {
+                let key = format!(
+                    "{}{}/{}",
+                    nautilus_common::cache::CacheSnapshotRef::POSITION_PREFIX,
+                    yes_position_id,
+                    index
+                );
+                rebuilt_cache.add(&key, bytes::Bytes::from(bytes)).unwrap();
+            }
+        }
+        let marker_prefix = format!(
+            "{SETTLED_CONSUMPTION_PREFIX}:operation:{}:",
+            redeem.operation_id
+        );
+        assert!(
+            rebuilt_cache
+                .general_entries_with_prefix(&marker_prefix)
+                .first()
+                .is_some_and(|(key, _)| key.ends_with(&archived_cycle_id)),
+            "the archived cycle marker must sort before the current cycle marker"
+        );
+        let record = serde_json::json!({
+            "operation_id": redeem.operation_id,
+            "account_id": account,
+            "application_status": "Pending",
+            "venue_status": "Submitted",
+            "barrier_instrument_ids": [yes.id()],
+        });
+        rebuilt_cache
+            .add(
+                &format!("position-operation:{}", redeem.operation_id),
+                serde_json::to_vec(&record).unwrap().into(),
+            )
+            .unwrap();
+
+        let rebuilt = Rc::new(RefCell::new(rebuilt_cache));
+        let mut rebuilt_engine = ExecutionEngine::new(
+            Rc::new(RefCell::new(VirtualClock::new())),
+            rebuilt.clone(),
+            None,
+        );
+        rebuilt_engine.restore_position_operation_barriers();
+
+        let mut applied_legs = if recorded_legs {
+            vec![
+                PositionOperationRecoveryLeg {
+                    position_id: yes_position_id,
+                    instrument_id: yes.id(),
+                    strategy_id: Some(strategy),
+                    direction: PositionOperationDirection::Close,
+                    quantity: Quantity::from("100"),
+                    cost: Decimal::ZERO,
+                    income: Some(dec!(100)),
+                    settled: true,
+                },
+                PositionOperationRecoveryLeg {
+                    position_id: archived_id,
+                    instrument_id: yes.id(),
+                    strategy_id: Some(strategy),
+                    direction: PositionOperationDirection::Close,
+                    quantity: Quantity::from("100"),
+                    cost: Decimal::ZERO,
+                    income: Some(dec!(100)),
+                    settled: true,
+                },
+            ]
+        } else {
+            Vec::new()
+        };
+
+        if reverse_legs {
+            applied_legs.reverse();
+        }
+        let recovery = recovery_request(&redeem, redeem_effects, applied_legs);
+        let outcome = rebuilt_engine
+            .reconcile_recovered_position_operation(&recovery)
+            .unwrap();
+        assert!(
+            matches!(outcome, PositionOperationRecoveryOutcome::Applied { .. }),
+            "complete multi-cycle consumption must recover"
+        );
+        assert_eq!(rebuilt_engine.position_operation_barrier(&yes.id()), None);
+
+        let before = {
+            let cache = rebuilt.borrow();
+            let current = cache.position(&yes_position_id).unwrap().cloned();
+            let restored = cache.position_snapshots(Some(&yes_position_id), Some(&account));
+            assert_eq!(settled_consumed(&cache, &current), dec!(100));
+            assert_eq!(settled_consumed(&cache, &restored[0]), dec!(100));
+            current
+        };
+
+        let outcome = rebuilt_engine
+            .reconcile_recovered_position_operation(&recovery)
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            PositionOperationRecoveryOutcome::Applied { .. }
+        ));
+        let cache = rebuilt.borrow();
+        assert_eq!(
+            cache.position(&yes_position_id).unwrap().cloned(),
+            before,
+            "repeated recovery must not change the position"
+        );
+        let current = cache.position(&yes_position_id).unwrap();
+        assert_eq!(settled_consumed(&cache, &current), dec!(100));
+        let restored = cache.position_snapshots(Some(&yes_position_id), Some(&account));
+        assert_eq!(settled_consumed(&cache, &restored[0]), dec!(100));
+    }
+
+    #[rstest]
+    #[case(false)]
+    #[case(true)]
+    fn test_recover_redeem_rejects_partial_multicycle_consumption(#[case] recorded_legs: bool) {
+        let no1 = option("853", "No");
+        let no2 = option("855", "No");
+        let yes = option("854", "Yes");
+        let (mut engine, cache) = engine_with(&[no1.clone(), no2.clone(), yes.clone()]);
+        let strategy = StrategyId::from("STRATEGY-001");
+        let account = AccountId::from("ACCOUNT-001");
+
+        for instrument in [&no1, &no2] {
+            let position = input_position(
+                instrument,
+                strategy,
+                account,
+                Quantity::from("100"),
+                dec!(40),
+            );
+            cache
+                .borrow_mut()
+                .add_position_without_order(&position, OmsType::Netting)
+                .unwrap();
+        }
+        cache
+            .borrow_mut()
+            .add_instrument_close(InstrumentClose::new(
+                yes.id(),
+                Price::from("1"),
+                InstrumentCloseType::ContractExpired,
+                UnixNanos::from(5),
+                UnixNanos::from(5),
+            ))
+            .unwrap();
+        let yes_position_id = netting_position_id(&yes.id(), strategy);
+
+        let first = result(
+            PositionOperationType::Convert,
+            vec![no1.id(), yes.id()],
+            PositionOperationEffects {
+                received: vec![amount("854", "100")],
+                spent: vec![amount("853", "100")],
+                collateral_delta: "0".into(),
+                payouts: Vec::new(),
+            },
+        );
+        engine.process_position_operation(&first);
+        let mut second = result(
+            PositionOperationType::Convert,
+            vec![no2.id(), yes.id()],
+            PositionOperationEffects {
+                received: vec![amount("854", "100")],
+                spent: vec![amount("855", "100")],
+                collateral_delta: "0".into(),
+                payouts: Vec::new(),
+            },
+        );
+        second.ts_event = UnixNanos::from(2_000_000_000);
+        second.ts_init = UnixNanos::from(2_000_000_001);
+        engine.process_position_operation(&second);
+
+        let archived = cache
+            .borrow()
+            .position_snapshots(Some(&yes_position_id), Some(&account))
+            .first()
+            .expect("first cycle must be archived")
+            .clone();
+        let archived_id = archived.id;
+        let archived_cycle_id = settled_cycle_id(&archived);
+
+        let redeem_effects = PositionOperationEffects {
+            received: Vec::new(),
+            spent: vec![amount("854", "200")],
+            collateral_delta: "200".into(),
+            payouts: Vec::new(),
+        };
+        let redeem = result(
+            PositionOperationType::Redeem,
+            vec![yes.id()],
+            redeem_effects.clone(),
+        );
+        engine.process_position_operation(&redeem);
+
+        let current = cache
+            .borrow()
+            .position(&yes_position_id)
+            .expect("second cycle must exist")
+            .cloned();
+        let mut rebuilt_cache = Cache::default();
+        rebuilt_cache.add_instrument(yes.clone()).unwrap();
+        rebuilt_cache
+            .add_position_without_order(&current, OmsType::Netting)
+            .unwrap();
+        let mut persisted_entries = cache
+            .borrow()
+            .general_entries_with_prefix("position-settlement-source:");
+        persisted_entries.extend(
+            cache
+                .borrow()
+                .general_entries_with_prefix("position-operation-settled:"),
+        );
+
+        for (key, bytes) in persisted_entries {
+            if key.starts_with("position-operation-settled:") && key.ends_with(&archived_cycle_id) {
+                continue;
+            }
+            rebuilt_cache.add(&key, bytes).unwrap();
+        }
+
+        if let Some(frames) = cache.borrow().position_snapshot_bytes(&yes_position_id) {
+            for (index, bytes) in frames.into_iter().enumerate() {
+                let key = format!(
+                    "{}{}/{}",
+                    nautilus_common::cache::CacheSnapshotRef::POSITION_PREFIX,
+                    yes_position_id,
+                    index
+                );
+                rebuilt_cache.add(&key, bytes::Bytes::from(bytes)).unwrap();
+            }
+        }
+        let record = serde_json::json!({
+            "operation_id": redeem.operation_id,
+            "account_id": account,
+            "application_status": "Pending",
+            "venue_status": "Submitted",
+            "barrier_instrument_ids": [yes.id()],
+        });
+        rebuilt_cache
+            .add(
+                &format!("position-operation:{}", redeem.operation_id),
+                serde_json::to_vec(&record).unwrap().into(),
+            )
+            .unwrap();
+
+        let rebuilt = Rc::new(RefCell::new(rebuilt_cache));
+        let mut rebuilt_engine = ExecutionEngine::new(
+            Rc::new(RefCell::new(VirtualClock::new())),
+            rebuilt.clone(),
+            None,
+        );
+        rebuilt_engine.restore_position_operation_barriers();
+
+        let applied_legs = if recorded_legs {
+            vec![
+                PositionOperationRecoveryLeg {
+                    position_id: archived_id,
+                    instrument_id: yes.id(),
+                    strategy_id: Some(strategy),
+                    direction: PositionOperationDirection::Close,
+                    quantity: Quantity::from("100"),
+                    cost: Decimal::ZERO,
+                    income: Some(dec!(100)),
+                    settled: true,
+                },
+                PositionOperationRecoveryLeg {
+                    position_id: yes_position_id,
+                    instrument_id: yes.id(),
+                    strategy_id: Some(strategy),
+                    direction: PositionOperationDirection::Close,
+                    quantity: Quantity::from("100"),
+                    cost: Decimal::ZERO,
+                    income: Some(dec!(100)),
+                    settled: true,
+                },
+            ]
+        } else {
+            Vec::new()
+        };
+        let recovery = recovery_request(&redeem, redeem_effects, applied_legs);
+        let error = rebuilt_engine
+            .reconcile_recovered_position_operation(&recovery)
+            .expect_err("partial multi-cycle consumption evidence must remain unresolved")
+            .to_string();
+        assert!(
+            error.contains("consumption") || error.contains("receipt"),
+            "unexpected partial recovery error: {error}"
+        );
+        assert_eq!(
+            rebuilt_engine.position_operation_barrier(&yes.id()),
+            Some(redeem.operation_id),
+            "an unresolved recovery must keep the barrier"
+        );
+        let cache = rebuilt.borrow();
+        let current = cache.position(&yes_position_id).unwrap();
+        assert_eq!(settled_consumed(&cache, &current), dec!(100));
+        let restored = cache.position_snapshots(Some(&yes_position_id), Some(&account));
+        assert_eq!(restored.len(), 1);
+        assert_eq!(settled_consumed(&cache, &restored[0]), Decimal::ZERO);
+    }
+
+    #[rstest]
+    fn test_barrier_allows_settled_convert_output_but_rejects_settled_input() {
+        let no = option("790", "No");
+        let yes = option("791", "Yes");
+        let (engine, cache) = engine_with(&[no.clone(), yes.clone()]);
+        let strategy = StrategyId::from("STRATEGY-001");
+        let account = AccountId::from("ACCOUNT-001");
+        let position = input_position(&no, strategy, account, Quantity::from("100"), dec!(40));
+        cache
+            .borrow_mut()
+            .add_position_without_order(&position, OmsType::Netting)
+            .unwrap();
+        cache
+            .borrow_mut()
+            .add_instrument_close(InstrumentClose::new(
+                yes.id(),
+                Price::from("1"),
+                InstrumentCloseType::ContractExpired,
+                UnixNanos::from(5),
+                UnixNanos::from(5),
+            ))
+            .unwrap();
+
+        let inputs = BarrierInputs {
+            strategy_id: strategy,
+            account_id: account,
+            quantity: Some(Quantity::from("100")),
+            instrument_ids: vec![no.id()],
+        };
+        let operation_id = UUID4::new();
+        engine
+            .establish_full_barrier(
+                operation_id,
+                PositionOperationType::Convert,
+                &[no.id(), yes.id()],
+                Some(&inputs),
+            )
+            .unwrap();
+        assert_eq!(
+            engine.position_operation_barrier(&yes.id()),
+            Some(operation_id)
+        );
+        engine.release_position_operation_barrier(operation_id, &[no.id(), yes.id()]);
+
+        cache
+            .borrow_mut()
+            .add_instrument_close(InstrumentClose::new(
+                no.id(),
+                Price::from("1"),
+                InstrumentCloseType::ContractExpired,
+                UnixNanos::from(5),
+                UnixNanos::from(5),
+            ))
+            .unwrap();
+        let error = engine
+            .establish_full_barrier(
+                UUID4::new(),
+                PositionOperationType::Convert,
+                &[no.id(), yes.id()],
+                Some(&inputs),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("economically settled"), "{error}");
+
         assert!(
             engine
                 .establish_full_barrier(
@@ -4598,6 +6980,70 @@ mod tests {
                 )
                 .is_ok()
         );
+    }
+
+    #[rstest]
+    fn test_barrier_rejects_expired_output_without_settlement_evidence() {
+        let no = option("792", "No");
+        let yes = option("793", "Yes");
+        let cache = Rc::new(RefCell::new(Cache::default()));
+        for instrument in [&no, &yes] {
+            cache
+                .borrow_mut()
+                .add_instrument(instrument.clone())
+                .unwrap();
+        }
+        let strategy = StrategyId::from("STRATEGY-001");
+        let account = AccountId::from("ACCOUNT-001");
+        let position = input_position(&no, strategy, account, Quantity::from("100"), dec!(40));
+        cache
+            .borrow_mut()
+            .add_position_without_order(&position, OmsType::Netting)
+            .unwrap();
+
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
+        clock.borrow_mut().advance_time(UnixNanos::from(5), true);
+        let clock_dyn: Rc<RefCell<dyn nautilus_common::clock::Clock>> = clock;
+        let engine = ExecutionEngine::new(clock_dyn, cache.clone(), None);
+        let inputs = BarrierInputs {
+            strategy_id: strategy,
+            account_id: account,
+            quantity: Some(Quantity::from("100")),
+            instrument_ids: vec![no.id()],
+        };
+
+        let error = engine
+            .establish_full_barrier(
+                UUID4::new(),
+                PositionOperationType::Convert,
+                &[no.id(), yes.id()],
+                Some(&inputs),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("expired without authoritative settlement evidence"),
+            "{error}"
+        );
+
+        cache
+            .borrow_mut()
+            .add_instrument_close(InstrumentClose::new(
+                yes.id(),
+                Price::from("1"),
+                InstrumentCloseType::ContractExpired,
+                UnixNanos::from(5),
+                UnixNanos::from(5),
+            ))
+            .unwrap();
+        engine
+            .establish_full_barrier(
+                UUID4::new(),
+                PositionOperationType::Convert,
+                &[no.id(), yes.id()],
+                Some(&inputs),
+            )
+            .unwrap();
     }
 
     #[rstest]

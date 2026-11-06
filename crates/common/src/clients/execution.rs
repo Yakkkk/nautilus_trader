@@ -40,9 +40,9 @@ use crate::messages::execution::{
     BatchCancelOrders, BatchModifyOrders, CancelAllOrders, CancelOrder, GenerateFillReports,
     GenerateFillReportsBuilder, GenerateOrderStatusReport, GenerateOrderStatusReports,
     GenerateOrderStatusReportsBuilder, GeneratePositionStatusReports,
-    GeneratePositionStatusReportsBuilder, ModifyOrder, PositionOperationStartupRecovery,
-    PositionOperationStatus, QueryAccount, QueryOrder, QueryPositionOperation, SubmitOrder,
-    SubmitOrderList, SubmitPositionOperation,
+    GeneratePositionStatusReportsBuilder, ModifyOrder, PositionOperationResult,
+    PositionOperationStartupRecovery, PositionOperationStatus, QueryAccount, QueryOrder,
+    QueryPositionOperation, SubmitOrder, SubmitOrderList, SubmitPositionOperation,
 };
 
 /// Default maximum absolute position difference tolerated during reconciliation.
@@ -388,6 +388,17 @@ pub trait ExecutionClient {
         _operation_id: UUID4,
         _legs: &[PositionOperationLeg],
         _transaction_hash: Option<&str>,
+    ) {
+    }
+
+    /// Notifies the strategy that the core completed local application and released the barrier.
+    ///
+    /// Adapters forward the supplied result through their existing execution event queue. The
+    /// default does nothing.
+    fn on_position_operation_applied_result(
+        &self,
+        _result: &PositionOperationResult,
+        _legs: &[PositionOperationLeg],
     ) {
     }
 

@@ -277,18 +277,28 @@ impl ExecutionClient for BacktestExecutionClient {
     fn on_position_operation_applied(
         &self,
         operation_id: UUID4,
-        _legs: &[PositionOperationLeg],
+        legs: &[PositionOperationLeg],
         _transaction_hash: Option<&str>,
     ) {
         if let Some(exchange) = self.exchange.upgrade() {
             let mut exchange = exchange.borrow_mut();
             exchange.mark_position_operation_applied(operation_id);
-            if let Err(e) = exchange.apply_pending_position_operation_cash(operation_id) {
+            if let Err(e) = exchange.apply_pending_position_operation_cash(operation_id, legs) {
                 log::error!(
                     "Failed to apply simulated cash for position operation {operation_id}: {e}"
                 );
             }
         }
+    }
+
+    fn on_position_operation_applied_result(
+        &self,
+        result: &PositionOperationResult,
+        _legs: &[PositionOperationLeg],
+    ) {
+        self.queued_position_operation_results
+            .borrow_mut()
+            .push(result.clone());
     }
 
     fn submit_position_operation(&self, cmd: SubmitPositionOperation) -> anyhow::Result<()> {

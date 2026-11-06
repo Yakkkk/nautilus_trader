@@ -37,7 +37,11 @@ use nautilus_live::{
     testing::{ExecutionHarness, RoutedKind},
 };
 use nautilus_model::{
-    enums::{AssetClass, LiquiditySide, OmsType, OrderSide, OrderStatus, OrderType, TimeInForce},
+    data::InstrumentClose,
+    enums::{
+        AssetClass, InstrumentCloseType, LiquiditySide, OmsType, OrderSide, OrderStatus, OrderType,
+        TimeInForce,
+    },
     events::{OrderEventAny, OrderRejected, OrderUpdated},
     identifiers::{
         AccountId, ClientOrderId, InstrumentId, StrategyId, Symbol, TradeId, TraderId, VenueOrderId,
@@ -3966,6 +3970,13 @@ async fn managed_convert_routes_to_position_cache_account_and_portfolio() {
         );
     }
 
+    assert!(
+        results.borrow().iter().any(|result| {
+            result.operation_id == operation_id && result.status == PositionOperationStatus::Applied
+        }),
+        "the strategy must receive Applied without polling",
+    );
+
     msgbus::send_trading_command(
         MessagingSwitchboard::exec_engine_execute(),
         TradingCommand::QueryPositionOperation(
@@ -3984,5 +3995,137 @@ async fn managed_convert_routes_to_position_cache_account_and_portfolio() {
             result.operation_id == operation_id && result.status == PositionOperationStatus::Applied
         }),
         "query must report the applied operation"
+    );
+}
+
+#[rstest]
+#[tokio::test]
+async fn managed_convert_receives_and_settles_company_payout_output() {
+    let position_state = PositionServerState::default();
+    let no0 = position_instrument(&format!("0x{}{:02x}", "11".repeat(31), 0), 256, "No");
+    let mut yes1 = position_instrument(&format!("0x{}{:02x}", "11".repeat(31), 1), 513, "Yes");
+    // Production Polymarket instruments use the token ID as the raw symbol, which is the key
+    // the execution client's token lookup uses.
+    if let InstrumentAny::BinaryOption(binary) = &mut yes1 {
+        binary.raw_symbol = Symbol::new("513");
+    }
+    let (no0_id, yes1_id) = (no0.id(), yes1.id());
+    let yes1_position_id =
+        nautilus_model::identifiers::PositionId::from(format!("{yes1_id}-{POSITION_STRATEGY_ID}"));
+
+    let (mut h, position_state) = Box::pin(harness::Harness::build_with_position_operations(
+        |h| {
+            h.cache().borrow_mut().add_instrument(no0.clone()).unwrap();
+            h.cache().borrow_mut().add_instrument(yes1.clone()).unwrap();
+            seed_operation_position(h, &no0, Quantity::from("100.0000"), Decimal::from(50));
+            h.cache()
+                .borrow_mut()
+                .add_instrument_close(InstrumentClose::new(
+                    yes1_id,
+                    Price::from("0"),
+                    InstrumentCloseType::ContractExpired,
+                    UnixNanos::from(5),
+                    UnixNanos::from(5),
+                ))
+                .unwrap();
+        },
+        position_state,
+    ))
+    .await;
+    position_state.set_position_balances([100_000_000, 0]).await;
+    position_state
+        .configure_convert_receipt(&[(256, 100_000_000)], &[(513, 99_000_000)], 0)
+        .await;
+    h.mock_state.balance_response.lock().await["balance"] = json!("1000000000");
+
+    let results = Rc::new(RefCell::new(Vec::<PositionOperationResult>::new()));
+    let captured = results.clone();
+    msgbus::subscribe_any(
+        nautilus_common::msgbus::switchboard::get_event_position_operation_topic(StrategyId::from(
+            POSITION_STRATEGY_ID,
+        ))
+        .into(),
+        ShareableMessageHandler::from_typed(move |result: &PositionOperationResult| {
+            captured.borrow_mut().push(result.clone());
+        }),
+        None,
+    );
+
+    let operation_id = UUID4::new();
+    let command = SubmitPositionOperation::new(
+        h.trader_id(),
+        Some(h.client_id()),
+        StrategyId::from(POSITION_STRATEGY_ID),
+        operation_id,
+        PositionOperationType::Convert,
+        vec![no0_id],
+        Some(Quantity::from("100.0000")),
+        UnixNanos::default(),
+    );
+    msgbus::send_trading_command(
+        MessagingSwitchboard::risk_engine_execute(),
+        TradingCommand::SubmitPositionOperation(command),
+    );
+
+    let settled = h
+        .pump_until(DEADLINE, |cache| {
+            cache
+                .position(&yes1_position_id)
+                .is_some_and(|position| position.is_closed() && position.is_settled())
+        })
+        .await;
+    assert!(settled, "settled YES output must be received and settled");
+    h.pump_for(Duration::from_millis(200)).await;
+
+    let confirmed = results
+        .borrow()
+        .iter()
+        .find(|result| {
+            result.operation_id == operation_id
+                && result.status == PositionOperationStatus::Confirmed
+        })
+        .cloned()
+        .expect("strategy topic must receive the confirmed operation");
+    assert_eq!(
+        confirmed
+            .effects
+            .expect("confirmed convert carries effects")
+            .collateral_delta,
+        "0"
+    );
+    assert!(
+        results.borrow().iter().any(|result| {
+            result.operation_id == operation_id && result.status == PositionOperationStatus::Applied
+        }),
+        "the strategy must receive Applied without polling",
+    );
+
+    let yes_position = h
+        .cache()
+        .borrow()
+        .position(&yes1_position_id)
+        .expect("settled YES output must be cached")
+        .cloned();
+    assert_eq!(yes_position.quantity, Quantity::from("0"));
+    assert_eq!(
+        yes_position.realized_pnl,
+        Some(Money::new(-50.0, Currency::pUSD()))
+    );
+    let account = h
+        .cache()
+        .borrow()
+        .account(&h.account_id())
+        .expect("account state must be refreshed")
+        .clone();
+    assert_eq!(
+        account.balances()[&Currency::pUSD()].total.as_decimal(),
+        Decimal::from(1000)
+    );
+    assert_eq!(
+        h.risk_engine()
+            .borrow_mut()
+            .portfolio_mut()
+            .realized_pnl(&yes1_id),
+        Some(Money::new(-50.0, Currency::pUSD()))
     );
 }

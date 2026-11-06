@@ -1761,6 +1761,26 @@ impl Position {
     /// the position is not open, or the settlement PnL cannot be represented. An error leaves the
     /// position unchanged.
     pub fn apply_instrument_close(&mut self, close: InstrumentClose) -> anyhow::Result<()> {
+        self.apply_instrument_close_at(close, close.ts_event)
+    }
+
+    /// Settles the open position and records `ts_confirmed` as the settlement confirmation time.
+    ///
+    /// The replay event keeps the close's payout basis and uses `ts_confirmed` as its event time;
+    /// the close's original market result timestamp is retained in its `ts_init` as provenance.
+    /// `ts_last`, `ts_closed`, and the duration use the moment the new shares were economically
+    /// settled.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the close targets another instrument, is not a contract expiration,
+    /// the position is not open, or the settlement PnL cannot be represented. An error leaves the
+    /// position unchanged.
+    pub fn apply_instrument_close_at(
+        &mut self,
+        close: InstrumentClose,
+        ts_confirmed: nautilus_core::UnixNanos,
+    ) -> anyhow::Result<()> {
         anyhow::ensure!(
             close.instrument_id == self.instrument_id,
             "instrument close {} does not match position instrument {}",
@@ -1778,12 +1798,13 @@ impl Position {
             self.id,
         );
 
-        self.apply_instrument_close_state(close, true)
+        self.apply_instrument_close_state(close, ts_confirmed, true)
     }
 
     fn apply_instrument_close_state(
         &mut self,
         close: InstrumentClose,
+        ts_confirmed: nautilus_core::UnixNanos,
         record_replay: bool,
     ) -> anyhow::Result<()> {
         if self.side == PositionSide::Flat {
@@ -1800,8 +1821,21 @@ impl Position {
         self.accumulate_pnl(pnl)?;
 
         if record_replay {
+            // Keep the settlement confirmation timestamp for replay, while `ts_init` retains the
+            // close's original market result timestamp as provenance.
+            let replay_close = if close.ts_event == ts_confirmed {
+                close
+            } else {
+                InstrumentClose::new(
+                    close.instrument_id,
+                    close.close_price,
+                    close.close_type,
+                    ts_confirmed,
+                    close.ts_event,
+                )
+            };
             self.replay_events
-                .push(PositionReplayEvent::InstrumentClosed(close));
+                .push(PositionReplayEvent::InstrumentClosed(replay_close));
         }
 
         self.avg_px_close = Some(avg_px_close);
@@ -1813,9 +1847,9 @@ impl Position {
         self.signed_qty = Decimal::ZERO;
         self.quantity = Quantity::zero(self.size_precision);
         self.closing_order_id = None;
-        self.ts_last = close.ts_event;
-        self.ts_closed = Some(close.ts_event);
-        self.duration_ns = close.ts_event.saturating_duration_since(self.ts_opened);
+        self.ts_last = ts_confirmed;
+        self.ts_closed = Some(ts_confirmed);
+        self.duration_ns = ts_confirmed.saturating_duration_since(self.ts_opened);
         self.debug_assert_invariants();
         Ok(())
     }
@@ -2049,7 +2083,7 @@ impl Position {
                     self.apply_adjustment_state(*adjustment, false)?;
                 }
                 PositionReplayEvent::InstrumentClosed(close) => {
-                    self.apply_instrument_close_state(*close, false)
+                    self.apply_instrument_close_state(*close, close.ts_event, false)
                         .map_err(|e| invalid(&e.to_string()))?;
                 }
                 PositionReplayEvent::Operation(leg) => {
@@ -6073,6 +6107,40 @@ mod tests {
         assert_eq!(restored.realized_pnl, position.realized_pnl);
         assert_eq!(restored.avg_px_close, position.avg_px_close);
         assert_eq!(restored.ts_closed, position.ts_closed);
+    }
+
+    #[rstest]
+    fn test_apply_instrument_close_at_records_confirmation_time(binary_option: BinaryOption) {
+        let instrument = InstrumentAny::BinaryOption(binary_option);
+        let fill = binary_fill(&instrument, "T-OPEN", "10.00", "0.400", 100);
+        let mut position = Position::new(&instrument, fill);
+        let close = contract_expired(&instrument, "1.000");
+        let confirmation = UnixNanos::from(1_000);
+
+        position
+            .apply_instrument_close_at(close, confirmation)
+            .unwrap();
+
+        assert!(position.is_settled());
+        assert_eq!(position.ts_last, confirmation);
+        assert_eq!(position.ts_closed, Some(confirmation));
+        assert_eq!(
+            position.duration_ns,
+            confirmation.saturating_duration_since(position.ts_opened)
+        );
+        assert!(matches!(
+            position.replay_events.last(),
+            Some(PositionReplayEvent::InstrumentClosed(event))
+                if event.ts_event == confirmation
+                    && event.ts_init == close.ts_event
+                    && event.close_price == close.close_price
+        ));
+        assert_eq!(close.ts_event, UnixNanos::from(300));
+
+        let snapshot = PositionSnapshot::from_replay_state(&position, None);
+        let restored: Position = serde_json::from_value(snapshot.replay_state.unwrap()).unwrap();
+        assert_eq!(restored.ts_closed, Some(confirmation));
+        assert_eq!(restored.ts_last, confirmation);
     }
 
     #[rstest]

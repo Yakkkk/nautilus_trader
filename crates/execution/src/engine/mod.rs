@@ -5194,9 +5194,15 @@ impl ExecutionEngine {
             );
 
             let ts_init = self.clock.borrow().timestamp_ns();
+            let mut event_close = close;
+            if let Some(ts_closed) = position.ts_closed
+                && event_close.ts_event < ts_closed
+            {
+                event_close.ts_event = ts_closed;
+            }
             let event = PositionClosed::create_from_instrument_close(
                 &position,
-                &close,
+                &event_close,
                 last_qty,
                 UUID4::new(),
                 ts_init,

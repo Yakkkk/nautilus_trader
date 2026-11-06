@@ -601,6 +601,14 @@ impl ExecutionClient for PolymarketExecutionClient {
         self.refresh_position_operation_balances(legs);
     }
 
+    fn on_position_operation_applied_result(
+        &self,
+        result: &PositionOperationResult,
+        _legs: &[PositionOperationLeg],
+    ) {
+        self.emitter.send_position_operation_result(result.clone());
+    }
+
     async fn prepare_startup_recovery(&mut self) -> anyhow::Result<()> {
         self.prepare_startup_recovery_inner().await?;
         Ok(())

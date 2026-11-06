@@ -49,8 +49,9 @@ use nautilus_common::{
     messages::execution::{
         BatchCancelOrders, BatchModifyOrders, CancelAllOrders, CancelOrder, GenerateFillReports,
         GenerateOrderStatusReport, GenerateOrderStatusReports, GeneratePositionStatusReports,
-        ModifyOrder, PositionOperationStartupRecovery, PositionOperationStatus, QueryAccount,
-        QueryOrder, QueryPositionOperation, SubmitOrder, SubmitOrderList, SubmitPositionOperation,
+        ModifyOrder, PositionOperationResult, PositionOperationStartupRecovery,
+        PositionOperationStatus, QueryAccount, QueryOrder, QueryPositionOperation, SubmitOrder,
+        SubmitOrderList, SubmitPositionOperation,
     },
 };
 use nautilus_core::{Params, UUID4, UnixNanos};
@@ -519,6 +520,16 @@ impl ExecutionClient for LiveExecutionClient {
         self.client
             .borrow()
             .on_position_operation_applied(operation_id, legs, transaction_hash);
+    }
+
+    fn on_position_operation_applied_result(
+        &self,
+        result: &PositionOperationResult,
+        legs: &[PositionOperationLeg],
+    ) {
+        self.client
+            .borrow()
+            .on_position_operation_applied_result(result, legs);
     }
 
     #[expect(

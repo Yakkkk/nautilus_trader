@@ -2967,6 +2967,8 @@ class ConvertProbeStrategy(Strategy):
         self.operation_id = None
         self.statuses: list[str] = []
         self.opened: list[object] = []
+        self.denied: list[str] = []
+        self.sell_submitted = False
         self.queried = False
 
     def on_start(self) -> None:
@@ -3015,11 +3017,32 @@ class ConvertProbeStrategy(Strategy):
         if event.instrument_id == self.output_instrument_id:
             self.opened.append(event)
 
+    def on_order_denied(self, event: object) -> None:
+        """
+        Record denied orders.
+        """
+        self.denied.append(str(event.reason))
+
     def on_position_operation(self, result: object) -> None:
         """
-        Record operation result statuses.
+        Record statuses and sell the output once local application completes.
         """
         self.statuses.append(result.status)
+        if (
+            result.status == "applied"
+            and self.output_instrument_id is not None
+            and not self.sell_submitted
+        ):
+            self.sell_submitted = True
+            self.submit_order(
+                self.order_factory.limit(
+                    self.output_instrument_id,
+                    OrderSide.SELL,
+                    Quantity.from_str("1.0000"),
+                    Price.from_str("0.9000"),
+                    time_in_force=TimeInForce.GTC,
+                ),
+            )
 
 
 def _neg_risk_python_instrument(
@@ -3187,7 +3210,7 @@ def test_python_strategy_convert_operation_source_projection() -> None:
     engine.add_data(
         [
             QuoteTick(
-                instrument_id=no0.id,
+                instrument_id=instrument.id,
                 bid_price=Price.from_str("0.4900"),
                 ask_price=Price.from_str("0.5000"),
                 bid_size=Quantity.from_str("1000.0000"),
@@ -3195,6 +3218,7 @@ def test_python_strategy_convert_operation_source_projection() -> None:
                 ts_event=ts,
                 ts_init=ts,
             )
+            for instrument in (no0, yes1)
             for ts in (
                 1_000_000_000,
                 2_000_000_000,
@@ -3224,6 +3248,8 @@ def test_python_strategy_convert_operation_source_projection() -> None:
         assert opened.opening_order_id is None
         assert opened.opening_operation_id == strategy.operation_id
         assert opened.last_px is None
+        assert strategy.sell_submitted
+        assert strategy.denied == []
 
         yes_position = engine.cache.positions_open(instrument_id=yes1.id)[0]
         assert yes_position.quantity == Quantity.from_str("99.0000")

@@ -94,8 +94,8 @@ use nautilus_model::{
         price::PriceRaw,
     },
 };
-pub use position::CacheSnapshotRef;
 use position::PositionSnapshotFrame;
+pub use position::{CacheSnapshotRef, SettledPositionSource, settled_cycle_id};
 pub use refs::{AccountRef, AccountRefMut, OrderRef, OrderRefMut, PositionRef, PositionRefMut};
 use rust_decimal::Decimal;
 use ustr::Ustr;
@@ -4318,14 +4318,46 @@ impl Cache {
         let Some(position_cell) = self.positions.get(&position_id).cloned() else {
             anyhow::bail!("Cannot update position {position_id}: not found in cache");
         };
+        let ts_opened = position_cell.borrow().ts_opened;
+        self.update_position_from_instrument_close_at(
+            position_id,
+            close,
+            close.ts_event.max(ts_opened),
+        )
+    }
 
-        let position = {
+    /// Updates a cached position from an instrument close with an explicit confirmation time.
+    ///
+    /// The close keeps its original market result timestamp in replay, while the position records
+    /// `ts_confirmed` as `ts_last`/`ts_closed`. This prevents an output received after the market
+    /// resolved from appearing closed before it was opened.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the position is not already held in the cache or the close cannot be
+    /// applied. An error leaves the position unchanged.
+    pub fn update_position_from_instrument_close_at(
+        &mut self,
+        position_id: PositionId,
+        close: InstrumentClose,
+        ts_confirmed: UnixNanos,
+    ) -> anyhow::Result<Position> {
+        let Some(position_cell) = self.positions.get(&position_id).cloned() else {
+            anyhow::bail!("Cannot update position {position_id}: not found in cache");
+        };
+
+        let (position, physical_settled) = {
             let mut position = position_cell.borrow_mut();
-            position.apply_instrument_close(close)?;
-            position.clone_without_events()
+            let physical_settled = position.quantity;
+            position.apply_instrument_close_at(close, ts_confirmed)?;
+            (position.clone_without_events(), physical_settled)
         };
 
         self.refresh_position_indexes(&position);
+
+        if let Err(e) = self.record_settled_position_source(&position, physical_settled) {
+            log::error!("Failed to record settled source for position {position_id}: {e}");
+        }
 
         if let Some(database) = &mut self.database
             && let Err(e) = database.update_position(&position_cell.borrow())

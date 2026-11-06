@@ -33,7 +33,7 @@ use nautilus_model::{
     enums::{AccountType, AssetClass, OmsType, OrderSide, OrderType, TimeInForce},
     events::AccountState,
     identifiers::{AccountId, ClientOrderId, InstrumentId, StrategyId, Symbol, TraderId},
-    instruments::{BinaryOption, InstrumentAny},
+    instruments::{BinaryOption, Instrument, InstrumentAny},
     orders::{OrderAny, OrderTestBuilder},
     types::{AccountBalance, Currency, Money, Price, Quantity},
 };
@@ -105,7 +105,21 @@ impl Harness {
             .instrument(&execution.instrument_id())
             .unwrap()
             .clone();
+        let default_instrument_id = cached_instrument.id();
         client.on_instrument(cached_instrument);
+        let cached_instruments = execution
+            .cache()
+            .borrow()
+            .instruments(&POLYMARKET_VENUE, None)
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>();
+
+        for cached in cached_instruments {
+            if cached.id() != default_instrument_id {
+                client.on_instrument(cached);
+            }
+        }
         client.start().unwrap();
         client.connect().await.unwrap();
         nautilus_common::testing::wait_until_async(
@@ -169,7 +183,21 @@ impl Harness {
             .instrument(&execution.instrument_id())
             .unwrap()
             .clone();
+        let default_instrument_id = cached_instrument.id();
         client.on_instrument(cached_instrument);
+        let cached_instruments = execution
+            .cache()
+            .borrow()
+            .instruments(&POLYMARKET_VENUE, None)
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>();
+
+        for cached in cached_instruments {
+            if cached.id() != default_instrument_id {
+                client.on_instrument(cached);
+            }
+        }
         client.start().unwrap();
         client.connect().await.unwrap();
         nautilus_common::testing::wait_until_async(

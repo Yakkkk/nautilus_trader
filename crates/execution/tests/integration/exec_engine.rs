@@ -25855,7 +25855,7 @@ fn test_execution_command_logging(
     assert_eq!(*calls.borrow(), vec![(client_id, operation)]);
 }
 
-#[test]
+#[rstest]
 fn test_settled_consumption_persistence_failure_does_not_double_count() {
     use std::sync::Arc;
 

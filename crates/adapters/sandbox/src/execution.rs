@@ -62,12 +62,12 @@ use nautilus_model::{
         Bar, InstrumentClose, InstrumentStatus, OrderBookDeltas, OrderBookDepth, QuoteTick,
         TradeTick,
     },
-    enums::{AccountType, OmsType},
+    enums::{AccountType, InstrumentCloseType, OmsType},
     events::{OrderCancelDenied, OrderEventAny, OrderModifyDenied, OrderRejected, PositionEvent},
     identifiers::{AccountId, ClientId, ClientOrderId, InstrumentId, Venue},
     instruments::{Instrument, InstrumentAny},
     orders::{Order, OrderAny},
-    position_operation::PositionOperationType,
+    position_operation::{PositionOperationDirection, PositionOperationType},
     reports::{ExecutionMassStatus, FillReport, OrderStatusReport, PositionStatusReport},
     types::{AccountBalance, Currency, MarginBalance, Money},
 };
@@ -213,6 +213,7 @@ impl SandboxExecutionClient {
                 factory: factory.clone(),
                 position_operations: AHashMap::new(),
                 pending_position_operation_cash: AHashMap::new(),
+                retained_convert_dependencies: AHashSet::new(),
                 self_weak: WeakCell::from(weak.clone()),
             })
         });
@@ -600,6 +601,7 @@ impl SandboxExecutionClient {
         inner.clear_inbound_queue();
         inner.position_operations.clear();
         inner.pending_position_operation_cash.clear();
+        inner.retained_convert_dependencies.clear();
         self.cancel_inbound_alert();
 
         log::info!(
@@ -909,16 +911,37 @@ impl ExecutionClient for SandboxExecutionClient {
     fn on_position_operation_applied(
         &self,
         operation_id: UUID4,
-        _legs: &[nautilus_model::position_operation::PositionOperationLeg],
+        legs: &[nautilus_model::position_operation::PositionOperationLeg],
         _transaction_hash: Option<&str>,
     ) {
         let mut inner = self.inner.borrow_mut();
         if let Some((_, _, status)) = inner.position_operations.get_mut(&operation_id) {
             *status = PositionOperationStatus::Applied;
         }
-        if let Err(e) = inner.apply_pending_position_operation_cash(operation_id) {
+
+        if let Err(e) = inner.apply_pending_position_operation_cash(operation_id, legs) {
             log::error!(
                 "Failed to apply simulated cash for position operation {operation_id}: {e}"
+            );
+        }
+    }
+
+    fn on_position_operation_applied_result(
+        &self,
+        result: &PositionOperationResult,
+        _legs: &[nautilus_model::position_operation::PositionOperationLeg],
+    ) {
+        let Some(sender) = try_get_exec_event_sender() else {
+            log::error!(
+                "Cannot send applied position operation {}: execution event sender is unavailable",
+                result.operation_id
+            );
+            return;
+        };
+        if let Err(e) = sender.send(ExecutionEvent::PositionOperation(result.clone())) {
+            log::error!(
+                "Failed to send applied position operation {}: {e}",
+                result.operation_id
             );
         }
     }
@@ -1097,8 +1120,11 @@ struct SandboxInner {
             PositionOperationStatus,
         ),
     >,
-    /// Cash effects retained until the core confirms that it applied the operation.
+    /// Direct conversion cash retained until the core confirms application.
     pending_position_operation_cash: AHashMap<UUID4, Decimal>,
+    /// Instruments whose closed definitions and settlement evidence must survive normal cleanup
+    /// while the same negative-risk event can still produce them as convert outputs.
+    retained_convert_dependencies: AHashSet<InstrumentId>,
     self_weak: WeakCell<Self>,
 }
 
@@ -1258,6 +1284,12 @@ impl SandboxInner {
                     "sandbox convert requires {} available {instrument_id}, found {available}",
                     quantity.as_decimal()
                 );
+                anyhow::ensure!(
+                    !cache.instrument_close(instrument_id).is_some_and(|close| {
+                        close.close_type == InstrumentCloseType::ContractExpired
+                    }),
+                    "sandbox convert input {instrument_id} is already economically settled"
+                );
                 ensure_instrument_active(
                     instrument_id,
                     binary.activation_ns,
@@ -1359,23 +1391,46 @@ impl SandboxInner {
                 let InstrumentAny::BinaryOption(binary) = output else {
                     unreachable!("output was matched as a binary option");
                 };
-                ensure_instrument_active(
-                    &output.id(),
-                    binary.activation_ns,
-                    binary.expiration_ns,
-                    now,
-                )?;
+
+                let output_quantity = base_units_to_decimal(amounts.per_outcome)?;
+
+                if let Some(close) = cache.instrument_close(&output.id()) {
+                    anyhow::ensure!(
+                        close.close_type == InstrumentCloseType::ContractExpired,
+                        "sandbox conversion output {} has a non-settlement close",
+                        output.id()
+                    );
+                } else {
+                    ensure_instrument_active(
+                        &output.id(),
+                        binary.activation_ns,
+                        binary.expiration_ns,
+                        now,
+                    )?;
+                }
 
                 instrument_ids.push(output.id());
                 received.push(PositionOperationTokenAmount {
                     token_id: condition.yes_token_id.clone(),
-                    quantity: base_units_to_decimal(amounts.per_outcome)?.to_string(),
+                    quantity: output_quantity.to_string(),
                 });
             }
         }
 
         instrument_ids.sort();
         instrument_ids.dedup();
+
+        {
+            let cache = self.cache.borrow();
+            for instrument_id in &instrument_ids {
+                anyhow::ensure!(
+                    cache
+                        .orders_open(None, Some(instrument_id), None, None, None)
+                        .is_empty(),
+                    "sandbox convert cannot proceed while active orders exist for {instrument_id}"
+                );
+            }
+        }
 
         let collateral = base_units_to_decimal(amounts.collateral_return)?;
         let effects = PositionOperationEffects {
@@ -1440,12 +1495,46 @@ impl SandboxInner {
         Ok(())
     }
 
-    fn apply_pending_position_operation_cash(&mut self, operation_id: UUID4) -> anyhow::Result<()> {
-        if let Some(collateral) = self.pending_position_operation_cash.remove(&operation_id)
-            && let Err(e) = self.apply_simulated_collateral(collateral)
-        {
-            self.pending_position_operation_cash
-                .insert(operation_id, collateral);
+    fn position_operation_settlement_cash(
+        &self,
+        legs: &[nautilus_model::position_operation::PositionOperationLeg],
+    ) -> Decimal {
+        let cache = self.cache.borrow();
+        legs.iter()
+            .filter(|leg| leg.direction == PositionOperationDirection::Open)
+            .filter_map(|leg| {
+                let close = cache.instrument_close(&leg.instrument_id)?;
+                if close.close_type != InstrumentCloseType::ContractExpired {
+                    return None;
+                }
+                let position = cache.position(&leg.position_id)?;
+                if !position.is_closed() || !position.is_settled() {
+                    return None;
+                }
+                Some(leg.quantity.as_decimal() * close.close_price.as_decimal())
+            })
+            .sum()
+    }
+
+    fn apply_pending_position_operation_cash(
+        &mut self,
+        operation_id: UUID4,
+        legs: &[nautilus_model::position_operation::PositionOperationLeg],
+    ) -> anyhow::Result<()> {
+        let collateral = self
+            .pending_position_operation_cash
+            .remove(&operation_id)
+            .unwrap_or_default();
+        let total = collateral + self.position_operation_settlement_cash(legs);
+        if self.config.frozen_account || total.is_zero() {
+            return Ok(());
+        }
+
+        if let Err(e) = self.apply_simulated_collateral(total) {
+            if !collateral.is_zero() {
+                self.pending_position_operation_cash
+                    .insert(operation_id, collateral);
+            }
             return Err(e);
         }
         Ok(())
@@ -1697,13 +1786,22 @@ impl SandboxInner {
     fn process_instrument_close(&mut self, close: &InstrumentClose) {
         let instrument_id = close.instrument_id;
 
-        // A delayed close belongs to an existing exposure lifecycle. Unlike an
-        // instrument status update, it must not recreate execution state from
-        // cache after rotation/unsubscribe; pending-settlement ownership stays
-        // with the already-initialized matching engine.
+        // A delayed close belongs to an existing exposure lifecycle. Recreate execution state
+        // only for a retained convert output whose settlement message can arrive after cleanup.
         if let Some(engine) = self.matching_engines.get_mut(&instrument_id) {
             engine.process_instrument_close(*close);
             self.sync_expired_cleanup(instrument_id);
+        } else if close.close_type == InstrumentCloseType::ContractExpired
+            && self.retained_convert_dependencies.contains(&instrument_id)
+        {
+            if self.ensure_engine_for(instrument_id) {
+                self.seed_cached_market_data(instrument_id);
+
+                if let Some(engine) = self.matching_engines.get_mut(&instrument_id) {
+                    engine.process_instrument_close(*close);
+                    self.sync_expired_cleanup(instrument_id);
+                }
+            }
         } else {
             log::warn!(
                 "Ignoring instrument close for {instrument_id}: no existing matching engine",
@@ -1711,6 +1809,124 @@ impl SandboxInner {
         }
 
         self.drain_oto_commands();
+    }
+
+    fn has_pending_convert_for(&self, instrument_id: InstrumentId) -> bool {
+        self.position_operations
+            .values()
+            .any(|(operation, instrument_ids, status)| {
+                *operation == PositionOperationType::Convert
+                    && *status != PositionOperationStatus::Applied
+                    && instrument_ids.contains(&instrument_id)
+            })
+    }
+
+    /// Returns whether normal expiry cleanup must retain this settled YES definition.
+    ///
+    /// A negative-risk event can still produce the settled YES as a convert output while any
+    /// other condition's NO instrument remains available and unsettled for a supported input.
+    fn should_retain_convert_dependency(&self, instrument_id: InstrumentId) -> bool {
+        let cache = self.cache.borrow();
+        let Some(InstrumentAny::BinaryOption(output)) = cache.instrument(&instrument_id) else {
+            return false;
+        };
+
+        if !output
+            .outcome
+            .is_some_and(|outcome| outcome.as_str().eq_ignore_ascii_case("yes"))
+        {
+            return false;
+        }
+        let Some(info) = output.info.as_ref() else {
+            return false;
+        };
+
+        if info.get_bool("neg_risk") != Some(true) {
+            return false;
+        }
+
+        if !cache
+            .instrument_close(&instrument_id)
+            .is_some_and(|close| close.close_type == InstrumentCloseType::ContractExpired)
+        {
+            return false;
+        }
+        let Ok(market) = NegRiskMarketMetadata::parse(info) else {
+            return false;
+        };
+        let Some(output_token) = info.get_str("token_id") else {
+            return false;
+        };
+        let now = self.clock.borrow().timestamp_ns();
+        let instruments = cache.instruments(&self.config.venue, None);
+
+        for condition in &market.conditions {
+            if condition.yes_token_id == output_token {
+                continue;
+            }
+            let Some(input) = instruments.iter().find(|instrument| {
+                let InstrumentAny::BinaryOption(binary) = instrument else {
+                    return false;
+                };
+                binary
+                    .info
+                    .as_ref()
+                    .and_then(|info| info.get_str("token_id"))
+                    == Some(condition.no_token_id.as_str())
+            }) else {
+                continue;
+            };
+            let InstrumentAny::BinaryOption(input) = input else {
+                continue;
+            };
+
+            if input
+                .info
+                .as_ref()
+                .and_then(|info| info.get_str(MARKET_VERSION_KEY))
+                == Some(MARKET_VERSION_V2)
+            {
+                continue;
+            }
+
+            if cache
+                .instrument_close(&input.id)
+                .is_some_and(|close| close.close_type == InstrumentCloseType::ContractExpired)
+            {
+                continue;
+            }
+
+            if input.expiration_ns.is_zero() || now < input.expiration_ns {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn release_retained_convert_dependencies(&mut self) {
+        let retained: Vec<InstrumentId> =
+            self.retained_convert_dependencies.iter().copied().collect();
+
+        for instrument_id in retained {
+            let has_open_positions = self.cache.borrow().has_positions_open(
+                Some(&self.config.venue),
+                Some(&instrument_id),
+                None,
+                None,
+                None,
+            );
+
+            if has_open_positions
+                || self.should_retain_convert_dependency(instrument_id)
+                || self.has_pending_convert_for(instrument_id)
+            {
+                continue;
+            }
+            self.retained_convert_dependencies.remove(&instrument_id);
+            self.cache
+                .borrow_mut()
+                .purge_instrument_skip_order_guard(instrument_id);
+        }
     }
 
     fn is_expired_now(&self, instrument_id: InstrumentId) -> bool {
@@ -1761,9 +1977,48 @@ impl SandboxInner {
         }
 
         self.matching_engines.remove(&instrument_id);
+
+        if self.should_retain_convert_dependency(instrument_id)
+            || self.has_pending_convert_for(instrument_id)
+        {
+            let (instrument, close) = {
+                let cache = self.cache.borrow();
+                (
+                    cache.instrument(&instrument_id).cloned(),
+                    cache.instrument_close(&instrument_id).copied(),
+                )
+            };
+            {
+                let mut cache = self.cache.borrow_mut();
+                cache.purge_instrument_skip_order_guard(instrument_id);
+
+                if cache.instrument(&instrument_id).is_none()
+                    && let Some(instrument) = instrument
+                    && let Err(e) = cache.add_instrument(instrument)
+                {
+                    log::error!(
+                        "Failed to restore retained convert instrument {instrument_id}: {e}"
+                    );
+                }
+
+                if cache.instrument_close(&instrument_id).is_none()
+                    && let Some(close) = close
+                    && let Err(e) = cache.add_instrument_close(close)
+                {
+                    log::error!(
+                        "Failed to restore retained settlement evidence for {instrument_id}: {e}"
+                    );
+                }
+            }
+            self.retained_convert_dependencies.insert(instrument_id);
+            return;
+        }
+
+        self.retained_convert_dependencies.remove(&instrument_id);
         self.cache
             .borrow_mut()
             .purge_instrument_skip_order_guard(instrument_id);
+        self.release_retained_convert_dependencies();
     }
 
     fn sync_expired_cleanup_many(&mut self, instrument_ids: &[InstrumentId]) {
@@ -1794,6 +2049,7 @@ impl SandboxInner {
             self.sync_expired_cleanup(instrument_id);
         }
 
+        self.release_retained_convert_dependencies();
         self.drain_oto_commands();
     }
 

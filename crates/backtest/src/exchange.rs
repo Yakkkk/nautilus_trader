@@ -65,8 +65,8 @@ use nautilus_model::{
         OrderBookDelta, OrderBookDeltas, OrderBookDepth, QuoteTick, TradeTick,
     },
     enums::{
-        AccountType, AggregationSource, AggressorSide, BookType, OmsType, OrderStatus,
-        PositionAdjustmentType, PositionSide, PriceType,
+        AccountType, AggregationSource, AggressorSide, BookType, InstrumentCloseType, OmsType,
+        OrderStatus, PositionAdjustmentType, PositionSide, PriceType,
     },
     events::{FundingSettlement, OrderEventAny, OrderUpdated, PositionAdjusted, PositionEvent},
     identifiers::{AccountId, InstrumentId, Venue},
@@ -74,7 +74,7 @@ use nautilus_model::{
     orderbook::OrderBook,
     orders::{Order, OrderAny},
     position::Position,
-    position_operation::PositionOperationType,
+    position_operation::{PositionOperationDirection, PositionOperationLeg, PositionOperationType},
     types::{AccountBalance, Currency, Money, Price, Quantity},
 };
 use rust_decimal::Decimal;
@@ -229,7 +229,7 @@ pub struct SimulatedExchange {
             PositionOperationStatus,
         ),
     >,
-    /// Cash effects retained until the core confirms application.
+    /// Direct conversion cash retained until the core confirms application.
     pending_position_operation_cash: AHashMap<UUID4, Decimal>,
     /// Position operation results buffered until this exchange's mutable borrow is released.
     position_operation_results: Rc<RefCell<Vec<PositionOperationResult>>>,
@@ -2147,7 +2147,7 @@ impl SimulatedExchange {
             }
         };
 
-        if !self.frozen_account {
+        if !self.frozen_account && !collateral.is_zero() {
             self.pending_position_operation_cash
                 .insert(command.operation_id, collateral);
         }
@@ -2216,6 +2216,12 @@ impl SimulatedExchange {
                     available >= quantity.as_decimal(),
                     "backtest convert requires {} available {instrument_id}, found {available}",
                     quantity.as_decimal()
+                );
+                anyhow::ensure!(
+                    !cache.instrument_close(instrument_id).is_some_and(|close| {
+                        close.close_type == InstrumentCloseType::ContractExpired
+                    }),
+                    "backtest convert input {instrument_id} is already economically settled"
                 );
                 ensure_instrument_active(
                     instrument_id,
@@ -2318,23 +2324,46 @@ impl SimulatedExchange {
                 let InstrumentAny::BinaryOption(binary) = output else {
                     unreachable!("output was matched as a binary option");
                 };
-                ensure_instrument_active(
-                    &output.id(),
-                    binary.activation_ns,
-                    binary.expiration_ns,
-                    now,
-                )?;
+
+                let output_quantity = base_units_to_decimal(amounts.per_outcome)?;
+
+                if let Some(close) = cache.instrument_close(&output.id()) {
+                    anyhow::ensure!(
+                        close.close_type == InstrumentCloseType::ContractExpired,
+                        "backtest conversion output {} has a non-settlement close",
+                        output.id()
+                    );
+                } else {
+                    ensure_instrument_active(
+                        &output.id(),
+                        binary.activation_ns,
+                        binary.expiration_ns,
+                        now,
+                    )?;
+                }
 
                 instrument_ids.push(output.id());
                 received.push(PositionOperationTokenAmount {
                     token_id: condition.yes_token_id.clone(),
-                    quantity: base_units_to_decimal(amounts.per_outcome)?.to_string(),
+                    quantity: output_quantity.to_string(),
                 });
             }
         }
 
         instrument_ids.sort();
         instrument_ids.dedup();
+
+        {
+            let cache = self.cache.borrow();
+            for instrument_id in &instrument_ids {
+                anyhow::ensure!(
+                    cache
+                        .orders_open(None, Some(instrument_id), None, None, None)
+                        .is_empty(),
+                    "backtest convert cannot proceed while active orders exist for {instrument_id}"
+                );
+            }
+        }
 
         let collateral = base_units_to_decimal(amounts.collateral_return)?;
         let effects = PositionOperationEffects {
@@ -2356,15 +2385,43 @@ impl SimulatedExchange {
     pub(crate) fn apply_pending_position_operation_cash(
         &mut self,
         operation_id: UUID4,
+        legs: &[PositionOperationLeg],
     ) -> anyhow::Result<()> {
-        if let Some(collateral) = self.pending_position_operation_cash.remove(&operation_id)
-            && let Err(e) = self.apply_simulated_collateral(collateral)
-        {
-            self.pending_position_operation_cash
-                .insert(operation_id, collateral);
+        let collateral = self
+            .pending_position_operation_cash
+            .remove(&operation_id)
+            .unwrap_or_default();
+        let total = collateral + self.position_operation_settlement_cash(legs);
+        if self.frozen_account || total.is_zero() {
+            return Ok(());
+        }
+
+        if let Err(e) = self.apply_simulated_collateral(total) {
+            if !collateral.is_zero() {
+                self.pending_position_operation_cash
+                    .insert(operation_id, collateral);
+            }
             return Err(e);
         }
         Ok(())
+    }
+
+    fn position_operation_settlement_cash(&self, legs: &[PositionOperationLeg]) -> Decimal {
+        let cache = self.cache.borrow();
+        legs.iter()
+            .filter(|leg| leg.direction == PositionOperationDirection::Open)
+            .filter_map(|leg| {
+                let close = cache.instrument_close(&leg.instrument_id)?;
+                if close.close_type != InstrumentCloseType::ContractExpired {
+                    return None;
+                }
+                let position = cache.position(&leg.position_id)?;
+                if !position.is_closed() || !position.is_settled() {
+                    return None;
+                }
+                Some(leg.quantity.as_decimal() * close.close_price.as_decimal())
+            })
+            .sum()
     }
 
     fn apply_simulated_collateral(&self, collateral: Decimal) -> anyhow::Result<()> {

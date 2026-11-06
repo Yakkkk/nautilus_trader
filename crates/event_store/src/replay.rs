@@ -2619,6 +2619,11 @@ mod tests {
             &[],
         ),
         cache_mutation(
+            "restore_position_snapshots_for",
+            CacheMutationRecoveryClass::SnapshotOwned,
+            &[],
+        ),
+        cache_mutation(
             "purge_instrument",
             CacheMutationRecoveryClass::SnapshotOwned,
             &[],
@@ -2893,6 +2898,16 @@ mod tests {
             "update_position_from_instrument_close",
             CacheMutationRecoveryClass::EventStoreCapturedAndReplayed,
             &[PAYLOAD_TYPE_INSTRUMENT_CLOSE],
+        ),
+        cache_mutation(
+            "update_position_from_instrument_close_at",
+            CacheMutationRecoveryClass::EventStoreCapturedAndReplayed,
+            &[PAYLOAD_TYPE_INSTRUMENT_CLOSE, PAYLOAD_TYPE_POSITION_CLOSED],
+        ),
+        cache_mutation(
+            "record_settled_position_source",
+            CacheMutationRecoveryClass::SnapshotOwned,
+            &[],
         ),
         cache_mutation(
             "update_position_from_adjustment",
