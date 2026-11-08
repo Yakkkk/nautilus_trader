@@ -34,6 +34,7 @@ use std::{
     rc::Rc,
 };
 
+use ahash::AHashMap;
 use indexmap::{IndexMap, IndexSet};
 use jiff::SignedDuration;
 use nautilus_common::{
@@ -133,6 +134,11 @@ pub struct OrderMatchingEngine {
     execution_bar_deltas: IndexMap<BarType, SignedDuration>,
     account_ids: IndexMap<TraderId, AccountId>,
     pending_fills: IndexMap<TradeId, PendingFill>,
+    /// Quantities committed to confirmed position operations that core has not applied yet.
+    position_operation_reservations: AHashMap<PositionId, Decimal>,
+    /// Expired positions whose settlement waits for a pending position operation, with the
+    /// authoritative close received at expiration.
+    deferred_expiration_positions: AHashMap<PositionId, Option<InstrumentClose>>,
     post_match_order_ids: IndexSet<ClientOrderId>,
     orders: MatchingOrders,
     ids_generator: IdsGenerator,
@@ -232,6 +238,8 @@ impl OrderMatchingEngine {
             execution_bar_deltas: IndexMap::new(),
             account_ids: IndexMap::new(),
             pending_fills: IndexMap::new(),
+            position_operation_reservations: AHashMap::new(),
+            deferred_expiration_positions: AHashMap::new(),
             post_match_order_ids: IndexSet::new(),
             orders: MatchingOrders::default(),
             ids_generator,
@@ -307,6 +315,8 @@ impl OrderMatchingEngine {
         self.execution_bar_deltas.clear();
         self.account_ids.clear();
         self.pending_fills.clear();
+        self.position_operation_reservations.clear();
+        self.deferred_expiration_positions.clear();
         self.post_match_order_ids.clear();
         self.orders
             .reset(self.instrument.id(), &self.cache.borrow());
@@ -2845,71 +2855,108 @@ impl OrderMatchingEngine {
                 .collect()
         };
 
-        let ts_now = self.clock.borrow().timestamp_ns();
         let close_price = close.as_ref().map(|close| close.close_price);
 
         for (trader_id, strategy_id, account_id, position_id, closing_side, quantity) in positions {
-            let client_order_id =
-                ClientOrderId::from(format!("EXPIRATION-{}-{}", self.venue, UUID4::new()).as_str());
-            let mut order = OrderAny::Market(MarketOrder::new(
+            if self
+                .position_operation_reservations
+                .get(&position_id)
+                .is_some_and(|reserved| !reserved.is_zero())
+            {
+                self.deferred_expiration_positions
+                    .insert(position_id, close);
+                continue;
+            }
+
+            self.settle_expiration_position(
                 trader_id,
                 strategy_id,
-                instrument_id,
-                client_order_id,
+                account_id,
+                position_id,
                 closing_side,
                 quantity,
-                TimeInForce::Gtc,
-                UUID4::new(),
-                ts_now,
-                true, // reduce_only
+                close_price,
+            );
+        }
+    }
+
+    /// Settles one expired position with a synthetic reduce-only market order.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "expiration settlement carries the position identity and close basis"
+    )]
+    fn settle_expiration_position(
+        &mut self,
+        trader_id: TraderId,
+        strategy_id: StrategyId,
+        account_id: AccountId,
+        position_id: PositionId,
+        closing_side: OrderSide,
+        quantity: Quantity,
+        close_price: Option<Price>,
+    ) {
+        let instrument_id = self.instrument.id();
+        let ts_now = self.clock.borrow().timestamp_ns();
+        let client_order_id =
+            ClientOrderId::from(format!("EXPIRATION-{}-{}", self.venue, UUID4::new()).as_str());
+        let mut order = OrderAny::Market(MarketOrder::new(
+            trader_id,
+            strategy_id,
+            instrument_id,
+            client_order_id,
+            closing_side,
+            quantity,
+            TimeInForce::Gtc,
+            UUID4::new(),
+            ts_now,
+            true, // reduce_only
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(vec![Ustr::from(&format!(
+                "EXPIRATION_{}_CLOSE",
+                self.venue
+            ))]),
+        ));
+        order.set_liquidity_side(LiquiditySide::Taker);
+
+        let add_result =
+            self.cache
+                .borrow_mut()
+                .add_order(order.clone(), Some(position_id), None, false);
+
+        if add_result.is_err() {
+            log::debug!("Expiration order already in cache: {client_order_id}");
+        } else {
+            self.publish_order_initialized(&order);
+        }
+
+        let venue_order_id = self.ids_generator.get_venue_order_id(&order).unwrap();
+
+        // A restored position can expire with no order processed this
+        // session, leaving the account unindexed.
+        self.account_ids.insert(trader_id, account_id);
+        self.generate_order_accepted(&order, venue_order_id);
+
+        if let Some(fill_price) = close_price {
+            if let Err(e) = self.apply_fills(
+                &order,
+                &[(fill_price, quantity)],
+                LiquiditySide::Taker,
+                Some(position_id),
+                None,
+                None,
                 false,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                Some(vec![Ustr::from(&format!(
-                    "EXPIRATION_{}_CLOSE",
-                    self.venue
-                ))]),
-            ));
-            order.set_liquidity_side(LiquiditySide::Taker);
-
-            let add_result =
-                self.cache
-                    .borrow_mut()
-                    .add_order(order.clone(), Some(position_id), None, false);
-
-            if add_result.is_err() {
-                log::debug!("Expiration order already in cache: {client_order_id}");
-            } else {
-                self.publish_order_initialized(&order);
+            ) {
+                log::error!("Cannot fill expiration order {client_order_id}: {e}");
             }
-
-            let venue_order_id = self.ids_generator.get_venue_order_id(&order).unwrap();
-
-            // A restored position can expire with no order processed this
-            // session, leaving the account unindexed.
-            self.account_ids.insert(trader_id, account_id);
-            self.generate_order_accepted(&order, venue_order_id);
-
-            if let Some(fill_price) = close_price {
-                if let Err(e) = self.apply_fills(
-                    &order,
-                    &[(fill_price, quantity)],
-                    LiquiditySide::Taker,
-                    Some(position_id),
-                    None,
-                    None,
-                    false,
-                ) {
-                    log::error!("Cannot fill expiration order {client_order_id}: {e}");
-                }
-            } else {
-                self.fill_market_order(client_order_id);
-            }
+        } else {
+            self.fill_market_order(client_order_id);
         }
     }
 
@@ -3807,6 +3854,20 @@ impl OrderMatchingEngine {
                 return;
             }
         };
+
+        if order.is_sell() && self.order_position_is_reserved(&order) {
+            self.generate_order_modify_rejected(
+                command.trader_id,
+                command.strategy_id,
+                command.instrument_id,
+                command.client_order_id,
+                Ustr::from("position operation in progress"),
+                command.venue_order_id,
+                Some(account_id),
+                Some(command.command_id),
+            );
+            return;
+        }
 
         let update_success = self.update_order(
             &order,
@@ -6046,7 +6107,144 @@ impl OrderMatchingEngine {
             };
         }
 
+        if let Some(reserved) = position_id
+            .and_then(|position_id| self.position_operation_reservations.get(&position_id))
+        {
+            quantity = quantity.checked_sub(*reserved).ok_or_else(|| {
+                anyhow::anyhow!("Position operation reservation exceeds position quantity")
+            })?;
+        }
+
         Ok(quantity)
+    }
+
+    /// Returns the signed quantity change from fills emitted by this engine that core has not
+    /// applied yet.
+    ///
+    /// Call [`Self::purge_applied_pending_fills`] first when the cache may have applied a fill
+    /// since the engine last processed an order or fill.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the pending quantity change overflows.
+    pub fn pending_fill_quantity(&self, position_id: PositionId) -> anyhow::Result<Decimal> {
+        let mut quantity = Decimal::ZERO;
+
+        for fill in self.pending_fills.values() {
+            if fill.position_id != Some(position_id) {
+                continue;
+            }
+            quantity = quantity
+                .checked_add(fill.quantity_change)
+                .ok_or_else(|| anyhow::anyhow!("Pending position quantity overflow"))?;
+        }
+
+        Ok(quantity)
+    }
+
+    /// Drops pending fills the cache has already applied.
+    pub fn purge_applied_pending_fills(&mut self) {
+        self.purge_applied_fills();
+    }
+
+    /// Reserves `quantity` of `position_id` for a confirmed position operation.
+    ///
+    /// Reserved quantity stays unavailable to new sell orders until the operation is applied or
+    /// definitively rejected.
+    pub fn reserve_position_operation(&mut self, position_id: PositionId, quantity: Quantity) {
+        let entry = self
+            .position_operation_reservations
+            .entry(position_id)
+            .or_default();
+
+        match entry.checked_add(quantity.as_decimal()) {
+            Some(total) => *entry = total,
+            None => log::error!("Position operation reservation overflow for {position_id}"),
+        }
+    }
+
+    /// Releases `quantity` previously reserved for `position_id`.
+    pub fn release_position_operation(&mut self, position_id: PositionId, quantity: Quantity) {
+        if let Some(reserved) = self.position_operation_reservations.get_mut(&position_id) {
+            let remaining = reserved
+                .checked_sub(quantity.as_decimal())
+                .unwrap_or(Decimal::ZERO);
+
+            if remaining <= Decimal::ZERO {
+                self.position_operation_reservations.remove(&position_id);
+            } else {
+                *reserved = remaining;
+            }
+        }
+
+        self.settle_deferred_expiration_position(position_id);
+    }
+
+    /// Settles an expired position once the operation reserving it has applied or been rejected.
+    fn settle_deferred_expiration_position(&mut self, position_id: PositionId) {
+        let Some(stored_close) = self.deferred_expiration_positions.remove(&position_id) else {
+            return;
+        };
+
+        if self
+            .position_operation_reservations
+            .get(&position_id)
+            .is_some_and(|reserved| !reserved.is_zero())
+        {
+            self.deferred_expiration_positions
+                .insert(position_id, stored_close);
+            return;
+        }
+
+        let (trader_id, strategy_id, account_id, closing_side, quantity, close_price) = {
+            let cache = self.cache.borrow();
+            let Some(position) = cache.position(&position_id) else {
+                return;
+            };
+            if !position.is_open() {
+                return;
+            }
+            let Some(closing_side) = OrderCore::closing_side(position.side) else {
+                return;
+            };
+            let close_price = stored_close.map(|close| close.close_price).or_else(|| {
+                cache
+                    .instrument_close(&self.instrument.id())
+                    .map(|close| close.close_price)
+            });
+            (
+                position.trader_id,
+                position.strategy_id,
+                position.account_id,
+                closing_side,
+                position.quantity,
+                close_price,
+            )
+        };
+
+        self.settle_expiration_position(
+            trader_id,
+            strategy_id,
+            account_id,
+            position_id,
+            closing_side,
+            quantity,
+            close_price,
+        );
+    }
+
+    fn order_position_is_reserved(&self, order: &OrderAny) -> bool {
+        let position_id = order.position_id().or_else(|| {
+            (self.oms_type == OmsType::Netting).then(|| {
+                PositionId::new(format!("{}-{}", order.instrument_id(), order.strategy_id()))
+            })
+        });
+
+        position_id.is_some_and(|position_id| {
+            self.position_operation_reservations
+                .get(&position_id)
+                .is_some_and(|quantity| !quantity.is_zero())
+        })
     }
 
     fn purge_applied_fills(&mut self) {
@@ -6094,7 +6292,9 @@ impl OrderMatchingEngine {
                     .any(|snapshot| snapshot.trade_ids.contains(trade_id))
                     || cash_cache
                         .and_then(|cache| cache.order(&fill.client_order_id))
-                        .filter(|order| position.opening_order_id == order.client_order_id())
+                        .filter(|order| {
+                            position.opening_order_id == Some(order.client_order_id())
+                        })
                         .is_some_and(|order| {
                             order
                                 .trade_ids()

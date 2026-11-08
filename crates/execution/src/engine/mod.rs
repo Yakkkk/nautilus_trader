@@ -25,6 +25,8 @@ pub mod position;
 pub mod settlement;
 pub mod stubs;
 
+mod position_operations;
+
 use std::{
     cell::{Cell, RefCell, RefMut},
     collections::{HashMap, HashSet},
@@ -49,13 +51,15 @@ use nautilus_common::{
         ExecutionReport,
         execution::{
             BatchCancelOrders, BatchModifyOrders, CancelAllOrders, CancelOrder, ModifyOrder,
-            QueryAccount, QueryOrder, SubmitOrder, SubmitOrderList, TradingCommand,
+            PositionOperationControlRequest, PositionOperationResult, PositionOperationStatus,
+            QueryAccount, QueryOrder, QueryPositionOperation, SubmitOrder, SubmitOrderList,
+            SubmitPositionOperation, TradingCommand,
         },
     },
     msgbus::{
-        self, MStr, MessagingSwitchboard, Pattern, TypedHandler, TypedIntoHandler, get_message_bus,
+        self, MStr, MessagingSwitchboard, Pattern, ShareableMessageHandler, TypedHandler,
+        TypedIntoHandler, get_message_bus,
         switchboard::{self},
-        typed_handler::ShareableMessageHandler,
     },
     runner::{
         TradingCommandMessage, capture_trading_cmd, trading_cmd_is_dispatching,
@@ -139,6 +143,12 @@ pub struct ExecutionEngine {
     event_count: u64,
     report_count: u64,
     filtered_unclaimed_external_order_count: u64,
+    applied_position_operations: AHashSet<UUID4>,
+    position_operation_barriers:
+        RefCell<AHashMap<InstrumentId, AHashSet<position_operations::PositionOperationBarrier>>>,
+    /// Instrument scope of submitted operations whose settlement waits for the operation result.
+    position_operation_settlement_scope: RefCell<AHashMap<UUID4, (ClientId, Vec<InstrumentId>)>>,
+    deferred_instrument_closes: RefCell<AHashSet<InstrumentId>>,
     snapshot_anchorer: Option<SnapshotAnchorer>,
 }
 
@@ -201,6 +211,10 @@ impl ExecutionEngine {
             event_count: 0,
             report_count: 0,
             filtered_unclaimed_external_order_count: 0,
+            applied_position_operations: AHashSet::new(),
+            position_operation_barriers: RefCell::new(AHashMap::new()),
+            position_operation_settlement_scope: RefCell::new(AHashMap::new()),
+            deferred_instrument_closes: RefCell::new(AHashSet::new()),
             snapshot_anchorer: None,
         }
     }
@@ -253,6 +267,28 @@ impl ExecutionEngine {
                     rc.borrow_mut().reconcile_execution_report(&report);
                 }
             }),
+        );
+
+        let weak4 = WeakCell::from(Rc::downgrade(engine));
+        msgbus::register_any(
+            MessagingSwitchboard::exec_engine_position_operation(),
+            ShareableMessageHandler::from_typed(move |result: &PositionOperationResult| {
+                if let Some(rc) = weak4.upgrade() {
+                    rc.borrow_mut().process_position_operation(result);
+                }
+            }),
+        );
+
+        let weak5 = WeakCell::from(Rc::downgrade(engine));
+        msgbus::register_any(
+            MessagingSwitchboard::exec_engine_position_operation_control(),
+            ShareableMessageHandler::from_typed(
+                move |request: &PositionOperationControlRequest| {
+                    if let Some(rc) = weak5.upgrade() {
+                        rc.borrow_mut().process_position_operation_control(request);
+                    }
+                },
+            ),
         );
     }
 
@@ -991,6 +1027,8 @@ impl ExecutionEngine {
         }
 
         self.cache.borrow_mut().cache_all().await?;
+
+        self.restore_position_operation_barriers();
 
         // Snapshot before iterating: `get_or_init_own_order_book` re-enters `self.cache.borrow_mut()`.
         let own_book_entries: Vec<(InstrumentId, OwnBookOrder)> = {
@@ -2055,6 +2093,12 @@ impl ExecutionEngine {
         self.event_count = 0;
         self.report_count = 0;
         self.filtered_unclaimed_external_order_count = 0;
+        self.applied_position_operations.clear();
+        self.position_operation_barriers.borrow_mut().clear();
+        self.position_operation_settlement_scope
+            .borrow_mut()
+            .clear();
+        self.deferred_instrument_closes.borrow_mut().clear();
         log::info!("Reset");
     }
 
@@ -2150,6 +2194,12 @@ impl ExecutionEngine {
             TradingCommand::CancelAllOrders(cmd) => self.handle_cancel_all_orders(client, &cmd),
             TradingCommand::QueryOrder(cmd) => self.handle_query_order(client, cmd),
             TradingCommand::QueryAccount(cmd) => self.handle_query_account(client, cmd),
+            TradingCommand::SubmitPositionOperation(cmd) => {
+                self.handle_submit_position_operation(client, cmd);
+            }
+            TradingCommand::QueryPositionOperation(cmd) => {
+                self.handle_query_position_operation(client, cmd);
+            }
         }
     }
 
@@ -2335,6 +2385,18 @@ impl ExecutionEngine {
                 let issuer = cmd.account_id.get_issuer();
                 format!("account_id={}, issuer={issuer}", cmd.account_id)
             }
+            TradingCommand::SubmitPositionOperation(cmd) => {
+                format!(
+                    "operation_id={}, operation={}, client_id={:?}",
+                    cmd.operation_id, cmd.operation, cmd.client_id
+                )
+            }
+            TradingCommand::QueryPositionOperation(cmd) => {
+                format!(
+                    "operation_id={}, client_id={:?}",
+                    cmd.operation_id, cmd.client_id
+                )
+            }
             _ => format!("venue={}", command.instrument_id().venue),
         }
     }
@@ -2397,11 +2459,13 @@ impl ExecutionEngine {
             | TradingCommand::ModifyOrders(_)
             | TradingCommand::CancelOrders(_)
             | TradingCommand::CancelAllOrders(_)
-            | TradingCommand::QueryOrder(_) => None,
+            | TradingCommand::QueryOrder(_)
+            | TradingCommand::SubmitPositionOperation(_)
+            | TradingCommand::QueryPositionOperation(_) => None,
         }
     }
 
-    const fn instrument_id_for_command(command: &TradingCommand) -> Option<InstrumentId> {
+    fn instrument_id_for_command(command: &TradingCommand) -> Option<InstrumentId> {
         match command {
             TradingCommand::SubmitOrder(cmd) => Some(cmd.instrument_id),
             TradingCommand::SubmitOrderList(cmd) => Some(cmd.instrument_id),
@@ -2411,11 +2475,29 @@ impl ExecutionEngine {
             TradingCommand::CancelOrders(cmd) => Some(cmd.instrument_id),
             TradingCommand::CancelAllOrders(cmd) => Some(cmd.instrument_id),
             TradingCommand::QueryOrder(cmd) => Some(cmd.instrument_id),
-            TradingCommand::QueryAccount(_) => None,
+            TradingCommand::SubmitPositionOperation(cmd) => cmd.instrument_ids.first().copied(),
+            TradingCommand::QueryAccount(_) | TradingCommand::QueryPositionOperation(_) => None,
         }
     }
 
     fn handle_submit_order(&self, client: &dyn ExecutionClient, cmd: SubmitOrder) {
+        if let Some(operation_id) =
+            self.position_operation_barrier_for(client.account_id(), &cmd.instrument_id)
+        {
+            let reason = format!(
+                "position operation {operation_id} is in progress for {}",
+                cmd.instrument_id
+            );
+            let order = self.cache.borrow().order_owned(&cmd.client_order_id);
+
+            if let Some(order) = order {
+                self.deny_order(&order, &reason);
+            } else {
+                log::warn!("{reason}; submit {} is not cached", cmd.client_order_id);
+            }
+            return;
+        }
+
         let client_order_id = cmd.client_order_id;
         let cached_order = { self.cache.borrow().order_owned(&client_order_id) };
 
@@ -2518,6 +2600,31 @@ impl ExecutionEngine {
     }
 
     fn handle_submit_order_list(&self, client: &dyn ExecutionClient, cmd: SubmitOrderList) {
+        let account_id = client.account_id();
+        let barred = {
+            let barriers = self.position_operation_barriers.borrow();
+            cmd.order_inits.iter().any(|init| {
+                barriers.get(&init.instrument_id).is_some_and(|set| {
+                    set.iter()
+                        .any(|barrier| barrier.matches_account(account_id))
+                })
+            })
+        };
+
+        if barred {
+            let orders: Vec<OrderAny> = cmd
+                .order_inits
+                .iter()
+                .filter_map(|init| self.cache.borrow().order_owned(&init.client_order_id))
+                .collect();
+
+            for order in orders {
+                self.deny_order(&order, "position operation in progress");
+            }
+            log::warn!("Blocked order list while a position operation is in progress");
+            return;
+        }
+
         let mut orders = Vec::with_capacity(cmd.order_list.client_order_ids.len());
         let mut added_client_order_ids = AHashSet::new();
 
@@ -2725,6 +2832,19 @@ impl ExecutionEngine {
     }
 
     fn handle_modify_order(&self, client: &dyn ExecutionClient, cmd: ModifyOrder) {
+        if let Some(operation_id) =
+            self.position_operation_barrier_for(client.account_id(), &cmd.instrument_id)
+        {
+            self.deny_modify_command(
+                &cmd,
+                &format!(
+                    "position operation {operation_id} is in progress for {}",
+                    cmd.instrument_id
+                ),
+            );
+            return;
+        }
+
         let venue_str = cmd
             .venue_order_id
             .map_or_else(String::new, |venue_order_id| format!(" {venue_order_id}"));
@@ -2745,6 +2865,30 @@ impl ExecutionEngine {
     }
 
     fn handle_batch_modify_orders(&self, client: &dyn ExecutionClient, cmd: BatchModifyOrders) {
+        let account_id = client.account_id();
+        let barred = {
+            let barriers = self.position_operation_barriers.borrow();
+            cmd.modifies.iter().any(|modify| {
+                barriers.get(&modify.instrument_id).is_some_and(|set| {
+                    set.iter()
+                        .any(|barrier| barrier.matches_account(account_id))
+                })
+            })
+        };
+
+        if barred {
+            for modify in &cmd.modifies {
+                if self
+                    .position_operation_barrier_for(account_id, &modify.instrument_id)
+                    .is_some()
+                {
+                    self.deny_modify_command(modify, "position operation in progress");
+                }
+            }
+            log::warn!("Blocked batch modify while a position operation is in progress");
+            return;
+        }
+
         let command_id = cmd.command_id;
         if client.batch_modify_orders(cmd).is_err() {
             log::error!(
@@ -2966,6 +3110,96 @@ impl ExecutionEngine {
         if client.query_order(cmd).is_err() {
             log::warn!(
                 "Error querying order: client {}, command {command_id}",
+                client.client_id()
+            );
+        }
+    }
+
+    fn handle_submit_position_operation(
+        &self,
+        client: &dyn ExecutionClient,
+        cmd: SubmitPositionOperation,
+    ) {
+        log_info!(
+            "Submit position operation {} ({})",
+            cmd.operation_id,
+            cmd.operation,
+            color = LogColor::Blue
+        );
+
+        if let Err(e) = cmd.validate() {
+            log::warn!("Rejected position operation {}: {e}", cmd.operation_id);
+            self.publish_position_operation_rejection(&cmd, &e.to_string());
+            return;
+        }
+
+        // Hold input settlements until the operation result arrives. This keeps a confirmed
+        // conversion's inputs open for application even if their market closes first; the close
+        // then settles the inventory the operation left behind.
+        self.note_position_operation_settlement_scope(
+            cmd.operation_id,
+            client.client_id(),
+            &cmd.instrument_ids,
+        );
+
+        let operation_id = cmd.operation_id;
+        if let Err(e) = client.submit_position_operation(cmd) {
+            self.release_position_operation_settlement_scope(operation_id);
+            log::warn!(
+                "Error submitting position operation: client {}, {e}",
+                client.client_id()
+            );
+        }
+    }
+
+    fn publish_position_operation_rejection(&self, cmd: &SubmitPositionOperation, message: &str) {
+        let Some(client_id) = cmd
+            .client_id
+            .or(self.default_client_id)
+            .or_else(|| self.clients.keys().next().copied())
+        else {
+            return;
+        };
+        let account_id = self
+            .clients
+            .get(&client_id)
+            .map_or_else(|| AccountId::from("UNKNOWN"), |adapter| adapter.account_id);
+        let ts = self.clock.borrow().timestamp_ns();
+        let result = PositionOperationResult::new(
+            cmd.trader_id,
+            cmd.strategy_id,
+            client_id,
+            account_id,
+            cmd.operation_id,
+            cmd.operation,
+            PositionOperationStatus::Rejected,
+            cmd.instrument_ids.clone(),
+            None,
+            None,
+            Some(message.to_string()),
+            None,
+            UUID4::new(),
+            ts,
+            ts,
+        );
+        let topic = msgbus::switchboard::get_event_position_operation_topic(cmd.strategy_id);
+        msgbus::publish_any(topic, &result);
+    }
+
+    fn handle_query_position_operation(
+        &self,
+        client: &dyn ExecutionClient,
+        cmd: QueryPositionOperation,
+    ) {
+        log_info!(
+            "Query position operation {}",
+            cmd.operation_id,
+            color = LogColor::Blue
+        );
+
+        if let Err(e) = client.query_position_operation(cmd) {
+            log::warn!(
+                "Error querying position operation: client {}, {e}",
                 client.client_id()
             );
         }
@@ -3457,7 +3691,7 @@ impl ExecutionEngine {
                 None,
             )
             .iter()
-            .filter(|position| position.opening_order_id == fill.client_order_id)
+            .filter(|position| position.opening_order_id == Some(fill.client_order_id))
             .map(|position| position.id)
             .collect();
 
@@ -4526,14 +4760,17 @@ impl ExecutionEngine {
                 position_id: position.id,
                 account_id: position.account_id,
                 opening_order_id: position.opening_order_id,
+                opening_operation_id: position.opening_operation_id,
+                operation_id: None,
                 closing_order_id: position.closing_order_id,
+                closing_operation_id: position.closing_operation_id,
                 entry: position.entry,
                 side: position.side,
                 signed_qty: position.signed_qty,
                 quantity: position.quantity,
                 peak_quantity: position.peak_qty,
-                last_qty: corrected_qty,
-                last_px: fill_voided.last_px,
+                last_qty: Some(corrected_qty),
+                last_px: Some(fill_voided.last_px),
                 currency: position.quote_currency,
                 avg_px_open: position.avg_px_open,
                 avg_px_close: position.avg_px_close,
@@ -4555,13 +4792,15 @@ impl ExecutionEngine {
                 position_id: position.id,
                 account_id: position.account_id,
                 opening_order_id: position.opening_order_id,
+                opening_operation_id: position.opening_operation_id,
+                operation_id: None,
                 entry: position.entry,
                 side: position.side,
                 signed_qty: position.signed_qty,
                 quantity: position.quantity,
                 peak_quantity: position.peak_qty,
-                last_qty: corrected_qty,
-                last_px: fill_voided.last_px,
+                last_qty: Some(corrected_qty),
+                last_px: Some(fill_voided.last_px),
                 currency: position.quote_currency,
                 avg_px_open: position.avg_px_open,
                 avg_px_close: position.avg_px_close,
@@ -4745,7 +4984,9 @@ impl ExecutionEngine {
         }
 
         let is_orderless_leg = self.is_leg_fill(&fill)
-            && !self.cache.borrow().order_exists(&position.opening_order_id);
+            && !position
+                .opening_order_id
+                .is_some_and(|id| self.cache.borrow().order_exists(&id));
         if let Some(position_id) = prior_position_id {
             debug_assert_eq!(position_id, position.id);
 
@@ -4938,6 +5179,27 @@ impl ExecutionEngine {
     fn settle_instrument_close(&self, close: &InstrumentClose) {
         let instrument_id = close.instrument_id;
 
+        if self.position_operation_barrier(&instrument_id).is_some()
+            || self.position_operation_defers_settlement(&instrument_id)
+        {
+            let has_close = self
+                .cache
+                .borrow()
+                .instrument_close(&instrument_id)
+                .is_some();
+
+            if !has_close && let Err(e) = self.cache.borrow_mut().add_instrument_close(*close) {
+                log::error!("Cannot retain deferred close for {instrument_id}: {e}");
+            }
+            self.deferred_instrument_closes
+                .borrow_mut()
+                .insert(instrument_id);
+            log::warn!(
+                "Deferred contract settlement for {instrument_id} while a position operation is pending"
+            );
+            return;
+        }
+
         let settled =
             match settlement::settle_instrument_close(&mut self.cache.borrow_mut(), *close) {
                 Ok(settled) => settled,
@@ -4969,9 +5231,15 @@ impl ExecutionEngine {
             );
 
             let ts_init = self.clock.borrow().timestamp_ns();
+            let mut event_close = close;
+            if let Some(ts_closed) = position.ts_closed
+                && event_close.ts_event < ts_closed
+            {
+                event_close.ts_event = ts_closed;
+            }
             let event = PositionClosed::create_from_instrument_close(
                 &position,
-                &close,
+                &event_close,
                 last_qty,
                 UUID4::new(),
                 ts_init,
@@ -5304,15 +5572,37 @@ mod tests {
             OrderFillVoided,
             order::spec::{OrderCanceledSpec, OrderFillVoidedSpec, OrderFilledSpec},
         },
-        identifiers::{AccountId, ClientOrderId, TradeId, VenueOrderId},
+        identifiers::{
+            AccountId, ClientOrderId, InstrumentId, StrategyId, TradeId, TraderId, VenueOrderId,
+        },
         instruments::{InstrumentAny, stubs::audusd_sim},
         orders::{builder::OrderTestBuilder, stubs::TestOrderEventStubs},
         position::PositionFillVoid,
-        types::Price,
+        types::{Price, Quantity},
     };
     use rstest::*;
 
     use super::*;
+
+    #[rstest]
+    fn test_position_operation_command_routes_by_input_venue() {
+        let instrument_id = InstrumentId::from("TOKEN.POLYMARKET");
+        let command = TradingCommand::SubmitPositionOperation(SubmitPositionOperation::new(
+            TraderId::from("TRADER-001"),
+            None,
+            StrategyId::from("STRATEGY-001"),
+            UUID4::new(),
+            nautilus_model::position_operation::PositionOperationType::Convert,
+            vec![instrument_id],
+            Some(Quantity::from("1")),
+            UnixNanos::from(1),
+        ));
+
+        assert_eq!(
+            ExecutionEngine::instrument_id_for_command(&command),
+            Some(instrument_id)
+        );
+    }
 
     #[cfg(feature = "high-precision")]
     #[rstest]
@@ -5723,9 +6013,9 @@ mod tests {
             panic!("Expected one position-opened event");
         };
         assert_eq!(opened.position_id, position_id);
-        assert_eq!(opened.opening_order_id, fill.client_order_id);
+        assert_eq!(opened.opening_order_id, Some(fill.client_order_id));
         assert_eq!(opened.quantity, fill.last_qty);
-        assert_eq!(opened.last_px, fill.last_px);
+        assert_eq!(opened.last_px, Some(fill.last_px));
     }
 
     fn position_fill(

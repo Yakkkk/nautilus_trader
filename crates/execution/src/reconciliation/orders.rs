@@ -20,6 +20,7 @@
 
 use std::collections::HashSet;
 
+use indexmap::IndexMap;
 use nautilus_common::enums::LogColor;
 use nautilus_core::{UUID4, UnixNanos};
 use nautilus_model::{
@@ -38,10 +39,18 @@ use rust_decimal::Decimal;
 use ustr::Ustr;
 
 use super::{
+    INFERRED_RECONCILIATION_FILL_INFO_KEY,
     ids::create_inferred_reconciliation_trade_id,
     positions::{cap_price_at_instrument_max, is_within_single_unit_tolerance},
     reconciliation_price,
 };
+
+fn inferred_reconciliation_fill_info() -> IndexMap<Ustr, Ustr> {
+    IndexMap::from([(
+        Ustr::from(INFERRED_RECONCILIATION_FILL_INFO_KEY),
+        Ustr::from("true"),
+    )])
+}
 
 /// Generates reconciliation events for a live order status report.
 ///
@@ -1136,7 +1145,7 @@ pub(super) fn create_inferred_fill(
         true, // reconciliation
         report.venue_position_id,
         commission,
-        None,
+        Some(inferred_reconciliation_fill_info()),
     )))
 }
 
@@ -1212,7 +1221,7 @@ pub fn create_incremental_inferred_fill(
         true, // reconciliation
         report.venue_position_id,
         commission,
-        None,
+        Some(inferred_reconciliation_fill_info()),
     )))
 }
 
@@ -1343,7 +1352,7 @@ pub fn create_inferred_fill_for_qty(
         true, // reconciliation
         report.venue_position_id,
         commission,
-        None,
+        Some(inferred_reconciliation_fill_info()),
     )))
 }
 

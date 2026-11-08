@@ -20,6 +20,7 @@ use std::ffi::CString;
 use std::{
     cell::{Cell, RefCell},
     rc::Rc,
+    str::FromStr,
     sync::Arc,
 };
 
@@ -35,7 +36,8 @@ use nautilus_common::{
         execution::{
             BatchCancelOrders, BatchModifyOrders, CancelAllOrders, CancelOrder,
             GenerateOrderStatusReportBuilder, GenerateOrderStatusReportsBuilder, ModifyOrder,
-            SubmitOrder, SubmitOrderList, TradingCommand,
+            PositionOperationStatus, QueryAccount, QueryPositionOperation, SubmitOrder,
+            SubmitOrderList, SubmitPositionOperation, TradingCommand,
         },
     },
     msgbus::{
@@ -47,7 +49,7 @@ use nautilus_common::{
         replace_exec_cmd_sender, replace_time_event_sender,
     },
 };
-use nautilus_core::{DurationNanos, UUID4, UnixNanos};
+use nautilus_core::{DurationNanos, Params, UUID4, UnixNanos};
 use nautilus_data::engine::DataEngine;
 #[cfg(feature = "python")]
 use nautilus_execution::python::{
@@ -96,10 +98,12 @@ use nautilus_model::{
         stubs::{binary_option, crypto_perpetual_ethusdt, futures_contract_es},
     },
     orders::{Order, OrderAny, OrderList, OrderTestBuilder, stubs::TestOrderEventStubs},
-    position::Position,
+    position::{Position, PositionReplayEvent},
+    position_operation::{PositionOperationDirection, PositionOperationLeg, PositionOperationType},
     reports::OrderStatusReport,
     types::{Currency, Money, Price, Quantity},
 };
+use nautilus_portfolio::Portfolio;
 use nautilus_sandbox::{
     SandboxExecutionClient, SandboxExecutionClientConfig, SandboxExecutionClientFactory,
 };
@@ -403,6 +407,143 @@ fn make_binary_option_instrument(
     InstrumentAny::BinaryOption(binary)
 }
 
+fn make_neg_risk_instrument(
+    condition_id: &str,
+    token_id: &str,
+    outcome: &str,
+    market: &serde_json::Value,
+) -> InstrumentAny {
+    make_neg_risk_instrument_version(condition_id, token_id, outcome, market, "v1")
+}
+
+fn make_neg_risk_instrument_version(
+    condition_id: &str,
+    token_id: &str,
+    outcome: &str,
+    market: &serde_json::Value,
+    version: &str,
+) -> InstrumentAny {
+    let mut binary = binary_option();
+    let raw_symbol = format!("{condition_id}-{token_id}");
+    binary.raw_symbol = raw_symbol.as_str().into();
+    binary.id = InstrumentId::from(format!("{raw_symbol}.POLYMARKET").as_str());
+    binary.currency = Currency::pUSD();
+    binary.activation_ns = UnixNanos::default();
+    binary.expiration_ns = UnixNanos::from(1_000_000_000_000u64);
+    binary.outcome = Some(Ustr::from(outcome));
+    binary.info = Some(Params::new(
+        [
+            (
+                "token_id".to_string(),
+                serde_json::Value::String(token_id.to_string()),
+            ),
+            (
+                "condition_id".to_string(),
+                serde_json::Value::String(condition_id.to_string()),
+            ),
+            ("neg_risk".to_string(), serde_json::Value::Bool(true)),
+            (
+                "market_version".to_string(),
+                serde_json::Value::String(version.to_string()),
+            ),
+            ("neg_risk_market".to_string(), market.clone()),
+        ]
+        .into(),
+    ));
+    InstrumentAny::BinaryOption(binary)
+}
+
+fn operation_position(
+    instrument: &InstrumentAny,
+    trader_id: TraderId,
+    strategy_id: StrategyId,
+    account_id: AccountId,
+    quantity: &str,
+    cost: Decimal,
+) -> Position {
+    let position_id = PositionId::new(format!("{}-{strategy_id}", instrument.id()));
+    let leg = PositionOperationLeg {
+        operation_id: UUID4::new(),
+        operation: PositionOperationType::Split,
+        direction: PositionOperationDirection::Open,
+        trader_id,
+        strategy_id,
+        account_id,
+        instrument_id: instrument.id(),
+        position_id,
+        quantity: Quantity::from(quantity),
+        cost,
+        income: None,
+        settled: false,
+        event_id: UUID4::new(),
+        ts_event: UnixNanos::from(1),
+        ts_init: UnixNanos::from(2),
+    };
+    Position::new_from_operation_checked(instrument, leg).unwrap()
+}
+
+fn short_position(
+    instrument: &InstrumentAny,
+    trader_id: TraderId,
+    strategy_id: StrategyId,
+    account_id: AccountId,
+    quantity: &str,
+) -> Position {
+    let position_id = PositionId::new(format!("{}-{strategy_id}", instrument.id()));
+    let order = OrderTestBuilder::new(OrderType::Market)
+        .trader_id(trader_id)
+        .strategy_id(strategy_id)
+        .instrument_id(instrument.id())
+        .side(OrderSide::Sell)
+        .quantity(Quantity::from(quantity))
+        .build();
+    let event = TestOrderEventStubs::filled(
+        &order,
+        instrument,
+        Some(TradeId::new("SHORT-SANDBOX")),
+        Some(position_id),
+        Some(Price::from("0.50")),
+        Some(Quantity::from(quantity)),
+        Some(LiquiditySide::Taker),
+        None,
+        None,
+        Some(account_id),
+    );
+    let OrderEventAny::Filled(fill) = event else {
+        panic!("expected a filled event");
+    };
+    Position::new(instrument, fill)
+}
+
+fn query_position_operation_status(
+    engine: &Rc<RefCell<ExecutionEngine>>,
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<ExecutionEvent>,
+    trader_id: TraderId,
+    client_id: ClientId,
+    strategy_id: StrategyId,
+    operation_id: UUID4,
+) -> PositionOperationStatus {
+    engine
+        .borrow()
+        .execute(TradingCommand::QueryPositionOperation(
+            QueryPositionOperation::new(
+                trader_id,
+                Some(client_id),
+                strategy_id,
+                operation_id,
+                UnixNanos::from(1),
+            ),
+        ));
+    std::iter::from_fn(|| rx.try_recv().ok())
+        .find_map(|event| match event {
+            ExecutionEvent::PositionOperation(result) if result.operation_id == operation_id => {
+                Some(result.status)
+            }
+            _ => None,
+        })
+        .expect("expected a queried position operation result")
+}
+
 fn create_binary_option_quote(instrument_id: InstrumentId) -> QuoteTick {
     QuoteTick::new(
         instrument_id,
@@ -458,14 +599,17 @@ fn position_closed_event(position: &Position, account_id: AccountId) -> Position
         position_id: position.id,
         account_id,
         opening_order_id: position.opening_order_id,
+        opening_operation_id: position.opening_operation_id,
+        operation_id: None,
         closing_order_id: position.closing_order_id,
+        closing_operation_id: position.closing_operation_id,
         entry: position.entry,
         side: PositionSide::Flat,
         signed_qty: 0.into(),
         quantity: Quantity::zero(position.size_precision),
         peak_quantity: position.peak_qty,
-        last_qty: Quantity::zero(position.size_precision),
-        last_px: Price::zero(position.price_precision),
+        last_qty: Some(Quantity::zero(position.size_precision)),
+        last_px: Some(Price::zero(position.price_precision)),
         currency: position.quote_currency,
         avg_px_open: position.avg_px_open,
         avg_px_close: position.avg_px_close,
@@ -11903,4 +12047,3580 @@ fn create_depth(instrument_id: InstrumentId, asks: &[(&str, &str)]) -> OrderBook
         1.into(),
         1.into(),
     )
+}
+
+#[rstest]
+fn test_sandbox_rejects_v2_ctf_convert(trader_id: TraderId) {
+    let account_id = AccountId::from("POLYMARKET-002");
+    let market = serde_json::json!({
+        "market_id": "0xnegrisk",
+        "fee_bips": 0,
+        "conditions": [
+            {
+                "question_index": 0,
+                "condition_id": "0xc0",
+                "yes_token_id": "1000",
+                "no_token_id": "1001",
+            },
+            {
+                "question_index": 1,
+                "condition_id": "0xc1",
+                "yes_token_id": "1100",
+                "no_token_id": "1101",
+            },
+            {
+                "question_index": 2,
+                "condition_id": "0xc2",
+                "yes_token_id": "1200",
+                "no_token_id": "1201",
+            },
+        ],
+    });
+    let no0 = make_neg_risk_instrument_version("0xc0", "1001", "No", &market, "v2");
+    let no1 = make_neg_risk_instrument("0xc1", "1101", "No", &market);
+    let yes2 = make_neg_risk_instrument("0xc2", "1200", "Yes", &market);
+
+    let venue = no0.id().venue;
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
+    let mut config = create_config(trader_id, account_id, venue);
+    config.account_type = AccountType::Cash;
+    config.starting_balances = vec![Money::new(1_000.0, Currency::pUSD())];
+    config.base_currency = Some(Currency::pUSD());
+    let core = ExecutionClientCore::new(
+        trader_id,
+        ClientId::new("SANDBOX"),
+        config.venue,
+        config.oms_type,
+        config.account_id,
+        config.account_type,
+        config.base_currency,
+        cache.clone(),
+    );
+    let mut client =
+        SandboxExecutionClient::new(core, config, clock.clone(), cache.clone()).unwrap();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ExecutionEvent>();
+    set_exec_event_sender(tx);
+    setup_account_state_handler(cache.clone());
+
+    for instrument in [&no0, &no1, &yes2] {
+        cache
+            .borrow_mut()
+            .add_instrument(instrument.clone())
+            .unwrap();
+    }
+    for instrument in [&no0, &no1] {
+        let position = operation_position(
+            instrument,
+            trader_id,
+            StrategyId::from("STRATEGY-006"),
+            account_id,
+            "100",
+            Decimal::new(50, 0),
+        );
+        cache
+            .borrow_mut()
+            .add_position_without_order(&position, OmsType::Netting)
+            .unwrap();
+    }
+    client.start().unwrap();
+
+    let command = SubmitPositionOperation::new(
+        trader_id,
+        Some(client.client_id()),
+        StrategyId::from("STRATEGY-006"),
+        UUID4::new(),
+        PositionOperationType::Convert,
+        vec![no0.id(), no1.id()],
+        Some(Quantity::from("100")),
+        UnixNanos::from(1),
+    );
+    client.submit_position_operation(command).unwrap();
+
+    let result = std::iter::from_fn(|| rx.try_recv().ok())
+        .find_map(|event| match event {
+            ExecutionEvent::PositionOperation(result) => Some(result),
+            _ => None,
+        })
+        .expect("expected a position operation result");
+    assert_eq!(result.status, PositionOperationStatus::Rejected);
+    assert!(
+        result
+            .message
+            .as_deref()
+            .is_some_and(|message| message.contains("V2 CTF convert"))
+    );
+    assert!(cache.borrow().account(&account_id).is_none());
+}
+
+#[rstest]
+fn test_sandbox_rejects_conflicting_neg_risk_tokens_without_changes(trader_id: TraderId) {
+    let account_id = AccountId::from("POLYMARKET-009");
+    let market = serde_json::json!({
+        "market_id": "0xnegrisk",
+        "fee_bips": 100,
+        "conditions": [
+            {
+                "question_index": 0,
+                "condition_id": "0xc0",
+                "yes_token_id": "1200",
+                "no_token_id": "1001",
+            },
+            {
+                "question_index": 1,
+                "condition_id": "0xc1",
+                "yes_token_id": "1200",
+                "no_token_id": "1101",
+            },
+            {
+                "question_index": 2,
+                "condition_id": "0xc2",
+                "yes_token_id": "1300",
+                "no_token_id": "1201",
+            },
+        ],
+    });
+    let no0 = make_neg_risk_instrument("0xc0", "1001", "No", &market);
+    let no1 = make_neg_risk_instrument("0xc1", "1101", "No", &market);
+
+    let venue = no0.id().venue;
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
+    let mut config = create_config(trader_id, account_id, venue);
+    config.account_type = AccountType::Cash;
+    config.starting_balances = vec![Money::new(1_000.0, Currency::pUSD())];
+    config.base_currency = Some(Currency::pUSD());
+    let core = ExecutionClientCore::new(
+        trader_id,
+        ClientId::new("SANDBOX"),
+        config.venue,
+        config.oms_type,
+        config.account_id,
+        config.account_type,
+        config.base_currency,
+        cache.clone(),
+    );
+    let mut client = SandboxExecutionClient::new(core, config, clock, cache.clone()).unwrap();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ExecutionEvent>();
+    set_exec_event_sender(tx);
+    setup_account_state_handler(cache.clone());
+
+    for instrument in [&no0, &no1] {
+        cache
+            .borrow_mut()
+            .add_instrument(instrument.clone())
+            .unwrap();
+        let position = operation_position(
+            instrument,
+            trader_id,
+            StrategyId::from("STRATEGY-009"),
+            account_id,
+            "100",
+            Decimal::new(25, 0),
+        );
+        cache
+            .borrow_mut()
+            .add_position_without_order(&position, OmsType::Netting)
+            .unwrap();
+    }
+    client.start().unwrap();
+
+    let command = SubmitPositionOperation::new(
+        trader_id,
+        Some(client.client_id()),
+        StrategyId::from("STRATEGY-009"),
+        UUID4::new(),
+        PositionOperationType::Convert,
+        vec![no0.id(), no1.id()],
+        Some(Quantity::from("100")),
+        UnixNanos::from(1),
+    );
+    client.submit_position_operation(command).unwrap();
+
+    let result = std::iter::from_fn(|| rx.try_recv().ok())
+        .find_map(|event| match event {
+            ExecutionEvent::PositionOperation(result) => Some(result),
+            _ => None,
+        })
+        .expect("expected a position operation result");
+    assert_eq!(result.status, PositionOperationStatus::Rejected);
+    assert!(
+        result
+            .message
+            .as_deref()
+            .is_some_and(|message| message.contains("assigned to multiple outcomes"))
+    );
+    assert!(cache.borrow().account(&account_id).is_none());
+    for instrument in [&no0, &no1] {
+        let position = cache
+            .borrow()
+            .position(&PositionId::new(format!(
+                "{}-{}",
+                instrument.id(),
+                StrategyId::from("STRATEGY-009")
+            )))
+            .expect("input position must remain")
+            .cloned();
+        assert!(position.is_open());
+        assert_eq!(position.quantity, Quantity::from("100"));
+        assert_eq!(position.cost_open, Decimal::new(25, 0));
+    }
+}
+
+#[rstest]
+#[case(true)]
+#[case(false)]
+fn test_sandbox_convert_checks_active_order_scope(
+    trader_id: TraderId,
+    #[case] targeted_order: bool,
+) {
+    let account_id = AccountId::from("POLYMARKET-010");
+    let market = serde_json::json!({
+        "market_id": "0xnegrisk",
+        "fee_bips": 100,
+        "conditions": [
+            {
+                "question_index": 0,
+                "condition_id": "0xc0",
+                "yes_token_id": "1000",
+                "no_token_id": "1001",
+            },
+            {
+                "question_index": 1,
+                "condition_id": "0xc1",
+                "yes_token_id": "1100",
+                "no_token_id": "1101",
+            },
+            {
+                "question_index": 2,
+                "condition_id": "0xc2",
+                "yes_token_id": "1200",
+                "no_token_id": "1201",
+            },
+        ],
+    });
+    let no0 = make_neg_risk_instrument("0xc0", "1001", "No", &market);
+    let no1 = make_neg_risk_instrument("0xc1", "1101", "No", &market);
+    let yes2 = make_neg_risk_instrument("0xc2", "1200", "Yes", &market);
+    let unrelated = make_binary_option_instrument("0xother", "9999", "Yes", 1_000_000_000_000);
+
+    let venue = no0.id().venue;
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
+    let mut config = create_config(trader_id, account_id, venue);
+    config.account_type = AccountType::Cash;
+    config.starting_balances = vec![Money::new(1_000.0, Currency::pUSD())];
+    config.base_currency = Some(Currency::pUSD());
+    let core = ExecutionClientCore::new(
+        trader_id,
+        ClientId::new("SANDBOX"),
+        config.venue,
+        config.oms_type,
+        config.account_id,
+        config.account_type,
+        config.base_currency,
+        cache.clone(),
+    );
+    let mut client = SandboxExecutionClient::new(core, config, clock, cache.clone()).unwrap();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ExecutionEvent>();
+    set_exec_event_sender(tx);
+    setup_account_state_handler(cache.clone());
+
+    for instrument in [&no0, &no1, &yes2, &unrelated] {
+        cache
+            .borrow_mut()
+            .add_instrument(instrument.clone())
+            .unwrap();
+    }
+    for instrument in [&no0, &no1] {
+        let position = operation_position(
+            instrument,
+            trader_id,
+            StrategyId::from("STRATEGY-010"),
+            account_id,
+            "100",
+            Decimal::new(50, 0),
+        );
+        cache
+            .borrow_mut()
+            .add_position_without_order(&position, OmsType::Netting)
+            .unwrap();
+    }
+    let order_instrument = if targeted_order { &yes2 } else { &unrelated };
+    let order = OrderTestBuilder::new(OrderType::Limit)
+        .instrument_id(order_instrument.id())
+        .side(OrderSide::Buy)
+        .price(Price::from("0.4000"))
+        .quantity(Quantity::from("1.000"))
+        .client_order_id("O-ACTIVE-SCOPE".into())
+        .submit(true)
+        .build();
+    cache
+        .borrow_mut()
+        .add_order(order.clone(), None, None, false)
+        .unwrap();
+    cache
+        .borrow_mut()
+        .update_order(&TestOrderEventStubs::accepted(
+            &order,
+            account_id,
+            VenueOrderId::from("V-ACTIVE-SCOPE"),
+        ))
+        .unwrap();
+    client.start().unwrap();
+
+    let command = SubmitPositionOperation::new(
+        trader_id,
+        Some(client.client_id()),
+        StrategyId::from("STRATEGY-010"),
+        UUID4::new(),
+        PositionOperationType::Convert,
+        vec![no0.id(), no1.id()],
+        Some(Quantity::from("100")),
+        UnixNanos::from(1),
+    );
+    client.submit_position_operation(command).unwrap();
+
+    let result = std::iter::from_fn(|| rx.try_recv().ok())
+        .find_map(|event| match event {
+            ExecutionEvent::PositionOperation(result) => Some(result),
+            _ => None,
+        })
+        .expect("expected a position operation result");
+
+    if targeted_order {
+        assert_eq!(result.status, PositionOperationStatus::Rejected);
+        assert!(
+            result
+                .message
+                .as_deref()
+                .is_some_and(|message| message.contains("active orders"))
+        );
+        assert!(cache.borrow().account(&account_id).is_none());
+    } else {
+        assert_eq!(result.status, PositionOperationStatus::Confirmed);
+        client.on_position_operation_applied(result.operation_id, &[], None);
+        let account = cache
+            .borrow()
+            .account(&account_id)
+            .expect("unrelated order must not block conversion")
+            .clone();
+        assert_eq!(
+            account.balances()[&Currency::pUSD()].total.as_decimal(),
+            Decimal::from_str("1099").unwrap()
+        );
+    }
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_sandbox_frozen_account_convert_does_not_add_cash(trader_id: TraderId) {
+    *msgbus::get_message_bus().borrow_mut() = MessageBus::default();
+    let account_id = AccountId::from("POLYMARKET-008");
+    let strategy_id = StrategyId::from("STRATEGY-008");
+    let market = serde_json::json!({
+        "market_id": "0xnegrisk",
+        "fee_bips": 0,
+        "conditions": [
+            {
+                "question_index": 0,
+                "condition_id": "0xc0",
+                "yes_token_id": "1000",
+                "no_token_id": "1001",
+            },
+            {
+                "question_index": 1,
+                "condition_id": "0xc1",
+                "yes_token_id": "1100",
+                "no_token_id": "1101",
+            },
+            {
+                "question_index": 2,
+                "condition_id": "0xc2",
+                "yes_token_id": "1200",
+                "no_token_id": "1201",
+            },
+        ],
+    });
+    let no0 = make_neg_risk_instrument("0xc0", "1001", "No", &market);
+    let no1 = make_neg_risk_instrument("0xc1", "1101", "No", &market);
+    let yes2 = make_neg_risk_instrument("0xc2", "1200", "Yes", &market);
+
+    let venue = no0.id().venue;
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
+    let mut config = create_config(trader_id, account_id, venue);
+    config.account_type = AccountType::Cash;
+    config.frozen_account = true;
+    config.starting_balances = vec![Money::new(1_000.0, Currency::pUSD())];
+    config.base_currency = Some(Currency::pUSD());
+    let core = ExecutionClientCore::new(
+        trader_id,
+        ClientId::new("SANDBOX"),
+        config.venue,
+        config.oms_type,
+        config.account_id,
+        config.account_type,
+        config.base_currency,
+        cache.clone(),
+    );
+    let mut client =
+        SandboxExecutionClient::new(core, config, clock.clone(), cache.clone()).unwrap();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ExecutionEvent>();
+    set_exec_event_sender(tx);
+    setup_account_state_handler(cache.clone());
+
+    for instrument in [&no0, &no1, &yes2] {
+        cache
+            .borrow_mut()
+            .add_instrument(instrument.clone())
+            .unwrap();
+    }
+    for instrument in [&no0, &no1] {
+        let position = operation_position(
+            instrument,
+            trader_id,
+            strategy_id,
+            account_id,
+            "100",
+            Decimal::new(50, 0),
+        );
+        cache
+            .borrow_mut()
+            .add_position_without_order(&position, OmsType::Netting)
+            .unwrap();
+    }
+    cache
+        .borrow_mut()
+        .add_instrument_close(InstrumentClose::new(
+            yes2.id(),
+            Price::from("1"),
+            InstrumentCloseType::ContractExpired,
+            UnixNanos::from(5),
+            UnixNanos::from(5),
+        ))
+        .unwrap();
+
+    client.connect().await.unwrap();
+    let account_cash = cache
+        .borrow()
+        .account(&account_id)
+        .map(|account| account.balances()[&Currency::pUSD()].total.as_decimal());
+    assert_eq!(account_cash, Some(Decimal::new(1_000, 0)));
+
+    let engine = Rc::new(RefCell::new(ExecutionEngine::new(
+        clock.clone(),
+        cache.clone(),
+        None,
+    )));
+    ExecutionEngine::register_msgbus_handlers(&engine);
+    let client_id = client.client_id();
+    engine
+        .borrow_mut()
+        .register_client(Box::new(client))
+        .unwrap();
+
+    let operation_id = UUID4::new();
+    engine
+        .borrow()
+        .execute(TradingCommand::SubmitPositionOperation(
+            SubmitPositionOperation::new(
+                trader_id,
+                Some(client_id),
+                strategy_id,
+                operation_id,
+                PositionOperationType::Convert,
+                vec![no0.id(), no1.id()],
+                Some(Quantity::from("100")),
+                UnixNanos::from(1),
+            ),
+        ));
+    let result = std::iter::from_fn(|| rx.try_recv().ok())
+        .find_map(|event| match event {
+            ExecutionEvent::PositionOperation(result) if result.operation_id == operation_id => {
+                Some(result)
+            }
+            _ => None,
+        })
+        .expect("expected a position operation result");
+    assert_eq!(result.status, PositionOperationStatus::Confirmed);
+    let effects = result
+        .effects
+        .clone()
+        .expect("confirmed convert carries effects");
+    assert_eq!(
+        effects.collateral_delta, "100",
+        "the conversion must return direct collateral"
+    );
+    assert_eq!(effects.received.len(), 1);
+    assert_eq!(effects.received[0].quantity, "100");
+
+    msgbus::send_any_value(
+        MessagingSwitchboard::exec_engine_position_operation(),
+        &result,
+    );
+    let applied = std::iter::from_fn(|| rx.try_recv().ok()).any(|event| matches!(
+        event,
+        ExecutionEvent::PositionOperation(result)
+            if result.operation_id == operation_id && result.status == PositionOperationStatus::Applied
+    ));
+    assert!(
+        applied,
+        "the frozen account conversion must still complete application"
+    );
+
+    let output = cache
+        .borrow()
+        .position(&PositionId::new(format!("{}-{strategy_id}", yes2.id())))
+        .expect("settled output must be received")
+        .clone();
+    assert!(output.is_closed());
+    assert!(output.is_settled());
+
+    // Both the direct collateral return and the settled output payout must leave the
+    // frozen account balance untouched.
+    let account_cash = cache
+        .borrow()
+        .account(&account_id)
+        .map(|account| account.balances()[&Currency::pUSD()].total.as_decimal());
+    assert_eq!(account_cash, Some(Decimal::new(1_000, 0)));
+}
+
+#[rstest]
+#[case(AccountType::Margin, OmsType::Netting)]
+#[case(AccountType::Cash, OmsType::Hedging)]
+fn test_sandbox_rejects_convert_outside_cash_netting(
+    trader_id: TraderId,
+    #[case] account_type: AccountType,
+    #[case] oms_type: OmsType,
+) {
+    let account_id = AccountId::from("POLYMARKET-007");
+    let market = serde_json::json!({
+        "market_id": "0xnegrisk",
+        "fee_bips": 0,
+        "conditions": [
+            {
+                "question_index": 0,
+                "condition_id": "0xc0",
+                "yes_token_id": "1000",
+                "no_token_id": "1001",
+            },
+            {
+                "question_index": 1,
+                "condition_id": "0xc1",
+                "yes_token_id": "1100",
+                "no_token_id": "1101",
+            },
+            {
+                "question_index": 2,
+                "condition_id": "0xc2",
+                "yes_token_id": "1200",
+                "no_token_id": "1201",
+            },
+        ],
+    });
+    let no0 = make_neg_risk_instrument("0xc0", "1001", "No", &market);
+    let no1 = make_neg_risk_instrument("0xc1", "1101", "No", &market);
+    let yes2 = make_neg_risk_instrument("0xc2", "1200", "Yes", &market);
+
+    let venue = no0.id().venue;
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
+    let mut config = create_config(trader_id, account_id, venue);
+    config.account_type = account_type;
+    config.oms_type = oms_type;
+    config.starting_balances = vec![Money::new(1_000.0, Currency::pUSD())];
+    config.base_currency = Some(Currency::pUSD());
+    let core = ExecutionClientCore::new(
+        trader_id,
+        ClientId::new("SANDBOX"),
+        config.venue,
+        config.oms_type,
+        config.account_id,
+        config.account_type,
+        config.base_currency,
+        cache.clone(),
+    );
+    let mut client = SandboxExecutionClient::new(core, config, clock, cache.clone()).unwrap();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ExecutionEvent>();
+    set_exec_event_sender(tx);
+    setup_account_state_handler(cache.clone());
+
+    for instrument in [&no0, &no1, &yes2] {
+        cache
+            .borrow_mut()
+            .add_instrument(instrument.clone())
+            .unwrap();
+    }
+    for instrument in [&no0, &no1] {
+        let position = operation_position(
+            instrument,
+            trader_id,
+            StrategyId::from("STRATEGY-007"),
+            account_id,
+            "100",
+            Decimal::new(50, 0),
+        );
+        cache
+            .borrow_mut()
+            .add_position_without_order(&position, OmsType::Netting)
+            .unwrap();
+    }
+    client.start().unwrap();
+
+    let command = SubmitPositionOperation::new(
+        trader_id,
+        Some(client.client_id()),
+        StrategyId::from("STRATEGY-007"),
+        UUID4::new(),
+        PositionOperationType::Convert,
+        vec![no0.id(), no1.id()],
+        Some(Quantity::from("100")),
+        UnixNanos::from(1),
+    );
+    client.submit_position_operation(command).unwrap();
+
+    let result = std::iter::from_fn(|| rx.try_recv().ok())
+        .find_map(|event| match event {
+            ExecutionEvent::PositionOperation(result) => Some(result),
+            _ => None,
+        })
+        .expect("expected a position operation result");
+    assert_eq!(result.status, PositionOperationStatus::Rejected);
+    assert!(
+        result
+            .message
+            .as_deref()
+            .is_some_and(|message| message.contains("Cash/NETTING"))
+    );
+    assert!(cache.borrow().account(&account_id).is_none());
+    for instrument in [&no0, &no1] {
+        let position = cache
+            .borrow()
+            .position(&PositionId::new(format!(
+                "{}-{}",
+                instrument.id(),
+                StrategyId::from("STRATEGY-007")
+            )))
+            .expect("input position must remain")
+            .cloned();
+        assert!(position.is_open());
+        assert_eq!(position.quantity, Quantity::from("100"));
+    }
+}
+
+#[rstest]
+fn test_sandbox_ctf_convert_emits_effects_and_updates_cash(trader_id: TraderId) {
+    let account_id = AccountId::from("POLYMARKET-001");
+    let market = serde_json::json!({
+        "market_id": "0xnegrisk",
+        "fee_bips": 100,
+        "conditions": [
+            {
+                "question_index": 0,
+                "condition_id": "0xc0",
+                "yes_token_id": "1000",
+                "no_token_id": "1001",
+            },
+            {
+                "question_index": 1,
+                "condition_id": "0xc1",
+                "yes_token_id": "1100",
+                "no_token_id": "1101",
+            },
+            {
+                "question_index": 2,
+                "condition_id": "0xc2",
+                "yes_token_id": "1200",
+                "no_token_id": "1201",
+            },
+        ],
+    });
+    let no0 = make_neg_risk_instrument("0xc0", "1001", "No", &market);
+    let no1 = make_neg_risk_instrument("0xc1", "1101", "No", &market);
+    let yes2 = make_neg_risk_instrument("0xc2", "1200", "Yes", &market);
+
+    let venue = no0.id().venue;
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
+    let mut config = create_config(trader_id, account_id, venue);
+    config.account_type = AccountType::Cash;
+    config.starting_balances = vec![Money::new(1_000.0, Currency::pUSD())];
+    config.base_currency = Some(Currency::pUSD());
+    let core = ExecutionClientCore::new(
+        trader_id,
+        ClientId::new("SANDBOX"),
+        config.venue,
+        config.oms_type,
+        config.account_id,
+        config.account_type,
+        config.base_currency,
+        cache.clone(),
+    );
+    let mut client =
+        SandboxExecutionClient::new(core, config, clock.clone(), cache.clone()).unwrap();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ExecutionEvent>();
+
+    set_exec_event_sender(tx);
+    setup_account_state_handler(cache.clone());
+    for instrument in [&no0, &no1, &yes2] {
+        cache
+            .borrow_mut()
+            .add_instrument(instrument.clone())
+            .unwrap();
+    }
+
+    for instrument in [&no0, &no1] {
+        let position = operation_position(
+            instrument,
+            trader_id,
+            StrategyId::from("STRATEGY-001"),
+            account_id,
+            "100",
+            Decimal::new(50, 0),
+        );
+        cache
+            .borrow_mut()
+            .add_position_without_order(&position, OmsType::Netting)
+            .unwrap();
+    }
+    client.start().unwrap();
+    let client_id = client.client_id();
+
+    let engine = Rc::new(RefCell::new(ExecutionEngine::new(
+        clock.clone(),
+        cache.clone(),
+        None,
+    )));
+    ExecutionEngine::register_msgbus_handlers(&engine);
+    engine
+        .borrow_mut()
+        .register_client(Box::new(client))
+        .unwrap();
+
+    let first_operation_id = UUID4::new();
+    let command = SubmitPositionOperation::new(
+        trader_id,
+        Some(client_id),
+        StrategyId::from("STRATEGY-001"),
+        first_operation_id,
+        PositionOperationType::Convert,
+        vec![no0.id(), no1.id()],
+        Some(Quantity::from("100")),
+        UnixNanos::from(1),
+    );
+    engine
+        .borrow()
+        .execute(TradingCommand::SubmitPositionOperation(command));
+
+    let result = std::iter::from_fn(|| rx.try_recv().ok())
+        .find_map(|event| match event {
+            ExecutionEvent::PositionOperation(result) => Some(result),
+            _ => None,
+        })
+        .expect("expected a position operation result");
+
+    assert_eq!(result.status, PositionOperationStatus::Confirmed);
+    let effects = result
+        .effects
+        .clone()
+        .expect("confirmed convert carries effects");
+    assert_eq!(effects.collateral_delta, "99");
+    assert_eq!(effects.spent.len(), 2);
+    assert!(effects.spent.iter().all(|amount| amount.quantity == "100"));
+    assert_eq!(
+        effects.received,
+        vec![
+            nautilus_common::messages::execution::PositionOperationTokenAmount {
+                token_id: "1200".to_string(),
+                quantity: "99".to_string(),
+            }
+        ]
+    );
+    assert_eq!(result.instrument_ids, vec![no0.id(), no1.id(), yes2.id()]);
+    assert!(
+        cache.borrow().account(&account_id).is_none(),
+        "conversion cash must wait for core application"
+    );
+
+    // A normal sell of a reserved input must be rejected while the convert awaits application.
+    cache
+        .borrow_mut()
+        .add_quote(create_binary_option_quote(no0.id()))
+        .unwrap();
+    let reserved_sell = OrderTestBuilder::new(OrderType::Market)
+        .trader_id(trader_id)
+        .strategy_id(StrategyId::from("STRATEGY-001"))
+        .instrument_id(no0.id())
+        .client_order_id(ClientOrderId::from("O-RESERVED-SELL"))
+        .side(OrderSide::Sell)
+        .quantity(Quantity::from("100"))
+        .build();
+    cache
+        .borrow_mut()
+        .add_order(reserved_sell.clone(), None, Some(client_id), false)
+        .unwrap();
+    engine
+        .borrow()
+        .execute(TradingCommand::SubmitOrder(SubmitOrder::from_order(
+            &reserved_sell,
+            trader_id,
+            Some(client_id),
+            None,
+            UUID4::new(),
+            UnixNanos::from(1),
+        )));
+    let rejected_sell = std::iter::from_fn(|| rx.try_recv().ok())
+        .find_map(|event| match event {
+            ExecutionEvent::Order(OrderEventAny::Rejected(rejected))
+                if rejected.client_order_id == reserved_sell.client_order_id() =>
+            {
+                Some(rejected)
+            }
+            _ => None,
+        })
+        .expect("a sell of reserved convert inventory must be rejected");
+    assert!(rejected_sell.reason.contains("Short selling not permitted"));
+
+    // A second operation using the same inputs is rejected while the first operation's confirmed
+    // inventory reservation is still awaiting core application.
+    let second_operation_id = UUID4::new();
+    let conflicting = SubmitPositionOperation::new(
+        trader_id,
+        Some(client_id),
+        StrategyId::from("STRATEGY-001"),
+        second_operation_id,
+        PositionOperationType::Convert,
+        vec![no0.id(), no1.id()],
+        Some(Quantity::from("100")),
+        UnixNanos::from(1),
+    );
+    engine
+        .borrow()
+        .execute(TradingCommand::SubmitPositionOperation(conflicting));
+    let second = std::iter::from_fn(|| rx.try_recv().ok())
+        .find_map(|event| match event {
+            ExecutionEvent::PositionOperation(result) => Some(result),
+            _ => None,
+        })
+        .expect("expected the second operation result");
+    assert_eq!(second.operation_id, second_operation_id);
+    assert_eq!(second.status, PositionOperationStatus::Rejected);
+    assert!(second.effects.is_none());
+    assert!(
+        second
+            .message
+            .as_deref()
+            .unwrap()
+            .contains("after pending operations"),
+        "{:?}",
+        second.message
+    );
+    assert!(
+        cache.borrow().account(&account_id).is_none(),
+        "a rejected operation must not add cash"
+    );
+
+    // The first operation still queries as Confirmed until the core applies it.
+    assert_eq!(
+        query_position_operation_status(
+            &engine,
+            &mut rx,
+            trader_id,
+            client_id,
+            StrategyId::from("STRATEGY-001"),
+            first_operation_id,
+        ),
+        PositionOperationStatus::Confirmed,
+    );
+
+    msgbus::send_any_value(
+        MessagingSwitchboard::exec_engine_position_operation(),
+        &result,
+    );
+
+    let applied = std::iter::from_fn(|| rx.try_recv().ok())
+        .find_map(|event| match event {
+            ExecutionEvent::PositionOperation(result)
+                if result.operation_id == first_operation_id
+                    && result.status == PositionOperationStatus::Applied =>
+            {
+                Some(result)
+            }
+            _ => None,
+        })
+        .expect("the strategy must receive Applied without polling");
+    assert!(applied.effects.is_none());
+
+    let no0_position = cache
+        .borrow()
+        .position(&PositionId::new(format!(
+            "{}-{}",
+            no0.id(),
+            StrategyId::from("STRATEGY-001")
+        )))
+        .expect("NO input position must exist")
+        .cloned();
+    let no1_position = cache
+        .borrow()
+        .position(&PositionId::new(format!(
+            "{}-{}",
+            no1.id(),
+            StrategyId::from("STRATEGY-001")
+        )))
+        .expect("NO input position must exist")
+        .cloned();
+    let yes_position = cache
+        .borrow()
+        .position(&PositionId::new(format!(
+            "{}-{}",
+            yes2.id(),
+            StrategyId::from("STRATEGY-001")
+        )))
+        .expect("YES output position must exist")
+        .cloned();
+    assert!(no0_position.is_closed());
+    assert!(no1_position.is_closed());
+    assert_eq!(yes_position.quantity, Quantity::from("99"));
+    assert_eq!(yes_position.cost_open, Decimal::ONE);
+
+    let account = cache
+        .borrow()
+        .account(&account_id)
+        .expect("expected a simulated account state")
+        .clone();
+    assert_eq!(
+        account.balances()[&Currency::pUSD()].total.as_decimal(),
+        Decimal::from_str("1099").unwrap()
+    );
+    assert_eq!(
+        query_position_operation_status(
+            &engine,
+            &mut rx,
+            trader_id,
+            client_id,
+            StrategyId::from("STRATEGY-001"),
+            first_operation_id,
+        ),
+        PositionOperationStatus::Applied,
+    );
+
+    // Inject an anomalous Confirmed result for exhausted inputs. The core must not apply it and
+    // its effects must never reach the simulated balance.
+    let injected_id = UUID4::new();
+    let injected = nautilus_common::messages::execution::PositionOperationResult::new(
+        trader_id,
+        StrategyId::from("STRATEGY-001"),
+        client_id,
+        account_id,
+        injected_id,
+        PositionOperationType::Convert,
+        PositionOperationStatus::Confirmed,
+        vec![no0.id(), no1.id(), yes2.id()],
+        None,
+        None,
+        None,
+        Some(
+            nautilus_common::messages::execution::PositionOperationEffects {
+                received: vec![
+                    nautilus_common::messages::execution::PositionOperationTokenAmount {
+                        token_id: "1200".to_string(),
+                        quantity: "99".to_string(),
+                    },
+                ],
+                spent: vec![
+                    nautilus_common::messages::execution::PositionOperationTokenAmount {
+                        token_id: "1001".to_string(),
+                        quantity: "100".to_string(),
+                    },
+                    nautilus_common::messages::execution::PositionOperationTokenAmount {
+                        token_id: "1101".to_string(),
+                        quantity: "100".to_string(),
+                    },
+                ],
+                collateral_delta: "99".to_string(),
+                payouts: Vec::new(),
+            },
+        ),
+        UUID4::new(),
+        UnixNanos::from(2),
+        UnixNanos::from(2),
+    );
+    msgbus::send_any_value(
+        MessagingSwitchboard::exec_engine_position_operation(),
+        &injected,
+    );
+
+    assert!(
+        std::iter::from_fn(|| rx.try_recv().ok()).all(|event| !matches!(
+            event,
+            ExecutionEvent::PositionOperation(result)
+                if result.operation_id == injected_id
+                    && result.status == PositionOperationStatus::Applied
+        )),
+        "an anomalous Confirmed result must never report Applied"
+    );
+    let account = cache
+        .borrow()
+        .account(&account_id)
+        .expect("expected a simulated account state")
+        .clone();
+    assert_eq!(
+        account.balances()[&Currency::pUSD()].total.as_decimal(),
+        Decimal::from_str("1099").unwrap()
+    );
+    let yes_after = cache
+        .borrow()
+        .position(&PositionId::new(format!(
+            "{}-{}",
+            yes2.id(),
+            StrategyId::from("STRATEGY-001")
+        )))
+        .expect("YES output position must exist")
+        .cloned();
+    assert_eq!(yes_after.quantity, Quantity::from("99"));
+}
+
+#[rstest]
+fn test_sandbox_convert_rejects_pending_clob_sell_fill(trader_id: TraderId) {
+    let account_id = AccountId::from("POLYMARKET-002");
+    let market = serde_json::json!({
+        "market_id": "0xnegrisk",
+        "fee_bips": 100,
+        "conditions": [
+            {
+                "question_index": 0,
+                "condition_id": "0xc0",
+                "yes_token_id": "1000",
+                "no_token_id": "1001",
+            },
+            {
+                "question_index": 1,
+                "condition_id": "0xc1",
+                "yes_token_id": "1100",
+                "no_token_id": "1101",
+            },
+            {
+                "question_index": 2,
+                "condition_id": "0xc2",
+                "yes_token_id": "1200",
+                "no_token_id": "1201",
+            },
+        ],
+    });
+    let no0 = make_neg_risk_instrument("0xc0", "1001", "No", &market);
+    let no1 = make_neg_risk_instrument("0xc1", "1101", "No", &market);
+    let yes2 = make_neg_risk_instrument("0xc2", "1200", "Yes", &market);
+
+    let venue = no0.id().venue;
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
+    let mut config = create_config(trader_id, account_id, venue);
+    config.account_type = AccountType::Cash;
+    config.starting_balances = vec![Money::new(1_000.0, Currency::pUSD())];
+    config.base_currency = Some(Currency::pUSD());
+    let core = ExecutionClientCore::new(
+        trader_id,
+        ClientId::new("SANDBOX"),
+        config.venue,
+        config.oms_type,
+        config.account_id,
+        config.account_type,
+        config.base_currency,
+        cache.clone(),
+    );
+    let mut client =
+        SandboxExecutionClient::new(core, config, clock.clone(), cache.clone()).unwrap();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ExecutionEvent>();
+
+    set_exec_event_sender(tx);
+    setup_account_state_handler(cache.clone());
+    for instrument in [&no0, &no1, &yes2] {
+        cache
+            .borrow_mut()
+            .add_instrument(instrument.clone())
+            .unwrap();
+    }
+
+    for instrument in [&no0, &no1] {
+        let position = operation_position(
+            instrument,
+            trader_id,
+            StrategyId::from("STRATEGY-001"),
+            account_id,
+            "100",
+            Decimal::new(50, 0),
+        );
+        cache
+            .borrow_mut()
+            .add_position_without_order(&position, OmsType::Netting)
+            .unwrap();
+    }
+    client.start().unwrap();
+    let client_id = client.client_id();
+    client
+        .process_quote_tick(&create_binary_option_quote(no0.id()))
+        .unwrap();
+
+    let engine = Rc::new(RefCell::new(ExecutionEngine::new(
+        clock.clone(),
+        cache.clone(),
+        None,
+    )));
+    ExecutionEngine::register_msgbus_handlers(&engine);
+    engine
+        .borrow_mut()
+        .register_client(Box::new(client))
+        .unwrap();
+
+    let sell = OrderTestBuilder::new(OrderType::Market)
+        .trader_id(trader_id)
+        .strategy_id(StrategyId::from("STRATEGY-001"))
+        .instrument_id(no0.id())
+        .client_order_id(ClientOrderId::from("O-PENDING-SELL"))
+        .side(OrderSide::Sell)
+        .quantity(Quantity::from("100"))
+        .build();
+    cache
+        .borrow_mut()
+        .add_order(sell.clone(), None, Some(client_id), false)
+        .unwrap();
+    engine
+        .borrow()
+        .execute(TradingCommand::SubmitOrder(SubmitOrder::from_order(
+            &sell,
+            trader_id,
+            Some(client_id),
+            None,
+            UUID4::new(),
+            UnixNanos::from(1),
+        )));
+
+    let filled = std::iter::from_fn(|| rx.try_recv().ok())
+        .find_map(|event| match event {
+            ExecutionEvent::Order(OrderEventAny::Filled(fill))
+                if fill.client_order_id == sell.client_order_id() =>
+            {
+                Some(fill)
+            }
+            _ => None,
+        })
+        .expect("the sell must fill before core application");
+    assert_eq!(filled.last_qty.as_decimal(), Decimal::new(100, 0));
+
+    let no0_position_id =
+        PositionId::new(format!("{}-{}", no0.id(), StrategyId::from("STRATEGY-001")));
+    assert_eq!(
+        cache.borrow().position(&no0_position_id).unwrap().quantity,
+        Quantity::from("100"),
+        "the sell fill must remain pending core application"
+    );
+
+    let operation_id = UUID4::new();
+    let convert = SubmitPositionOperation::new(
+        trader_id,
+        Some(client_id),
+        StrategyId::from("STRATEGY-001"),
+        operation_id,
+        PositionOperationType::Convert,
+        vec![no0.id(), no1.id()],
+        Some(Quantity::from("100")),
+        UnixNanos::from(1),
+    );
+    engine
+        .borrow()
+        .execute(TradingCommand::SubmitPositionOperation(convert));
+
+    let result = std::iter::from_fn(|| rx.try_recv().ok())
+        .find_map(|event| match event {
+            ExecutionEvent::PositionOperation(result) => Some(result),
+            _ => None,
+        })
+        .expect("expected a position operation result");
+    assert_eq!(result.status, PositionOperationStatus::Rejected);
+    assert!(result.effects.is_none());
+    assert!(
+        result
+            .message
+            .as_deref()
+            .unwrap()
+            .contains("after pending operations and fills"),
+        "{:?}",
+        result.message
+    );
+    assert!(
+        cache.borrow().account(&account_id).is_none(),
+        "a rejected convert must not add cash"
+    );
+}
+
+#[rstest]
+fn test_sandbox_convert_applies_before_input_settlement(trader_id: TraderId) {
+    let account_id = AccountId::from("POLYMARKET-003");
+    let market = serde_json::json!({
+        "market_id": "0xnegrisk",
+        "fee_bips": 100,
+        "conditions": [
+            {
+                "question_index": 0,
+                "condition_id": "0xc0",
+                "yes_token_id": "1000",
+                "no_token_id": "1001",
+            },
+            {
+                "question_index": 1,
+                "condition_id": "0xc1",
+                "yes_token_id": "1100",
+                "no_token_id": "1101",
+            },
+            {
+                "question_index": 2,
+                "condition_id": "0xc2",
+                "yes_token_id": "1200",
+                "no_token_id": "1201",
+            },
+        ],
+    });
+    let no0 = make_neg_risk_instrument("0xc0", "1001", "No", &market);
+    let no1 = make_neg_risk_instrument("0xc1", "1101", "No", &market);
+    let yes2 = make_neg_risk_instrument("0xc2", "1200", "Yes", &market);
+    let no2 = make_neg_risk_instrument("0xc2", "1201", "No", &market);
+
+    let venue = no0.id().venue;
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    let test_clock = Rc::new(RefCell::new(VirtualClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = test_clock.clone();
+    let mut config = create_config(trader_id, account_id, venue);
+    config.account_type = AccountType::Cash;
+    config.starting_balances = vec![Money::new(1_000.0, Currency::pUSD())];
+    config.base_currency = Some(Currency::pUSD());
+    let core = ExecutionClientCore::new(
+        trader_id,
+        ClientId::new("SANDBOX"),
+        config.venue,
+        config.oms_type,
+        config.account_id,
+        config.account_type,
+        config.base_currency,
+        cache.clone(),
+    );
+    let mut client =
+        SandboxExecutionClient::new(core, config, clock.clone(), cache.clone()).unwrap();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ExecutionEvent>();
+
+    set_exec_event_sender(tx);
+    setup_account_state_handler(cache.clone());
+    for instrument in [&no0, &no1, &yes2, &no2] {
+        cache
+            .borrow_mut()
+            .add_instrument(instrument.clone())
+            .unwrap();
+    }
+
+    for instrument in [&no0, &no1, &no2] {
+        let position = operation_position(
+            instrument,
+            trader_id,
+            StrategyId::from("STRATEGY-001"),
+            account_id,
+            "100",
+            Decimal::new(50, 0),
+        );
+        cache
+            .borrow_mut()
+            .add_position_without_order(&position, OmsType::Netting)
+            .unwrap();
+    }
+    client.start().unwrap();
+    let client_id = client.client_id();
+    client
+        .process_quote_tick(&create_binary_option_quote(no2.id()))
+        .unwrap();
+
+    let engine = Rc::new(RefCell::new(ExecutionEngine::new(
+        clock.clone(),
+        cache.clone(),
+        None,
+    )));
+    ExecutionEngine::register_msgbus_handlers(&engine);
+    ExecutionEngine::subscribe_venue_instrument_closes(&engine, venue);
+    engine
+        .borrow_mut()
+        .register_client(Box::new(client))
+        .unwrap();
+
+    // Normal CLOB control: a fill pending application does not stop the input settlement, and
+    // the settlement leaves no position behind for the late fill.
+    let control_sell = OrderTestBuilder::new(OrderType::Market)
+        .trader_id(trader_id)
+        .strategy_id(StrategyId::from("STRATEGY-001"))
+        .instrument_id(no2.id())
+        .client_order_id(ClientOrderId::from("O-CONTROL-SELL"))
+        .side(OrderSide::Sell)
+        .quantity(Quantity::from("100"))
+        .build();
+    cache
+        .borrow_mut()
+        .add_order(control_sell.clone(), None, Some(client_id), false)
+        .unwrap();
+    engine
+        .borrow()
+        .execute(TradingCommand::SubmitOrder(SubmitOrder::from_order(
+            &control_sell,
+            trader_id,
+            Some(client_id),
+            None,
+            UUID4::new(),
+            UnixNanos::from(1),
+        )));
+    let control_fill = std::iter::from_fn(|| rx.try_recv().ok())
+        .find_map(|event| match event {
+            ExecutionEvent::Order(OrderEventAny::Filled(fill))
+                if fill.client_order_id == control_sell.client_order_id() =>
+            {
+                Some(fill)
+            }
+            _ => None,
+        })
+        .expect("the control sell must fill");
+    publish_expired_close(&test_clock, &no2, Price::from("1"), 1_000_000_000);
+
+    let no2_position_id =
+        PositionId::new(format!("{}-{}", no2.id(), StrategyId::from("STRATEGY-001")));
+    assert!(
+        cache
+            .borrow()
+            .position(&no2_position_id)
+            .unwrap()
+            .is_closed(),
+        "the normal CLOB input must settle before its fill is applied"
+    );
+    engine
+        .borrow_mut()
+        .process(&OrderEventAny::Filled(control_fill));
+    assert_eq!(
+        cache.borrow().position(&no2_position_id).unwrap().quantity,
+        Quantity::zero(6),
+        "the late fill must not reopen the settled normal CLOB position"
+    );
+
+    // A confirmed convert holds its input settlement until its effects are applied.
+    let operation_id = UUID4::new();
+    let convert = SubmitPositionOperation::new(
+        trader_id,
+        Some(client_id),
+        StrategyId::from("STRATEGY-001"),
+        operation_id,
+        PositionOperationType::Convert,
+        vec![no0.id(), no1.id()],
+        Some(Quantity::from("100")),
+        UnixNanos::from(1),
+    );
+    engine
+        .borrow()
+        .execute(TradingCommand::SubmitPositionOperation(convert));
+    let result = std::iter::from_fn(|| rx.try_recv().ok())
+        .find_map(|event| match event {
+            ExecutionEvent::PositionOperation(result) => Some(result),
+            _ => None,
+        })
+        .expect("expected a position operation result");
+    assert_eq!(result.status, PositionOperationStatus::Confirmed);
+
+    publish_expired_close(&test_clock, &no0, Price::from("1"), 2_000_000_000);
+
+    let no0_position_id =
+        PositionId::new(format!("{}-{}", no0.id(), StrategyId::from("STRATEGY-001")));
+    assert_eq!(
+        cache.borrow().position(&no0_position_id).unwrap().quantity,
+        Quantity::from("100"),
+        "a confirmed convert must keep its input open until application"
+    );
+    let close_events: Vec<ExecutionEvent> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+    assert!(
+        close_events.iter().all(|event| !matches!(
+            event,
+            ExecutionEvent::Order(OrderEventAny::Filled(fill))
+                if fill.instrument_id == no0.id()
+                    && fill.client_order_id.as_str().starts_with("EXPIRATION-")
+        )),
+        "a reserved convert input must not settle through an expiration fill"
+    );
+
+    msgbus::send_any_value(
+        MessagingSwitchboard::exec_engine_position_operation(),
+        &result,
+    );
+
+    let applied = std::iter::from_fn(|| rx.try_recv().ok())
+        .find_map(|event| match event {
+            ExecutionEvent::PositionOperation(result)
+                if result.operation_id == operation_id
+                    && result.status == PositionOperationStatus::Applied =>
+            {
+                Some(result)
+            }
+            _ => None,
+        })
+        .expect("the convert must apply before its input settlement");
+    assert!(applied.effects.is_none());
+
+    let no0_position = cache
+        .borrow()
+        .position(&no0_position_id)
+        .expect("NO0 position must exist")
+        .cloned();
+    assert!(no0_position.is_closed());
+    assert_eq!(
+        no0_position.closing_operation_id,
+        Some(operation_id),
+        "the convert must close its input before the deferred settlement"
+    );
+    let yes_position = cache
+        .borrow()
+        .position(&PositionId::new(format!(
+            "{}-{}",
+            yes2.id(),
+            StrategyId::from("STRATEGY-001")
+        )))
+        .expect("YES output position must exist")
+        .cloned();
+    assert_eq!(yes_position.quantity, Quantity::from("99"));
+    assert_eq!(
+        cache
+            .borrow()
+            .account(&account_id)
+            .expect("expected a simulated account state")
+            .balances()[&Currency::pUSD()]
+            .total
+            .as_decimal(),
+        Decimal::from_str("1099").unwrap()
+    );
+    assert!(
+        cache.borrow().instrument_close(&no0.id()).is_some(),
+        "the deferred input close must be retained and applied after the convert"
+    );
+}
+
+#[rstest]
+fn test_sandbox_partial_convert_settles_remainder_through_venue(trader_id: TraderId) {
+    let account_id = AccountId::from("POLYMARKET-004");
+    let market = serde_json::json!({
+        "market_id": "0xnegrisk",
+        "fee_bips": 100,
+        "conditions": [
+            {
+                "question_index": 0,
+                "condition_id": "0xc0",
+                "yes_token_id": "1000",
+                "no_token_id": "1001",
+            },
+            {
+                "question_index": 1,
+                "condition_id": "0xc1",
+                "yes_token_id": "1100",
+                "no_token_id": "1101",
+            },
+            {
+                "question_index": 2,
+                "condition_id": "0xc2",
+                "yes_token_id": "1200",
+                "no_token_id": "1201",
+            },
+        ],
+    });
+    let no0 = make_neg_risk_instrument("0xc0", "1001", "No", &market);
+    let no1 = make_neg_risk_instrument("0xc1", "1101", "No", &market);
+    let yes2 = make_neg_risk_instrument("0xc2", "1200", "Yes", &market);
+    let no2 = make_neg_risk_instrument("0xc2", "1201", "No", &market);
+
+    let venue = no0.id().venue;
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    let test_clock = Rc::new(RefCell::new(VirtualClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = test_clock.clone();
+    let mut config = create_config(trader_id, account_id, venue);
+    config.account_type = AccountType::Cash;
+    config.starting_balances = vec![Money::new(1_000.0, Currency::pUSD())];
+    config.base_currency = Some(Currency::pUSD());
+    let core = ExecutionClientCore::new(
+        trader_id,
+        ClientId::new("SANDBOX"),
+        config.venue,
+        config.oms_type,
+        config.account_id,
+        config.account_type,
+        config.base_currency,
+        cache.clone(),
+    );
+    let mut client =
+        SandboxExecutionClient::new(core, config, clock.clone(), cache.clone()).unwrap();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ExecutionEvent>();
+
+    let _portfolio = Rc::new(RefCell::new(Portfolio::new(
+        clock.clone(),
+        cache.clone(),
+        None,
+    )));
+    set_exec_event_sender(tx);
+    setup_account_state_handler(cache.clone());
+    for instrument in [&no0, &no1, &yes2, &no2] {
+        cache
+            .borrow_mut()
+            .add_instrument(instrument.clone())
+            .unwrap();
+    }
+    for (instrument, quantity) in [(&no0, "200"), (&no1, "200"), (&no2, "100")] {
+        let position = operation_position(
+            instrument,
+            trader_id,
+            StrategyId::from("STRATEGY-001"),
+            account_id,
+            quantity,
+            Decimal::new(100, 0),
+        );
+        cache
+            .borrow_mut()
+            .add_position_without_order(&position, OmsType::Netting)
+            .unwrap();
+    }
+    client.start().unwrap();
+    let client_id = client.client_id();
+    client
+        .query_account(QueryAccount::new(
+            trader_id,
+            Some(client_id),
+            account_id,
+            UUID4::new(),
+            UnixNanos::from(1),
+            None,
+            None,
+        ))
+        .unwrap();
+    assert!(
+        cache.borrow().account(&account_id).is_some(),
+        "the sandbox account state must be available for fill accounting"
+    );
+    for instrument in [&no0, &no2] {
+        client
+            .process_quote_tick(&create_binary_option_quote(instrument.id()))
+            .unwrap();
+    }
+
+    let engine = Rc::new(RefCell::new(ExecutionEngine::new(
+        clock.clone(),
+        cache.clone(),
+        None,
+    )));
+    ExecutionEngine::register_msgbus_handlers(&engine);
+    engine
+        .borrow_mut()
+        .register_client(Box::new(client))
+        .unwrap();
+
+    // Normal CLOB control under the same configuration: a pending sell fill defers the
+    // expiration until the fill is applied, then the position is gone.
+    let control_sell = OrderTestBuilder::new(OrderType::Market)
+        .trader_id(trader_id)
+        .strategy_id(StrategyId::from("STRATEGY-001"))
+        .instrument_id(no2.id())
+        .client_order_id(ClientOrderId::from("O-CONTROL-SELL"))
+        .side(OrderSide::Sell)
+        .quantity(Quantity::from("100"))
+        .build();
+    cache
+        .borrow_mut()
+        .add_order(control_sell.clone(), None, Some(client_id), false)
+        .unwrap();
+    engine
+        .borrow()
+        .execute(TradingCommand::SubmitOrder(SubmitOrder::from_order(
+            &control_sell,
+            trader_id,
+            Some(client_id),
+            None,
+            UUID4::new(),
+            UnixNanos::from(1),
+        )));
+    let control_events: Vec<OrderEventAny> = std::iter::from_fn(|| rx.try_recv().ok())
+        .filter_map(|event| match event {
+            ExecutionEvent::Order(event)
+                if event.client_order_id() == control_sell.client_order_id() =>
+            {
+                Some(event)
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(
+        control_events
+            .iter()
+            .any(|event| matches!(event, OrderEventAny::Filled(_))),
+        "the control sell must fill before its settlement"
+    );
+    publish_expired_close(&test_clock, &no2, Price::from("1"), 1_000_000_000);
+    for event in control_events {
+        engine.borrow_mut().process(&event);
+    }
+    assert_eq!(
+        cache
+            .borrow()
+            .order(&control_sell.client_order_id())
+            .unwrap()
+            .status(),
+        OrderStatus::Filled,
+        "the control order must apply its fill"
+    );
+    let control_order = cache
+        .borrow()
+        .order(&control_sell.client_order_id())
+        .unwrap()
+        .clone();
+    assert_eq!(
+        control_order.position_id(),
+        Some(PositionId::new(format!(
+            "{}-{}",
+            no2.id(),
+            StrategyId::from("STRATEGY-001")
+        ))),
+        "the control fill must route to the netting position"
+    );
+
+    let no2_position_id =
+        PositionId::new(format!("{}-{}", no2.id(), StrategyId::from("STRATEGY-001")));
+    let no2_position = cache.borrow().position(&no2_position_id).unwrap().cloned();
+    assert!(
+        no2_position.is_closed(),
+        "the normal CLOB position must close before the close is settled: {no2_position:?}"
+    );
+
+    // A partial convert leaves half of each input open for the venue's own expiration path.
+    let operation_id = UUID4::new();
+    let convert = SubmitPositionOperation::new(
+        trader_id,
+        Some(client_id),
+        StrategyId::from("STRATEGY-001"),
+        operation_id,
+        PositionOperationType::Convert,
+        vec![no0.id(), no1.id()],
+        Some(Quantity::from("100")),
+        UnixNanos::from(1),
+    );
+    engine
+        .borrow()
+        .execute(TradingCommand::SubmitPositionOperation(convert));
+    let result = std::iter::from_fn(|| rx.try_recv().ok())
+        .find_map(|event| match event {
+            ExecutionEvent::PositionOperation(result) => Some(result),
+            _ => None,
+        })
+        .expect("expected a position operation result");
+    assert_eq!(result.status, PositionOperationStatus::Confirmed);
+
+    publish_expired_close(&test_clock, &no0, Price::from("1"), 2_000_000_000);
+
+    msgbus::send_any_value(
+        MessagingSwitchboard::exec_engine_position_operation(),
+        &result,
+    );
+
+    let mut applied = false;
+    let mut expiration_events = Vec::new();
+    for event in std::iter::from_fn(|| rx.try_recv().ok()) {
+        match event {
+            ExecutionEvent::PositionOperation(result)
+                if result.operation_id == operation_id
+                    && result.status == PositionOperationStatus::Applied =>
+            {
+                applied = true;
+            }
+            ExecutionEvent::Order(event)
+                if event.client_order_id().as_str().starts_with("EXPIRATION-") =>
+            {
+                expiration_events.push(event);
+            }
+            _ => {}
+        }
+    }
+    assert!(applied, "the partial convert must apply");
+    let expiration_fills: Vec<OrderFilled> = expiration_events
+        .iter()
+        .filter_map(|event| match event {
+            OrderEventAny::Filled(fill) => Some(fill.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        expiration_fills.len(),
+        1,
+        "only the closed input's remainder settles through the venue"
+    );
+    assert_eq!(
+        expiration_fills[0].last_px,
+        Price::from("1"),
+        "the deferred settlement must use the authoritative close price"
+    );
+    assert_eq!(
+        expiration_fills[0].last_qty.as_decimal(),
+        Decimal::new(100, 0)
+    );
+    for event in expiration_events {
+        engine.borrow_mut().process(&event);
+    }
+
+    let no0_position_id =
+        PositionId::new(format!("{}-{}", no0.id(), StrategyId::from("STRATEGY-001")));
+    let no0_position = cache
+        .borrow()
+        .position(&no0_position_id)
+        .expect("NO0 position must exist")
+        .cloned();
+    assert!(no0_position.is_closed());
+    assert_eq!(no0_position.quantity, Quantity::zero(2));
+
+    let no1_position_id =
+        PositionId::new(format!("{}-{}", no1.id(), StrategyId::from("STRATEGY-001")));
+    let no1_position = cache
+        .borrow()
+        .position(&no1_position_id)
+        .expect("NO1 position must exist")
+        .cloned();
+    assert!(no1_position.is_open());
+    assert_eq!(no1_position.quantity, Quantity::from("100"));
+
+    let yes_position = cache
+        .borrow()
+        .position(&PositionId::new(format!(
+            "{}-{}",
+            yes2.id(),
+            StrategyId::from("STRATEGY-001")
+        )))
+        .expect("YES output position must exist")
+        .cloned();
+    assert_eq!(yes_position.quantity, Quantity::from("99"));
+
+    let account = cache
+        .borrow()
+        .account(&account_id)
+        .expect("expected a simulated account state")
+        .clone();
+    assert_eq!(
+        account.balances()[&Currency::pUSD()].total.as_decimal(),
+        Decimal::from_str("1239").unwrap(),
+        "cash must include the direct return, the remainder payout, and the control fill"
+    );
+}
+
+#[rstest]
+#[case("0", Decimal::new(-50, 0), Some(Decimal::new(1_000, 0)))]
+#[case("1", Decimal::new(49, 0), Some(Decimal::new(1_099, 0)))]
+fn test_sandbox_ctf_convert_settles_output_payout_cash(
+    trader_id: TraderId,
+    #[case] close_price: &str,
+    #[case] expected_pnl: Decimal,
+    #[case] expected_cash: Option<Decimal>,
+) {
+    let account_id = AccountId::from("POLYMARKET-011");
+    let market = serde_json::json!({
+        "market_id": "0xnegrisk",
+        "fee_bips": 100,
+        "conditions": [
+            {
+                "question_index": 0,
+                "condition_id": "0xc0",
+                "yes_token_id": "1000",
+                "no_token_id": "1001",
+            },
+            {
+                "question_index": 1,
+                "condition_id": "0xc1",
+                "yes_token_id": "1100",
+                "no_token_id": "1101",
+            },
+        ],
+    });
+    let no0 = make_neg_risk_instrument("0xc0", "1001", "No", &market);
+    let yes1 = make_neg_risk_instrument("0xc1", "1100", "Yes", &market);
+
+    let venue = no0.id().venue;
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
+    let mut config = create_config(trader_id, account_id, venue);
+    config.account_type = AccountType::Cash;
+    config.starting_balances = vec![Money::new(1_000.0, Currency::pUSD())];
+    config.base_currency = Some(Currency::pUSD());
+    let core = ExecutionClientCore::new(
+        trader_id,
+        ClientId::new("SANDBOX"),
+        config.venue,
+        config.oms_type,
+        config.account_id,
+        config.account_type,
+        config.base_currency,
+        cache.clone(),
+    );
+    let mut client =
+        SandboxExecutionClient::new(core, config, clock.clone(), cache.clone()).unwrap();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ExecutionEvent>();
+
+    let portfolio = Rc::new(RefCell::new(Portfolio::new(
+        clock.clone(),
+        cache.clone(),
+        None,
+    )));
+    set_exec_event_sender(tx);
+    setup_account_state_handler(cache.clone());
+    for instrument in [&no0, &yes1] {
+        cache
+            .borrow_mut()
+            .add_instrument(instrument.clone())
+            .unwrap();
+    }
+    let position = operation_position(
+        &no0,
+        trader_id,
+        StrategyId::from("STRATEGY-001"),
+        account_id,
+        "100",
+        Decimal::new(50, 0),
+    );
+    cache
+        .borrow_mut()
+        .add_position_without_order(&position, OmsType::Netting)
+        .unwrap();
+    let close = InstrumentClose::new(
+        yes1.id(),
+        Price::from(close_price),
+        InstrumentCloseType::ContractExpired,
+        UnixNanos::from(5),
+        UnixNanos::from(5),
+    );
+    cache.borrow_mut().add_instrument_close(close).unwrap();
+    client.start().unwrap();
+    client
+        .process_quote_tick(&create_binary_option_quote(yes1.id()))
+        .unwrap();
+    let data_engine = Rc::new(RefCell::new(DataEngine::new(
+        clock.clone(),
+        cache.clone(),
+        None,
+    )));
+    DataEngine::register_msgbus_handlers(&data_engine);
+
+    let engine = Rc::new(RefCell::new(ExecutionEngine::new(
+        clock.clone(),
+        cache.clone(),
+        None,
+    )));
+    ExecutionEngine::register_msgbus_handlers(&engine);
+    let client_id = client.client_id();
+    engine
+        .borrow_mut()
+        .register_client(Box::new(client))
+        .unwrap();
+
+    let operation_id = UUID4::new();
+    let command = SubmitPositionOperation::new(
+        trader_id,
+        Some(client_id),
+        StrategyId::from("STRATEGY-001"),
+        operation_id,
+        PositionOperationType::Convert,
+        vec![no0.id()],
+        Some(Quantity::from("100")),
+        UnixNanos::from(1),
+    );
+    engine
+        .borrow()
+        .execute(TradingCommand::SubmitPositionOperation(command));
+
+    let result = std::iter::from_fn(|| rx.try_recv().ok())
+        .find_map(|event| match event {
+            ExecutionEvent::PositionOperation(result) => Some(result),
+            _ => None,
+        })
+        .expect("expected a position operation result");
+    assert_eq!(result.status, PositionOperationStatus::Confirmed);
+    assert_eq!(result.effects.as_ref().unwrap().collateral_delta, "0");
+    assert_eq!(
+        result.effects.as_ref().unwrap().received,
+        vec![
+            nautilus_common::messages::execution::PositionOperationTokenAmount {
+                token_id: "1100".to_string(),
+                quantity: "99".to_string(),
+            }
+        ]
+    );
+
+    msgbus::send_any_value(
+        MessagingSwitchboard::exec_engine_position_operation(),
+        &result,
+    );
+    let applied = std::iter::from_fn(|| rx.try_recv().ok())
+        .find_map(|event| match event {
+            ExecutionEvent::PositionOperation(result)
+                if result.operation_id == operation_id
+                    && result.status == PositionOperationStatus::Applied =>
+            {
+                Some(result)
+            }
+            _ => None,
+        })
+        .expect("the strategy must receive Applied");
+    assert!(applied.effects.is_none());
+
+    let yes_position = cache
+        .borrow()
+        .position(&PositionId::new(format!(
+            "{}-{}",
+            yes1.id(),
+            StrategyId::from("STRATEGY-001")
+        )))
+        .expect("settled YES output must be received")
+        .cloned();
+    assert!(yes_position.is_closed());
+    assert!(yes_position.is_settled());
+    assert_eq!(yes_position.quantity, Quantity::from("0"));
+    assert_eq!(
+        yes_position.realized_pnl,
+        Some(Money::from_decimal(expected_pnl, Currency::pUSD()).unwrap())
+    );
+    assert!(matches!(
+        yes_position.replay_events.as_slice(),
+        [
+            PositionReplayEvent::Operation(leg),
+            PositionReplayEvent::InstrumentClosed(_)
+        ] if leg.quantity == Quantity::from("99")
+    ));
+
+    let cash = cache
+        .borrow()
+        .account(&account_id)
+        .map(|account| account.balances()[&Currency::pUSD()].total.as_decimal());
+    assert_eq!(cash, expected_cash);
+
+    msgbus::send_any_value(
+        MessagingSwitchboard::exec_engine_position_operation(),
+        &result,
+    );
+    let cash_after_duplicate = cache
+        .borrow()
+        .account(&account_id)
+        .map(|account| account.balances()[&Currency::pUSD()].total.as_decimal());
+    assert_eq!(
+        cash_after_duplicate, expected_cash,
+        "duplicate results must not add settlement cash again"
+    );
+
+    msgbus::send_data(
+        MessagingSwitchboard::data_engine_process_data(),
+        Data::InstrumentClose(close),
+    );
+    let cash_after_close = cache
+        .borrow()
+        .account(&account_id)
+        .map(|account| account.balances()[&Currency::pUSD()].total.as_decimal());
+    assert_eq!(
+        cash_after_close, expected_cash,
+        "duplicate close must not add settlement cash again"
+    );
+
+    let mut portfolio = portfolio.borrow_mut();
+    assert_eq!(
+        portfolio.realized_pnl(&yes1.id()),
+        Some(Money::from_decimal(expected_pnl, Currency::pUSD()).unwrap())
+    );
+    assert_eq!(portfolio.net_position(&yes1.id()), Decimal::ZERO);
+}
+
+#[rstest]
+fn test_sandbox_convert_uses_settlement_received_before_application(trader_id: TraderId) {
+    let account_id = AccountId::from("POLYMARKET-092");
+    let strategy_id = StrategyId::from("STRATEGY-001");
+    let market = serde_json::json!({
+        "market_id": "0xnegrisk",
+        "fee_bips": 100,
+        "conditions": [
+            {
+                "question_index": 0,
+                "condition_id": "0xc0",
+                "yes_token_id": "1000",
+                "no_token_id": "1001",
+            },
+            {
+                "question_index": 1,
+                "condition_id": "0xc1",
+                "yes_token_id": "1100",
+                "no_token_id": "1101",
+            },
+        ],
+    });
+    let no0 = make_neg_risk_instrument("0xc0", "1001", "No", &market);
+    let yes1 = make_neg_risk_instrument("0xc1", "1100", "Yes", &market);
+
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
+    let mut config = create_config(trader_id, account_id, no0.id().venue);
+    config.account_type = AccountType::Cash;
+    config.starting_balances = vec![Money::new(1_000.0, Currency::pUSD())];
+    config.base_currency = Some(Currency::pUSD());
+    let core = ExecutionClientCore::new(
+        trader_id,
+        ClientId::new("SANDBOX"),
+        config.venue,
+        config.oms_type,
+        config.account_id,
+        config.account_type,
+        config.base_currency,
+        cache.clone(),
+    );
+    let mut client =
+        SandboxExecutionClient::new(core, config, clock.clone(), cache.clone()).unwrap();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ExecutionEvent>();
+    let portfolio = Rc::new(RefCell::new(Portfolio::new(
+        clock.clone(),
+        cache.clone(),
+        None,
+    )));
+    set_exec_event_sender(tx);
+    setup_account_state_handler(cache.clone());
+
+    for instrument in [&no0, &yes1] {
+        cache
+            .borrow_mut()
+            .add_instrument(instrument.clone())
+            .unwrap();
+    }
+    let position = operation_position(
+        &no0,
+        trader_id,
+        strategy_id,
+        account_id,
+        "100",
+        Decimal::new(50, 0),
+    );
+    cache
+        .borrow_mut()
+        .add_position_without_order(&position, OmsType::Netting)
+        .unwrap();
+    client.start().unwrap();
+
+    let engine = Rc::new(RefCell::new(ExecutionEngine::new(
+        clock.clone(),
+        cache.clone(),
+        None,
+    )));
+    ExecutionEngine::register_msgbus_handlers(&engine);
+    let client_id = client.client_id();
+    engine
+        .borrow_mut()
+        .register_client(Box::new(client))
+        .unwrap();
+
+    let operation_id = UUID4::new();
+    engine
+        .borrow()
+        .execute(TradingCommand::SubmitPositionOperation(
+            SubmitPositionOperation::new(
+                trader_id,
+                Some(client_id),
+                strategy_id,
+                operation_id,
+                PositionOperationType::Convert,
+                vec![no0.id()],
+                Some(Quantity::from("100")),
+                UnixNanos::from(1),
+            ),
+        ));
+    let result = std::iter::from_fn(|| rx.try_recv().ok())
+        .find_map(|event| match event {
+            ExecutionEvent::PositionOperation(result) if result.operation_id == operation_id => {
+                Some(result)
+            }
+            _ => None,
+        })
+        .expect("expected a position operation result");
+    assert_eq!(result.status, PositionOperationStatus::Confirmed);
+
+    // The payout arrives after the venue confirms, but before the core applies the operation.
+    cache
+        .borrow_mut()
+        .add_instrument_close(InstrumentClose::new(
+            yes1.id(),
+            Price::from("1"),
+            InstrumentCloseType::ContractExpired,
+            UnixNanos::from(5),
+            UnixNanos::from(5),
+        ))
+        .unwrap();
+    msgbus::send_any_value(
+        MessagingSwitchboard::exec_engine_position_operation(),
+        &result,
+    );
+    let applied = std::iter::from_fn(|| rx.try_recv().ok()).any(|event| matches!(
+        event,
+        ExecutionEvent::PositionOperation(result)
+            if result.operation_id == operation_id && result.status == PositionOperationStatus::Applied
+    ));
+    assert!(applied);
+
+    let yes_position = cache
+        .borrow()
+        .position(&PositionId::new(format!("{}-{strategy_id}", yes1.id())))
+        .expect("settled output must be received")
+        .cloned();
+    assert!(yes_position.is_closed());
+    assert!(yes_position.is_settled());
+    assert_eq!(
+        yes_position.realized_pnl,
+        Some(Money::from_decimal(Decimal::new(49, 0), Currency::pUSD()).unwrap())
+    );
+    let cash = cache
+        .borrow()
+        .account(&account_id)
+        .map(|account| account.balances()[&Currency::pUSD()].total.as_decimal());
+    assert_eq!(cash, Some(Decimal::new(1_099, 0)));
+    let mut portfolio = portfolio.borrow_mut();
+    assert_eq!(
+        portfolio.realized_pnl(&yes1.id()),
+        Some(Money::from_decimal(Decimal::new(49, 0), Currency::pUSD()).unwrap())
+    );
+    assert_eq!(portfolio.net_position(&yes1.id()), Decimal::ZERO);
+
+    msgbus::send_any_value(
+        MessagingSwitchboard::exec_engine_position_operation(),
+        &result,
+    );
+    let cash_after_duplicate = cache
+        .borrow()
+        .account(&account_id)
+        .map(|account| account.balances()[&Currency::pUSD()].total.as_decimal());
+    assert_eq!(
+        cash_after_duplicate,
+        Some(Decimal::new(1_099, 0)),
+        "duplicate results must not add settlement cash again"
+    );
+}
+
+#[rstest]
+fn test_sandbox_cleanup_retains_pending_convert_dependency(trader_id: TraderId) {
+    *msgbus::get_message_bus().borrow_mut() = MessageBus::default();
+    let account_id = AccountId::from("POLYMARKET-093");
+    let strategy_id = StrategyId::from("STRATEGY-001");
+    let market = serde_json::json!({
+        "market_id": "0xnegrisk",
+        "fee_bips": 100,
+        "conditions": [
+            {
+                "question_index": 0,
+                "condition_id": "0xc0",
+                "yes_token_id": "1000",
+                "no_token_id": "1001",
+            },
+            {
+                "question_index": 1,
+                "condition_id": "0xc1",
+                "yes_token_id": "1100",
+                "no_token_id": "1101",
+            },
+            {
+                "question_index": 2,
+                "condition_id": "0xc2",
+                "yes_token_id": "1200",
+                "no_token_id": "1201",
+            },
+        ],
+    });
+    let mut no0 = make_neg_risk_instrument("0xc0", "1001", "No", &market);
+    let mut yes1 = make_neg_risk_instrument("0xc1", "1100", "Yes", &market);
+    let yes2 = make_neg_risk_instrument("0xc2", "1200", "Yes", &market);
+    let mut no2 = make_neg_risk_instrument("0xc2", "1201", "No", &market);
+    let trigger = make_binary_option_instrument("0xtrigger", "9999", "Yes", 100);
+
+    if let InstrumentAny::BinaryOption(binary) = &mut no0 {
+        binary.expiration_ns = UnixNanos::from(1_000);
+    }
+
+    if let InstrumentAny::BinaryOption(binary) = &mut yes1 {
+        binary.expiration_ns = UnixNanos::from(100);
+    }
+
+    if let InstrumentAny::BinaryOption(binary) = &mut no2 {
+        binary.expiration_ns = UnixNanos::from(1_000);
+    }
+
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    let test_clock = Rc::new(RefCell::new(VirtualClock::new()));
+    test_clock.borrow_mut().set_time(UnixNanos::from(50));
+    let clock: Rc<RefCell<dyn Clock>> = test_clock.clone();
+    let mut config = create_config(trader_id, account_id, no0.id().venue);
+    config.account_type = AccountType::Cash;
+    config.starting_balances = vec![Money::new(1_000.0, Currency::pUSD())];
+    config.base_currency = Some(Currency::pUSD());
+    let core = ExecutionClientCore::new(
+        trader_id,
+        ClientId::new("SANDBOX"),
+        config.venue,
+        config.oms_type,
+        config.account_id,
+        config.account_type,
+        config.base_currency,
+        cache.clone(),
+    );
+    let mut client =
+        SandboxExecutionClient::new(core, config, clock.clone(), cache.clone()).unwrap();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ExecutionEvent>();
+    let portfolio = Rc::new(RefCell::new(Portfolio::new(
+        clock.clone(),
+        cache.clone(),
+        None,
+    )));
+    set_exec_event_sender(tx);
+    setup_account_state_handler(cache.clone());
+
+    for instrument in [&no0, &yes1, &yes2, &no2, &trigger] {
+        cache
+            .borrow_mut()
+            .add_instrument(instrument.clone())
+            .unwrap();
+    }
+    let no_position = operation_position(
+        &no0,
+        trader_id,
+        strategy_id,
+        account_id,
+        "100",
+        Decimal::new(50, 0),
+    );
+    cache
+        .borrow_mut()
+        .add_position_without_order(&no_position, OmsType::Netting)
+        .unwrap();
+    client.start().unwrap();
+    for instrument in [&no0, &yes1, &no2, &trigger] {
+        client
+            .process_quote_tick(&create_binary_option_quote(instrument.id()))
+            .unwrap();
+    }
+    let data_engine = Rc::new(RefCell::new(DataEngine::new(
+        clock.clone(),
+        cache.clone(),
+        None,
+    )));
+    DataEngine::register_msgbus_handlers(&data_engine);
+
+    test_clock.borrow_mut().set_time(UnixNanos::from(200));
+    let yes1_close = InstrumentClose::new(
+        yes1.id(),
+        Price::from("0"),
+        InstrumentCloseType::ContractExpired,
+        UnixNanos::from(200),
+        UnixNanos::from(200),
+    );
+    cache.borrow_mut().add_instrument_close(yes1_close).unwrap();
+    msgbus::send_data(
+        MessagingSwitchboard::data_engine_process_data(),
+        Data::InstrumentClose(yes1_close),
+    );
+
+    let engine = Rc::new(RefCell::new(ExecutionEngine::new(
+        clock.clone(),
+        cache.clone(),
+        None,
+    )));
+    ExecutionEngine::register_msgbus_handlers(&engine);
+    let client_id = client.client_id();
+    engine
+        .borrow_mut()
+        .register_client(Box::new(client))
+        .unwrap();
+
+    let operation_id = UUID4::new();
+    engine
+        .borrow()
+        .execute(TradingCommand::SubmitPositionOperation(
+            SubmitPositionOperation::new(
+                trader_id,
+                Some(client_id),
+                strategy_id,
+                operation_id,
+                PositionOperationType::Convert,
+                vec![no0.id()],
+                Some(Quantity::from("100")),
+                UnixNanos::from(200),
+            ),
+        ));
+    let result = std::iter::from_fn(|| rx.try_recv().ok())
+        .find_map(|event| match event {
+            ExecutionEvent::PositionOperation(result) if result.operation_id == operation_id => {
+                Some(result)
+            }
+            _ => None,
+        })
+        .expect("expected a confirmed result");
+    assert_eq!(result.status, PositionOperationStatus::Confirmed);
+
+    // All eligible NO inputs expire before the confirmed operation is applied.
+    test_clock.borrow_mut().set_time(UnixNanos::from(2_000));
+    let no2_close = InstrumentClose::new(
+        no2.id(),
+        Price::from("0"),
+        InstrumentCloseType::ContractExpired,
+        UnixNanos::from(2_000),
+        UnixNanos::from(2_000),
+    );
+    cache.borrow_mut().add_instrument_close(no2_close).unwrap();
+    msgbus::send_data(
+        MessagingSwitchboard::data_engine_process_data(),
+        Data::InstrumentClose(no2_close),
+    );
+
+    msgbus::send_any_value(
+        MessagingSwitchboard::exec_engine_position_operation(),
+        &result,
+    );
+    let applied = std::iter::from_fn(|| rx.try_recv().ok()).any(|event| matches!(
+        event,
+        ExecutionEvent::PositionOperation(result)
+            if result.operation_id == operation_id && result.status == PositionOperationStatus::Applied
+    ));
+    assert!(
+        applied,
+        "cleanup must retain the output while the conversion awaits application"
+    );
+
+    let settled = cache
+        .borrow()
+        .position(&PositionId::new(format!("{}-{strategy_id}", yes1.id())))
+        .expect("settled output must be received")
+        .cloned();
+    assert!(settled.is_closed());
+    assert!(settled.is_settled());
+    assert_eq!(
+        settled.realized_pnl,
+        Some(Money::from_decimal(Decimal::new(-25, 0), Currency::pUSD()).unwrap())
+    );
+    let active = cache
+        .borrow()
+        .position(&PositionId::new(format!("{}-{strategy_id}", yes2.id())))
+        .expect("unsettled output must open")
+        .cloned();
+    assert!(active.is_open());
+    assert_eq!(active.quantity, Quantity::from("99"));
+    let cash = cache
+        .borrow()
+        .account(&account_id)
+        .map(|account| account.balances()[&Currency::pUSD()].total.as_decimal());
+    assert_eq!(cash, Some(Decimal::new(1_000, 0)));
+    let mut portfolio = portfolio.borrow_mut();
+    assert_eq!(
+        portfolio.realized_pnl(&yes1.id()),
+        Some(Money::from_decimal(Decimal::new(-25, 0), Currency::pUSD()).unwrap())
+    );
+    assert_eq!(portfolio.net_position(&yes1.id()), Decimal::ZERO);
+    assert_eq!(portfolio.net_position(&yes2.id()), Decimal::new(99, 0));
+
+    // Once the pending conversion completes and all NO inputs are gone, the retained
+    // definition is released by the next normal cleanup.
+    let trigger_close = InstrumentClose::new(
+        trigger.id(),
+        Price::from("0"),
+        InstrumentCloseType::ContractExpired,
+        UnixNanos::from(2_000),
+        UnixNanos::from(2_000),
+    );
+    cache
+        .borrow_mut()
+        .add_instrument_close(trigger_close)
+        .unwrap();
+    msgbus::send_data(
+        MessagingSwitchboard::data_engine_process_data(),
+        Data::InstrumentClose(trigger_close),
+    );
+    assert!(cache.borrow().instrument(&yes1.id()).is_none());
+    assert!(cache.borrow().instrument_close(&yes1.id()).is_none());
+}
+
+#[rstest]
+fn test_sandbox_late_convert_payout_after_expiry_cleanup(trader_id: TraderId) {
+    *msgbus::get_message_bus().borrow_mut() = MessageBus::default();
+    let account_id = AccountId::from("POLYMARKET-094");
+    let strategy_id = StrategyId::from("STRATEGY-001");
+    let market = serde_json::json!({
+        "market_id": "0xnegrisk",
+        "fee_bips": 100,
+        "conditions": [
+            {
+                "question_index": 0,
+                "condition_id": "0xc0",
+                "yes_token_id": "1000",
+                "no_token_id": "1001",
+            },
+            {
+                "question_index": 1,
+                "condition_id": "0xc1",
+                "yes_token_id": "1100",
+                "no_token_id": "1101",
+            },
+        ],
+    });
+    let mut no0 = make_neg_risk_instrument("0xc0", "1001", "No", &market);
+    let mut yes1 = make_neg_risk_instrument("0xc1", "1100", "Yes", &market);
+
+    if let InstrumentAny::BinaryOption(binary) = &mut no0 {
+        binary.expiration_ns = UnixNanos::from(1_000);
+    }
+
+    if let InstrumentAny::BinaryOption(binary) = &mut yes1 {
+        binary.expiration_ns = UnixNanos::from(100);
+    }
+
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    let test_clock = Rc::new(RefCell::new(VirtualClock::new()));
+    test_clock.borrow_mut().set_time(UnixNanos::from(50));
+    let clock: Rc<RefCell<dyn Clock>> = test_clock.clone();
+    let mut config = create_config(trader_id, account_id, no0.id().venue);
+    config.account_type = AccountType::Cash;
+    config.starting_balances = vec![Money::new(1_000.0, Currency::pUSD())];
+    config.base_currency = Some(Currency::pUSD());
+    let core = ExecutionClientCore::new(
+        trader_id,
+        ClientId::new("SANDBOX"),
+        config.venue,
+        config.oms_type,
+        config.account_id,
+        config.account_type,
+        config.base_currency,
+        cache.clone(),
+    );
+    let mut client =
+        SandboxExecutionClient::new(core, config, clock.clone(), cache.clone()).unwrap();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ExecutionEvent>();
+    let portfolio = Rc::new(RefCell::new(Portfolio::new(
+        clock.clone(),
+        cache.clone(),
+        None,
+    )));
+    set_exec_event_sender(tx);
+    setup_account_state_handler(cache.clone());
+
+    for instrument in [&no0, &yes1] {
+        cache
+            .borrow_mut()
+            .add_instrument(instrument.clone())
+            .unwrap();
+    }
+    let no_position = operation_position(
+        &no0,
+        trader_id,
+        strategy_id,
+        account_id,
+        "100",
+        Decimal::new(50, 0),
+    );
+    cache
+        .borrow_mut()
+        .add_position_without_order(&no_position, OmsType::Netting)
+        .unwrap();
+    client.start().unwrap();
+    client
+        .process_quote_tick(&create_binary_option_quote(yes1.id()))
+        .unwrap();
+
+    let data_engine = Rc::new(RefCell::new(DataEngine::new(
+        clock.clone(),
+        cache.clone(),
+        None,
+    )));
+    DataEngine::register_msgbus_handlers(&data_engine);
+    let engine = Rc::new(RefCell::new(ExecutionEngine::new(
+        clock.clone(),
+        cache.clone(),
+        None,
+    )));
+    ExecutionEngine::register_msgbus_handlers(&engine);
+    let client_id = client.client_id();
+    engine
+        .borrow_mut()
+        .register_client(Box::new(client))
+        .unwrap();
+
+    let operation_id = UUID4::new();
+    engine
+        .borrow()
+        .execute(TradingCommand::SubmitPositionOperation(
+            SubmitPositionOperation::new(
+                trader_id,
+                Some(client_id),
+                strategy_id,
+                operation_id,
+                PositionOperationType::Convert,
+                vec![no0.id()],
+                Some(Quantity::from("100")),
+                UnixNanos::from(50),
+            ),
+        ));
+    let result = std::iter::from_fn(|| rx.try_recv().ok())
+        .find_map(|event| match event {
+            ExecutionEvent::PositionOperation(result) if result.operation_id == operation_id => {
+                Some(result)
+            }
+            _ => None,
+        })
+        .expect("expected a confirmed result");
+    assert_eq!(
+        result.status,
+        PositionOperationStatus::Confirmed,
+        "{:?}",
+        result.message
+    );
+
+    // The periodic sweep retires the expired output engine while the confirmed conversion
+    // still waits for local application. Its definition stays available for later settlement.
+    let handlers = advance_and_fire(&test_clock, UnixNanos::from(60_000_000_100));
+    assert!(handlers > 0, "expected the expiry sweep timer to fire");
+    assert!(cache.borrow().instrument(&yes1.id()).is_some());
+    assert!(cache.borrow().instrument_close(&yes1.id()).is_none());
+
+    msgbus::send_any_value(
+        MessagingSwitchboard::exec_engine_position_operation(),
+        &result,
+    );
+    let applied = std::iter::from_fn(|| rx.try_recv().ok()).any(|event| matches!(
+        event,
+        ExecutionEvent::PositionOperation(result)
+            if result.operation_id == operation_id && result.status == PositionOperationStatus::Applied
+    ));
+    assert!(applied);
+    let output = cache
+        .borrow()
+        .position(&PositionId::new(format!("{}-{strategy_id}", yes1.id())))
+        .expect("output position must be received")
+        .clone();
+    assert!(output.is_open());
+    assert_eq!(output.quantity, Quantity::from("99"));
+    let cash = cache
+        .borrow()
+        .account(&account_id)
+        .map(|account| account.balances()[&Currency::pUSD()].total.as_decimal());
+    assert_eq!(cash, Some(Decimal::new(1_000, 0)));
+
+    // A later sweep must keep the definition while the applied output position still awaits
+    // its authoritative payout.
+    let handlers = advance_and_fire(&test_clock, UnixNanos::from(120_000_000_100));
+    assert!(handlers > 0, "expected the next expiry sweep to fire");
+    assert!(cache.borrow().instrument(&yes1.id()).is_some());
+
+    // The payout arrives only after cleanup retired the engine. The retained convert output
+    // must still carry settlement into the simulated cash account exactly once.
+    let close = InstrumentClose::new(
+        yes1.id(),
+        Price::from("1"),
+        InstrumentCloseType::ContractExpired,
+        UnixNanos::from(120_000_000_101),
+        UnixNanos::from(120_000_000_101),
+    );
+    cache.borrow_mut().add_instrument_close(close).unwrap();
+    msgbus::send_data(
+        MessagingSwitchboard::data_engine_process_data(),
+        Data::InstrumentClose(close),
+    );
+
+    for event in std::iter::from_fn(|| rx.try_recv().ok()) {
+        if let ExecutionEvent::Order(order_event) = event {
+            engine.borrow_mut().process(&order_event);
+        }
+    }
+
+    let settled = cache
+        .borrow()
+        .position(&PositionId::new(format!("{}-{strategy_id}", yes1.id())))
+        .expect("settled output position must remain")
+        .clone();
+    assert!(settled.is_closed());
+    let cash = cache
+        .borrow()
+        .account(&account_id)
+        .map(|account| account.balances()[&Currency::pUSD()].total.as_decimal());
+    assert_eq!(cash, Some(Decimal::new(1_099, 0)));
+    let mut portfolio = portfolio.borrow_mut();
+    assert_eq!(
+        portfolio.realized_pnl(&yes1.id()),
+        Some(Money::from_decimal(Decimal::new(49, 0), Currency::pUSD()).unwrap())
+    );
+    assert_eq!(portfolio.net_position(&yes1.id()), Decimal::ZERO);
+
+    // Replayed payout evidence must not credit the same shares again.
+    msgbus::send_data(
+        MessagingSwitchboard::data_engine_process_data(),
+        Data::InstrumentClose(close),
+    );
+
+    for event in std::iter::from_fn(|| rx.try_recv().ok()) {
+        if let ExecutionEvent::Order(order_event) = event {
+            engine.borrow_mut().process(&order_event);
+        }
+    }
+    let cash = cache
+        .borrow()
+        .account(&account_id)
+        .map(|account| account.balances()[&Currency::pUSD()].total.as_decimal());
+    assert_eq!(cash, Some(Decimal::new(1_099, 0)));
+}
+
+#[rstest]
+#[case(false)]
+#[case(true)]
+fn test_sandbox_convert_after_normal_expiry_cleanup(
+    trader_id: TraderId,
+    #[case] expire_output: bool,
+) {
+    *msgbus::get_message_bus().borrow_mut() = MessageBus::default();
+    let account_id = AccountId::from("POLYMARKET-091");
+    let strategy_id = StrategyId::from("STRATEGY-001");
+    let market = serde_json::json!({
+        "market_id": "0xnegrisk",
+        "fee_bips": 100,
+        "conditions": [
+            {
+                "question_index": 0,
+                "condition_id": "0xc0",
+                "yes_token_id": "1000",
+                "no_token_id": "1001",
+            },
+            {
+                "question_index": 1,
+                "condition_id": "0xc1",
+                "yes_token_id": "1100",
+                "no_token_id": "1101",
+            },
+            {
+                "question_index": 2,
+                "condition_id": "0xc2",
+                "yes_token_id": "1200",
+                "no_token_id": "1201",
+            },
+        ],
+    });
+    let no0 = make_neg_risk_instrument("0xc0", "1001", "No", &market);
+    let mut yes1 = make_neg_risk_instrument("0xc1", "1100", "Yes", &market);
+    let yes2 = make_neg_risk_instrument("0xc2", "1200", "Yes", &market);
+
+    if let InstrumentAny::BinaryOption(binary) = &mut yes1 {
+        binary.expiration_ns = UnixNanos::from(if expire_output { 100 } else { 1_000 });
+    }
+
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    let test_clock = Rc::new(RefCell::new(VirtualClock::new()));
+    test_clock.borrow_mut().set_time(UnixNanos::from(50));
+    let clock: Rc<RefCell<dyn Clock>> = test_clock.clone();
+    let mut config = create_config(trader_id, account_id, no0.id().venue);
+    config.account_type = AccountType::Cash;
+    config.starting_balances = vec![Money::new(1_000.0, Currency::pUSD())];
+    config.base_currency = Some(Currency::pUSD());
+    let core = ExecutionClientCore::new(
+        trader_id,
+        ClientId::new("SANDBOX"),
+        config.venue,
+        config.oms_type,
+        config.account_id,
+        config.account_type,
+        config.base_currency,
+        cache.clone(),
+    );
+    let mut client =
+        SandboxExecutionClient::new(core, config, clock.clone(), cache.clone()).unwrap();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ExecutionEvent>();
+    let portfolio = Rc::new(RefCell::new(Portfolio::new(
+        clock.clone(),
+        cache.clone(),
+        None,
+    )));
+    set_exec_event_sender(tx);
+    setup_account_state_handler(cache.clone());
+
+    for instrument in [&no0, &yes1, &yes2] {
+        cache
+            .borrow_mut()
+            .add_instrument(instrument.clone())
+            .unwrap();
+    }
+    let no_position = operation_position(
+        &no0,
+        trader_id,
+        strategy_id,
+        account_id,
+        "100",
+        Decimal::new(50, 0),
+    );
+    cache
+        .borrow_mut()
+        .add_position_without_order(&no_position, OmsType::Netting)
+        .unwrap();
+    client.start().unwrap();
+    client
+        .process_quote_tick(&create_binary_option_quote(yes1.id()))
+        .unwrap();
+
+    let data_engine = Rc::new(RefCell::new(DataEngine::new(
+        clock.clone(),
+        cache.clone(),
+        None,
+    )));
+    DataEngine::register_msgbus_handlers(&data_engine);
+
+    test_clock.borrow_mut().set_time(UnixNanos::from(200));
+    let close = InstrumentClose::new(
+        yes1.id(),
+        Price::from("0"),
+        InstrumentCloseType::ContractExpired,
+        UnixNanos::from(200),
+        UnixNanos::from(200),
+    );
+    cache.borrow_mut().add_instrument_close(close).unwrap();
+    msgbus::send_data(
+        MessagingSwitchboard::data_engine_process_data(),
+        Data::InstrumentClose(close),
+    );
+    assert_eq!(
+        client.matching_engine_count(),
+        usize::from(!expire_output),
+        "expiry cleanup must remove the retired matching engine"
+    );
+
+    let engine = Rc::new(RefCell::new(ExecutionEngine::new(
+        clock.clone(),
+        cache.clone(),
+        None,
+    )));
+    ExecutionEngine::register_msgbus_handlers(&engine);
+    let client_id = client.client_id();
+    engine
+        .borrow_mut()
+        .register_client(Box::new(client))
+        .unwrap();
+
+    let operation_id = UUID4::new();
+    engine
+        .borrow()
+        .execute(TradingCommand::SubmitPositionOperation(
+            SubmitPositionOperation::new(
+                trader_id,
+                Some(client_id),
+                strategy_id,
+                operation_id,
+                PositionOperationType::Convert,
+                vec![no0.id()],
+                Some(Quantity::from("100")),
+                UnixNanos::from(200),
+            ),
+        ));
+    let result = std::iter::from_fn(|| rx.try_recv().ok())
+        .find_map(|event| match event {
+            ExecutionEvent::PositionOperation(result) if result.operation_id == operation_id => {
+                Some(result)
+            }
+            _ => None,
+        })
+        .expect("conversion must return a result");
+    assert_eq!(
+        result.status,
+        PositionOperationStatus::Confirmed,
+        "{:?}",
+        result.message
+    );
+    msgbus::send_any_value(
+        MessagingSwitchboard::exec_engine_position_operation(),
+        &result,
+    );
+    let applied = std::iter::from_fn(|| rx.try_recv().ok()).any(|event| matches!(
+        event,
+        ExecutionEvent::PositionOperation(result)
+            if result.operation_id == operation_id && result.status == PositionOperationStatus::Applied
+    ));
+    assert!(applied);
+
+    let settled = cache
+        .borrow()
+        .position(&PositionId::new(format!("{}-{strategy_id}", yes1.id())))
+        .expect("settled output must be received")
+        .cloned();
+    assert!(settled.is_closed());
+    assert!(settled.is_settled());
+    assert_eq!(
+        settled.realized_pnl,
+        Some(Money::from_decimal(Decimal::new(-25, 0), Currency::pUSD()).unwrap())
+    );
+    let active = cache
+        .borrow()
+        .position(&PositionId::new(format!("{}-{strategy_id}", yes2.id())))
+        .expect("unsettled output must open")
+        .cloned();
+    assert!(active.is_open());
+    assert_eq!(active.quantity, Quantity::from("99"));
+    let cash = cache
+        .borrow()
+        .account(&account_id)
+        .map(|account| account.balances()[&Currency::pUSD()].total.as_decimal());
+    assert_eq!(cash, Some(Decimal::new(1_000, 0)));
+
+    let mut portfolio = portfolio.borrow_mut();
+    assert_eq!(
+        portfolio.realized_pnl(&yes1.id()),
+        Some(Money::from_decimal(Decimal::new(-25, 0), Currency::pUSD()).unwrap())
+    );
+    assert_eq!(portfolio.net_position(&yes1.id()), Decimal::ZERO);
+    assert_eq!(portfolio.net_position(&yes2.id()), Decimal::new(99, 0));
+}
+
+#[rstest]
+fn test_sandbox_ctf_convert_rejects_settled_input(trader_id: TraderId) {
+    let account_id = AccountId::from("POLYMARKET-012");
+    let market = serde_json::json!({
+        "market_id": "0xnegrisk",
+        "fee_bips": 0,
+        "conditions": [
+            {
+                "question_index": 0,
+                "condition_id": "0xc0",
+                "yes_token_id": "1000",
+                "no_token_id": "1001",
+            },
+            {
+                "question_index": 1,
+                "condition_id": "0xc1",
+                "yes_token_id": "1100",
+                "no_token_id": "1101",
+            },
+        ],
+    });
+    let no0 = make_neg_risk_instrument("0xc0", "1001", "No", &market);
+    let yes1 = make_neg_risk_instrument("0xc1", "1100", "Yes", &market);
+
+    let venue = no0.id().venue;
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
+    let mut config = create_config(trader_id, account_id, venue);
+    config.account_type = AccountType::Cash;
+    config.starting_balances = vec![Money::new(1_000.0, Currency::pUSD())];
+    config.base_currency = Some(Currency::pUSD());
+    let core = ExecutionClientCore::new(
+        trader_id,
+        ClientId::new("SANDBOX"),
+        config.venue,
+        config.oms_type,
+        config.account_id,
+        config.account_type,
+        config.base_currency,
+        cache.clone(),
+    );
+    let mut client = SandboxExecutionClient::new(core, config, clock, cache.clone()).unwrap();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ExecutionEvent>();
+    set_exec_event_sender(tx);
+    setup_account_state_handler(cache.clone());
+
+    for instrument in [&no0, &yes1] {
+        cache
+            .borrow_mut()
+            .add_instrument(instrument.clone())
+            .unwrap();
+    }
+    let position = operation_position(
+        &no0,
+        trader_id,
+        StrategyId::from("STRATEGY-001"),
+        account_id,
+        "100",
+        Decimal::new(50, 0),
+    );
+    cache
+        .borrow_mut()
+        .add_position_without_order(&position, OmsType::Netting)
+        .unwrap();
+    cache
+        .borrow_mut()
+        .add_instrument_close(InstrumentClose::new(
+            no0.id(),
+            Price::from("0"),
+            InstrumentCloseType::ContractExpired,
+            UnixNanos::from(5),
+            UnixNanos::from(5),
+        ))
+        .unwrap();
+    client.start().unwrap();
+
+    let command = SubmitPositionOperation::new(
+        trader_id,
+        Some(client.client_id()),
+        StrategyId::from("STRATEGY-001"),
+        UUID4::new(),
+        PositionOperationType::Convert,
+        vec![no0.id()],
+        Some(Quantity::from("100")),
+        UnixNanos::from(1),
+    );
+    client.submit_position_operation(command).unwrap();
+
+    let result = std::iter::from_fn(|| rx.try_recv().ok())
+        .find_map(|event| match event {
+            ExecutionEvent::PositionOperation(result) => Some(result),
+            _ => None,
+        })
+        .expect("expected a position operation result");
+    assert_eq!(result.status, PositionOperationStatus::Rejected);
+    assert!(
+        result
+            .message
+            .as_deref()
+            .is_some_and(|message| message.contains("economically settled"))
+    );
+    assert!(cache.borrow().account(&account_id).is_none());
+}
+
+#[rstest]
+fn test_sandbox_rejects_unsupported_and_incomplete_converts(trader_id: TraderId) {
+    let account_id = AccountId::from("POLYMARKET-002");
+    let market = serde_json::json!({
+        "market_id": "0xnegrisk",
+        "fee_bips": 0,
+        "conditions": [
+            {
+                "question_index": 0,
+                "condition_id": "0xc0",
+                "yes_token_id": "1000",
+                "no_token_id": "1001",
+            },
+            {
+                "question_index": 1,
+                "condition_id": "0xc1",
+                "yes_token_id": "1100",
+                "no_token_id": "1101",
+            },
+        ],
+    });
+    let no0 = make_neg_risk_instrument("0xc0", "1001", "No", &market);
+    let no1 = make_neg_risk_instrument("0xc1", "1101", "No", &market);
+    let mut plain = make_binary_option_instrument("0xc9", "1900", "No", 1_000_000_000_000);
+    if let InstrumentAny::BinaryOption(binary) = &mut plain {
+        binary.activation_ns = UnixNanos::default();
+        binary.info = Some(Params::new(
+            [
+                (
+                    "token_id".to_string(),
+                    serde_json::Value::String("1900".to_string()),
+                ),
+                (
+                    "condition_id".to_string(),
+                    serde_json::Value::String("0xc9".to_string()),
+                ),
+            ]
+            .into(),
+        ));
+    }
+
+    let venue = no0.id().venue;
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
+    let mut config = create_config(trader_id, account_id, venue);
+    config.account_type = AccountType::Cash;
+    config.starting_balances = vec![Money::new(1_000.0, Currency::pUSD())];
+    config.base_currency = Some(Currency::pUSD());
+    let core = ExecutionClientCore::new(
+        trader_id,
+        ClientId::new("SANDBOX"),
+        config.venue,
+        config.oms_type,
+        config.account_id,
+        config.account_type,
+        config.base_currency,
+        cache.clone(),
+    );
+    let mut client = SandboxExecutionClient::new(core, config, clock, cache.clone()).unwrap();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ExecutionEvent>();
+
+    set_exec_event_sender(tx);
+
+    for instrument in [&no0, &no1, &plain] {
+        cache
+            .borrow_mut()
+            .add_instrument(instrument.clone())
+            .unwrap();
+    }
+
+    for instrument in [&no0, &no1, &plain] {
+        let position = operation_position(
+            instrument,
+            trader_id,
+            StrategyId::from("STRATEGY-002"),
+            account_id,
+            "100",
+            Decimal::new(50, 0),
+        );
+        cache
+            .borrow_mut()
+            .add_position_without_order(&position, OmsType::Netting)
+            .unwrap();
+    }
+    client.start().unwrap();
+
+    let split = SubmitPositionOperation::new(
+        trader_id,
+        Some(client.client_id()),
+        StrategyId::from("STRATEGY-002"),
+        UUID4::new(),
+        PositionOperationType::Split,
+        vec![no0.id(), no1.id()],
+        Some(Quantity::from("100")),
+        UnixNanos::from(1),
+    );
+    client.submit_position_operation(split).unwrap();
+
+    let missing = SubmitPositionOperation::new(
+        trader_id,
+        Some(client.client_id()),
+        StrategyId::from("STRATEGY-002"),
+        UUID4::new(),
+        PositionOperationType::Convert,
+        vec![plain.id()],
+        Some(Quantity::from("100")),
+        UnixNanos::from(1),
+    );
+    client.submit_position_operation(missing).unwrap();
+
+    let results: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok())
+        .filter_map(|event| match event {
+            ExecutionEvent::PositionOperation(result) => Some(result),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0].status, PositionOperationStatus::Rejected);
+    assert!(
+        results[0]
+            .message
+            .as_deref()
+            .unwrap()
+            .contains("CTF convert")
+    );
+    assert_eq!(results[1].status, PositionOperationStatus::Rejected);
+    assert!(
+        results[1]
+            .message
+            .as_deref()
+            .unwrap()
+            .contains("negative-risk")
+    );
+}
+
+#[rstest]
+fn test_sandbox_reset_clears_position_operation_dedup(trader_id: TraderId) {
+    let account_id = AccountId::from("POLYMARKET-003");
+    let market = serde_json::json!({
+        "market_id": "0xnegrisk",
+        "fee_bips": 0,
+        "conditions": [
+            {
+                "question_index": 0,
+                "condition_id": "0xc0",
+                "yes_token_id": "1000",
+                "no_token_id": "1001",
+            },
+            {
+                "question_index": 1,
+                "condition_id": "0xc1",
+                "yes_token_id": "1100",
+                "no_token_id": "1101",
+            },
+            {
+                "question_index": 2,
+                "condition_id": "0xc2",
+                "yes_token_id": "1200",
+                "no_token_id": "1201",
+            },
+        ],
+    });
+    let no0 = make_neg_risk_instrument("0xc0", "1001", "No", &market);
+    let no1 = make_neg_risk_instrument("0xc1", "1101", "No", &market);
+    let yes2 = make_neg_risk_instrument("0xc2", "1200", "Yes", &market);
+
+    let venue = no0.id().venue;
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
+    let mut config = create_config(trader_id, account_id, venue);
+    config.account_type = AccountType::Cash;
+    config.starting_balances = vec![Money::new(1_000.0, Currency::pUSD())];
+    config.base_currency = Some(Currency::pUSD());
+    let core = ExecutionClientCore::new(
+        trader_id,
+        ClientId::new("SANDBOX"),
+        config.venue,
+        config.oms_type,
+        config.account_id,
+        config.account_type,
+        config.base_currency,
+        cache.clone(),
+    );
+    let mut client = SandboxExecutionClient::new(core, config, clock, cache.clone()).unwrap();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ExecutionEvent>();
+
+    set_exec_event_sender(tx);
+
+    for instrument in [&no0, &no1, &yes2] {
+        cache
+            .borrow_mut()
+            .add_instrument(instrument.clone())
+            .unwrap();
+    }
+
+    for instrument in [&no0, &no1] {
+        let position = operation_position(
+            instrument,
+            trader_id,
+            StrategyId::from("STRATEGY-003"),
+            account_id,
+            "100",
+            Decimal::new(50, 0),
+        );
+        cache
+            .borrow_mut()
+            .add_position_without_order(&position, OmsType::Netting)
+            .unwrap();
+    }
+    client.start().unwrap();
+
+    let operation_id = UUID4::new();
+    let command = SubmitPositionOperation::new(
+        trader_id,
+        Some(client.client_id()),
+        StrategyId::from("STRATEGY-003"),
+        operation_id,
+        PositionOperationType::Convert,
+        vec![no0.id(), no1.id()],
+        Some(Quantity::from("100")),
+        UnixNanos::from(1),
+    );
+    client.submit_position_operation(command.clone()).unwrap();
+    let first = std::iter::from_fn(|| rx.try_recv().ok()).find_map(|event| match event {
+        ExecutionEvent::PositionOperation(result) => Some(result),
+        _ => None,
+    });
+    assert_eq!(
+        first.expect("first convert result").status,
+        PositionOperationStatus::Confirmed
+    );
+
+    client.submit_position_operation(command.clone()).unwrap();
+    assert!(
+        rx.try_recv().is_err(),
+        "duplicate operation must not apply again before reset"
+    );
+
+    client.reset();
+    client.submit_position_operation(command).unwrap();
+    let second = std::iter::from_fn(|| rx.try_recv().ok()).find_map(|event| match event {
+        ExecutionEvent::PositionOperation(result) => Some(result),
+        _ => None,
+    });
+    assert_eq!(
+        second.expect("second convert result after reset").status,
+        PositionOperationStatus::Confirmed
+    );
+}
+
+#[rstest]
+fn test_sandbox_convert_without_inventory_does_not_credit_cash(trader_id: TraderId) {
+    let account_id = AccountId::from("POLYMARKET-004");
+    let market = serde_json::json!({
+        "market_id": "0xnegrisk",
+        "fee_bips": 0,
+        "conditions": [
+            {
+                "question_index": 0,
+                "condition_id": "0xc0",
+                "yes_token_id": "1000",
+                "no_token_id": "1001",
+            },
+            {
+                "question_index": 1,
+                "condition_id": "0xc1",
+                "yes_token_id": "1100",
+                "no_token_id": "1101",
+            },
+            {
+                "question_index": 2,
+                "condition_id": "0xc2",
+                "yes_token_id": "1200",
+                "no_token_id": "1201",
+            },
+        ],
+    });
+    let no0 = make_neg_risk_instrument("0xc0", "1001", "No", &market);
+    let no1 = make_neg_risk_instrument("0xc1", "1101", "No", &market);
+    let yes2 = make_neg_risk_instrument("0xc2", "1200", "Yes", &market);
+
+    let venue = no0.id().venue;
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
+    let mut config = create_config(trader_id, account_id, venue);
+    config.account_type = AccountType::Cash;
+    config.starting_balances = vec![Money::new(1_000.0, Currency::pUSD())];
+    config.base_currency = Some(Currency::pUSD());
+    let core = ExecutionClientCore::new(
+        trader_id,
+        ClientId::new("SANDBOX"),
+        config.venue,
+        config.oms_type,
+        config.account_id,
+        config.account_type,
+        config.base_currency,
+        cache.clone(),
+    );
+    let mut client = SandboxExecutionClient::new(core, config, clock, cache.clone()).unwrap();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ExecutionEvent>();
+
+    set_exec_event_sender(tx);
+
+    for instrument in [&no0, &no1, &yes2] {
+        cache
+            .borrow_mut()
+            .add_instrument(instrument.clone())
+            .unwrap();
+    }
+    client.start().unwrap();
+
+    let command = SubmitPositionOperation::new(
+        trader_id,
+        Some(client.client_id()),
+        StrategyId::from("STRATEGY-004"),
+        UUID4::new(),
+        PositionOperationType::Convert,
+        vec![no0.id(), no1.id()],
+        Some(Quantity::from("100")),
+        UnixNanos::from(1),
+    );
+    client.submit_position_operation(command).unwrap();
+
+    let result = std::iter::from_fn(|| rx.try_recv().ok())
+        .find_map(|event| match event {
+            ExecutionEvent::PositionOperation(result) => Some(result),
+            _ => None,
+        })
+        .expect("expected a position operation result");
+    assert_eq!(result.status, PositionOperationStatus::Rejected);
+    assert!(
+        result
+            .message
+            .as_deref()
+            .unwrap()
+            .contains("requires 100 available")
+    );
+    assert!(cache.borrow().account(&account_id).is_none());
+}
+
+#[rstest]
+fn test_sandbox_convert_honors_inbound_latency_and_reset(trader_id: TraderId) {
+    const LATENCY_NS: u64 = 1_000_000_000;
+
+    let account_id = AccountId::from("POLYMARKET-005");
+    let market = serde_json::json!({
+        "market_id": "0xnegrisk",
+        "fee_bips": 0,
+        "conditions": [
+            {
+                "question_index": 0,
+                "condition_id": "0xc0",
+                "yes_token_id": "1000",
+                "no_token_id": "1001",
+            },
+            {
+                "question_index": 1,
+                "condition_id": "0xc1",
+                "yes_token_id": "1100",
+                "no_token_id": "1101",
+            },
+            {
+                "question_index": 2,
+                "condition_id": "0xc2",
+                "yes_token_id": "1200",
+                "no_token_id": "1201",
+            },
+        ],
+    });
+    let no0 = make_neg_risk_instrument("0xc0", "1001", "No", &market);
+    let no1 = make_neg_risk_instrument("0xc1", "1101", "No", &market);
+    let yes2 = make_neg_risk_instrument("0xc2", "1200", "Yes", &market);
+
+    let venue = no0.id().venue;
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    let test_clock = Rc::new(RefCell::new(VirtualClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = test_clock.clone();
+    let mut config = create_config(trader_id, account_id, venue);
+    config.account_type = AccountType::Cash;
+    config.starting_balances = vec![Money::new(1_000.0, Currency::pUSD())];
+    config.base_currency = Some(Currency::pUSD());
+    config.latency_model = Some(static_latency_model(LATENCY_NS, 0, 0));
+    let core = ExecutionClientCore::new(
+        trader_id,
+        ClientId::new("SANDBOX"),
+        config.venue,
+        config.oms_type,
+        config.account_id,
+        config.account_type,
+        config.base_currency,
+        cache.clone(),
+    );
+    let mut client = SandboxExecutionClient::new(core, config, clock, cache.clone()).unwrap();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ExecutionEvent>();
+
+    set_exec_event_sender(tx);
+
+    for instrument in [&no0, &no1, &yes2] {
+        cache
+            .borrow_mut()
+            .add_instrument(instrument.clone())
+            .unwrap();
+    }
+
+    for instrument in [&no0, &no1] {
+        let position = operation_position(
+            instrument,
+            trader_id,
+            StrategyId::from("STRATEGY-005"),
+            account_id,
+            "100",
+            Decimal::new(50, 0),
+        );
+        cache
+            .borrow_mut()
+            .add_position_without_order(&position, OmsType::Netting)
+            .unwrap();
+    }
+    client.start().unwrap();
+
+    let first_operation_id = UUID4::new();
+    let command = SubmitPositionOperation::new(
+        trader_id,
+        Some(client.client_id()),
+        StrategyId::from("STRATEGY-005"),
+        first_operation_id,
+        PositionOperationType::Convert,
+        vec![no0.id(), no1.id()],
+        Some(Quantity::from("100")),
+        UnixNanos::from(1),
+    );
+    client.submit_position_operation(command).unwrap();
+
+    assert!(
+        rx.try_recv().is_err(),
+        "convert must wait for inbound latency"
+    );
+    assert_eq!(
+        advance_and_fire(&test_clock, UnixNanos::from(LATENCY_NS / 2)),
+        0
+    );
+    assert!(rx.try_recv().is_err());
+    assert_eq!(
+        advance_and_fire(&test_clock, UnixNanos::from(LATENCY_NS)),
+        1
+    );
+    let result = std::iter::from_fn(|| rx.try_recv().ok()).find_map(|event| match event {
+        ExecutionEvent::PositionOperation(result) => Some(result),
+        _ => None,
+    });
+    assert_eq!(
+        result.expect("convert result after latency").status,
+        PositionOperationStatus::Confirmed
+    );
+
+    let deferred = SubmitPositionOperation::new(
+        trader_id,
+        Some(client.client_id()),
+        StrategyId::from("STRATEGY-005"),
+        UUID4::new(),
+        PositionOperationType::Convert,
+        vec![no0.id(), no1.id()],
+        Some(Quantity::from("100")),
+        UnixNanos::from(1),
+    );
+    client.submit_position_operation(deferred).unwrap();
+    client.reset();
+    assert_eq!(
+        advance_and_fire(&test_clock, UnixNanos::from(2 * LATENCY_NS)),
+        0
+    );
+    assert!(rx.try_recv().is_err(), "reset must clear deferred converts");
+    client
+        .process_quote_tick(&create_binary_option_quote(no0.id()))
+        .unwrap();
+    assert!(
+        rx.try_recv().is_err(),
+        "normal data processing must not consume a command cleared by reset"
+    );
+    client.on_position_operation_applied(first_operation_id, &[], None);
+    assert!(
+        cache.borrow().account(&account_id).is_none(),
+        "reset must clear pending operation cash even if the old result is replayed"
+    );
+    for instrument in [&no0, &no1] {
+        let position = cache
+            .borrow()
+            .position(&PositionId::new(format!(
+                "{}-{}",
+                instrument.id(),
+                StrategyId::from("STRATEGY-005")
+            )))
+            .expect("input position must remain")
+            .cloned();
+        assert!(!position.is_closed());
+        assert_eq!(position.quantity, Quantity::from("100"));
+    }
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_sandbox_ctf_convert_rejects_open_short_output_target(trader_id: TraderId) {
+    *msgbus::get_message_bus().borrow_mut() = MessageBus::default();
+    let account_id = AccountId::from("POLYMARKET-095");
+    let strategy_id = StrategyId::from("STRATEGY-001");
+    let market = serde_json::json!({
+        "market_id": "0xnegrisk",
+        "fee_bips": 100,
+        "conditions": [
+            {
+                "question_index": 0,
+                "condition_id": "0xc0",
+                "yes_token_id": "1000",
+                "no_token_id": "1001",
+            },
+            {
+                "question_index": 1,
+                "condition_id": "0xc1",
+                "yes_token_id": "1100",
+                "no_token_id": "1101",
+            },
+        ],
+    });
+    let no0 = make_neg_risk_instrument("0xc0", "1001", "No", &market);
+    let yes1 = make_neg_risk_instrument("0xc1", "1100", "Yes", &market);
+
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
+    let mut config = create_config(trader_id, account_id, no0.id().venue);
+    config.account_type = AccountType::Cash;
+    config.starting_balances = vec![Money::new(1_000.0, Currency::pUSD())];
+    config.base_currency = Some(Currency::pUSD());
+    let core = ExecutionClientCore::new(
+        trader_id,
+        ClientId::new("SANDBOX"),
+        config.venue,
+        config.oms_type,
+        config.account_id,
+        config.account_type,
+        config.base_currency,
+        cache.clone(),
+    );
+    let mut client =
+        SandboxExecutionClient::new(core, config, clock.clone(), cache.clone()).unwrap();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ExecutionEvent>();
+    set_exec_event_sender(tx);
+    setup_account_state_handler(cache.clone());
+
+    for instrument in [&no0, &yes1] {
+        cache
+            .borrow_mut()
+            .add_instrument(instrument.clone())
+            .unwrap();
+    }
+    let input = operation_position(
+        &no0,
+        trader_id,
+        strategy_id,
+        account_id,
+        "100",
+        Decimal::new(50, 0),
+    );
+    cache
+        .borrow_mut()
+        .add_position_without_order(&input, OmsType::Netting)
+        .unwrap();
+    let short = short_position(&yes1, trader_id, strategy_id, account_id, "100");
+    assert!(short.is_short());
+    cache
+        .borrow_mut()
+        .add_position_without_order(&short, OmsType::Netting)
+        .unwrap();
+
+    client.connect().await.unwrap();
+    let engine = Rc::new(RefCell::new(ExecutionEngine::new(
+        clock.clone(),
+        cache.clone(),
+        None,
+    )));
+    ExecutionEngine::register_msgbus_handlers(&engine);
+    let client_id = client.client_id();
+    engine
+        .borrow_mut()
+        .register_client(Box::new(client))
+        .unwrap();
+
+    let operation_id = UUID4::new();
+    engine
+        .borrow()
+        .execute(TradingCommand::SubmitPositionOperation(
+            SubmitPositionOperation::new(
+                trader_id,
+                Some(client_id),
+                strategy_id,
+                operation_id,
+                PositionOperationType::Convert,
+                vec![no0.id()],
+                Some(Quantity::from("100")),
+                UnixNanos::from(1),
+            ),
+        ));
+
+    let result = std::iter::from_fn(|| rx.try_recv().ok())
+        .find_map(|event| match event {
+            ExecutionEvent::PositionOperation(result) if result.operation_id == operation_id => {
+                Some(result)
+            }
+            _ => None,
+        })
+        .expect("expected a position operation result");
+    assert_eq!(result.status, PositionOperationStatus::Rejected);
+    assert!(
+        result
+            .message
+            .as_deref()
+            .is_some_and(|message| message.contains("open short position")),
+        "{:?}",
+        result.message
+    );
+    assert!(
+        !std::iter::from_fn(|| rx.try_recv().ok()).any(|event| matches!(
+            event,
+            ExecutionEvent::PositionOperation(result)
+                if result.operation_id == operation_id
+                    && result.status == PositionOperationStatus::Confirmed
+        ))
+    );
+
+    let input = cache
+        .borrow()
+        .position(&input.id)
+        .expect("input position must remain")
+        .cloned();
+    assert_eq!(input.quantity, Quantity::from("100"));
+    assert!(input.is_open());
+    let short = cache
+        .borrow()
+        .position(&short.id)
+        .expect("output short must remain")
+        .cloned();
+    assert!(short.is_short());
+    assert_eq!(short.quantity, Quantity::from("100"));
+    let cash = cache
+        .borrow()
+        .account(&account_id)
+        .map(|account| account.balances()[&Currency::pUSD()].total.as_decimal());
+    assert_eq!(cash, Some(Decimal::new(1_000, 0)));
 }

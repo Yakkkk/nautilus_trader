@@ -53,9 +53,10 @@ use super::{
         build_reconciliation_position_reports, build_target_order_report,
         cap_order_report_filled_qty, collect_fill_reports_from_trades, filter_unsupported_orders,
         filter_unsupported_positions, instrument_id_from_market_token,
-        normalize_terminal_order_report_quantity, order_status_recovery_status,
-        order_status_scope_awaits_application, position_in_report_scope, trade_touches_venue_order,
-        venue_leg_filled_before_and_quantity, without_order_status_pending_trades,
+        normalize_terminal_order_report_quantity, operation_basis_instruments,
+        order_status_recovery_status, order_status_scope_awaits_application,
+        position_in_report_scope, trade_touches_venue_order, venue_leg_filled_before_and_quantity,
+        without_order_status_pending_trades,
     },
     responses::confirm_modify_replacement,
     settlement::{SettlementRegistry, registry::CollectedFillReports},
@@ -981,9 +982,14 @@ impl PolymarketExecutionClient {
 
     fn report_client(&self) -> PolymarketReportClient {
         self.flush_pending_instruments();
+        let operation_basis = {
+            let cache = self.core.cache();
+            operation_basis_instruments(&cache, self.core.venue, self.core.account_id)
+        };
         PolymarketReportClient {
             clock: self.clock,
             account_id: self.core.account_id,
+            operation_basis,
             http_client: self.http_client.clone(),
             data_api_client: self.data_api_client.clone(),
             token_instruments: self.shared_token_instruments.clone(),
@@ -1015,6 +1021,7 @@ impl PolymarketExecutionClient {
 struct PolymarketReportClient {
     clock: &'static AtomicTime,
     account_id: AccountId,
+    operation_basis: AHashSet<InstrumentId>,
     http_client: PolymarketClobHttpClient,
     data_api_client: PolymarketDataApiHttpClient,
     token_instruments: Arc<AtomicMap<Ustr, InstrumentAny>>,
@@ -1354,6 +1361,7 @@ impl PolymarketReportClient {
             cmd.instrument_id,
             self.load_ids.as_deref(),
             &scope,
+            &self.operation_basis,
         )?;
 
         let balances: AHashMap<_, _> = positions

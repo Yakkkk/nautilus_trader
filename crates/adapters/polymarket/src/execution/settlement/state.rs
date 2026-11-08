@@ -101,6 +101,10 @@ pub(crate) struct SettlementLeg {
     pub application: LegApplication,
     /// The canonical applied fill as published by core, retained for void construction.
     pub applied_fill: Option<Box<OrderFilled>>,
+    /// Cumulative quantity voided by applied correction events.
+    pub voided_qty: Quantity,
+    /// Whether an actual fill event established the applied quantity.
+    pub fill_observed: bool,
     pub authorized: bool,
     pub report_routed: bool,
     pub venue_evidence: bool,
@@ -121,10 +125,22 @@ impl SettlementLeg {
             ts_event: leg.ts_event,
             application: LegApplication::Absent,
             applied_fill: None,
+            voided_qty: Quantity::zero(leg.last_qty.precision),
+            fill_observed: false,
             authorized: false,
             report_routed: false,
             venue_evidence: true,
         }
+    }
+
+    /// Returns whether an observed fill has been fully reversed by cumulative void evidence.
+    pub(crate) fn is_fully_voided(&self) -> bool {
+        self.fill_observed
+            && self.application == LegApplication::VoidObserved
+            && self
+                .applied_fill
+                .as_ref()
+                .is_some_and(|fill| self.voided_qty >= fill.last_qty)
     }
 
     /// Returns `true` when the leg was never sent to core and still requires an application.
@@ -243,6 +259,43 @@ impl SettlementRecord {
         ) || (!self.settlement.is_rest_terminal()
             && leg.application == LegApplication::Absent
             && !leg.report_routed)
+    }
+
+    /// Returns `true` when a managed position operation may rely on this record's inventory.
+    ///
+    /// An admitted stream or REST `CONFIRMED` result is terminal evidence. Every leg must then
+    /// have completed core application: buffered, pending, and report-routed fills are not
+    /// applied inventory. A REST `FAILED` result requires each applied fill to have been fully
+    /// reversed by its cumulative void evidence, while legs with no fill to void remain valid
+    /// tombstones.
+    ///
+    /// A record whose legs were all fully voided in core holds no inventory. It therefore does
+    /// not block by itself even without terminal venue evidence, which a synthetic inferred trade
+    /// ID can never obtain. A partial void leaves remaining inventory and still blocks.
+    pub(crate) fn is_operation_input_ready(&self) -> bool {
+        if self.hard_fault.is_some() || self.awaits_resolution() {
+            return false;
+        }
+
+        if !self.legs.is_empty() && self.legs.iter().all(|leg| leg.is_fully_voided()) {
+            return true;
+        }
+
+        match self.settlement {
+            SettlementState::StreamConfirmed | SettlementState::RestConfirmed => {
+                self.legs.iter().all(|leg| {
+                    matches!(
+                        leg.application,
+                        LegApplication::FillObserved | LegApplication::VoidObserved
+                    )
+                })
+            }
+            SettlementState::RestFailed => self.legs.iter().all(|leg| {
+                leg.is_fully_voided()
+                    || (leg.application == LegApplication::Absent && !leg.report_routed)
+            }),
+            SettlementState::Provisional | SettlementState::Quarantined => false,
+        }
     }
 
     /// Returns `true` when an order-status report must not treat this record's fills as covered.

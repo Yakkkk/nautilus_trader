@@ -37,6 +37,7 @@ use nautilus_backtest::{
 };
 use nautilus_common::{
     cache::Cache,
+    clients::ExecutionClient,
     clock::VirtualClock,
     messages::execution::{CancelOrder, ModifyOrder, SubmitOrder, SubmitOrderList, TradingCommand},
     msgbus::{
@@ -61,13 +62,13 @@ use nautilus_execution::{
 use nautilus_model::{
     accounts::{Account, AccountAny, CashAccount, MarginAccount},
     data::{
-        Bar, BarType, BookOrder, Data, FundingRateUpdate, InstrumentStatus, MarkPriceUpdate,
-        OrderBookDelta, OrderBookDeltas, QuoteTick, TradeTick,
+        Bar, BarType, BookOrder, Data, FundingRateUpdate, InstrumentClose, InstrumentStatus,
+        MarkPriceUpdate, OrderBookDelta, OrderBookDeltas, QuoteTick, TradeTick,
     },
     enums::{
         AccountType, AggressorSide, AssetClass, BookAction, BookType, ContingencyType,
-        LiquiditySide, MarketStatus, MarketStatusAction, OmsType, OptionKind, OrderSide,
-        OrderStatus, OrderType, PositionAdjustmentType,
+        InstrumentCloseType, LiquiditySide, MarketStatus, MarketStatusAction, OmsType, OptionKind,
+        OrderSide, OrderStatus, OrderType, PositionAdjustmentType,
     },
     events::{
         AccountState, FundingSettlement, OrderEventAny, OrderFilled, PositionEvent,
@@ -86,7 +87,8 @@ use nautilus_model::{
         },
     },
     orders::{Order, OrderAny, OrderList, OrderTestBuilder, stubs::TestOrderEventStubs},
-    position::Position,
+    position::{Position, PositionReplayEvent},
+    position_operation::{PositionOperationDirection, PositionOperationLeg, PositionOperationType},
     stubs::TestDefault,
     types::{
         AccountBalance, Currency, MarginBalance, Money, Price, Quantity, money::MONEY_RAW_MAX,
@@ -97,6 +99,7 @@ use nautilus_model::{
 use nautilus_model::{
     instruments::stubs::currency_pair_btcusdt, orders::stubs::OrderFilledTestBuilder,
 };
+use nautilus_portfolio::Portfolio;
 use nautilus_testkit::cache::TestCacheDatabaseControl;
 use parking_lot::Mutex;
 use rstest::rstest;
@@ -7792,4 +7795,2260 @@ fn test_same_instrument_oto_resize_preserves_valid_quantity_precision(
             .order_exists(child_id),
         !full_trigger
     );
+}
+
+fn make_neg_risk_instrument(
+    condition_id: &str,
+    token_id: &str,
+    outcome: &str,
+    market: &serde_json::Value,
+) -> InstrumentAny {
+    make_neg_risk_instrument_version(condition_id, token_id, outcome, market, "v1")
+}
+
+fn make_neg_risk_instrument_version(
+    condition_id: &str,
+    token_id: &str,
+    outcome: &str,
+    market: &serde_json::Value,
+    version: &str,
+) -> InstrumentAny {
+    use nautilus_model::instruments::BinaryOption;
+
+    let info = nautilus_core::Params::new(
+        [
+            (
+                "token_id".to_string(),
+                serde_json::Value::String(token_id.to_string()),
+            ),
+            (
+                "condition_id".to_string(),
+                serde_json::Value::String(condition_id.to_string()),
+            ),
+            ("neg_risk".to_string(), serde_json::Value::Bool(true)),
+            (
+                "market_version".to_string(),
+                serde_json::Value::String(version.to_string()),
+            ),
+            ("neg_risk_market".to_string(), market.clone()),
+        ]
+        .into(),
+    );
+    let instrument = BinaryOption::builder()
+        .instrument_id(InstrumentId::from(
+            format!("{condition_id}-{token_id}.POLYMARKET").as_str(),
+        ))
+        .raw_symbol(Symbol::new(format!("{condition_id}-{token_id}")))
+        .asset_class(AssetClass::Alternative)
+        .currency(Currency::pUSD())
+        .activation_ns(UnixNanos::default())
+        .expiration_ns(UnixNanos::from(1_000_000_000_000u64))
+        .price_precision(2)
+        .size_precision(6)
+        .price_increment(Price::from("0.01"))
+        .size_increment(Quantity::from("0.000001"))
+        .outcome(Ustr::from(outcome))
+        .info(info)
+        .ts_event(UnixNanos::default())
+        .ts_init(UnixNanos::default())
+        .build()
+        .unwrap();
+
+    InstrumentAny::BinaryOption(instrument)
+}
+
+fn operation_position(
+    instrument: &InstrumentAny,
+    trader_id: TraderId,
+    strategy_id: StrategyId,
+    account_id: AccountId,
+    quantity: &str,
+    cost: Decimal,
+) -> Position {
+    let position_id = PositionId::new(format!("{}-{strategy_id}", instrument.id()));
+    let leg = PositionOperationLeg {
+        operation_id: UUID4::new(),
+        operation: PositionOperationType::Split,
+        direction: PositionOperationDirection::Open,
+        trader_id,
+        strategy_id,
+        account_id,
+        instrument_id: instrument.id(),
+        position_id,
+        quantity: Quantity::from(quantity),
+        cost,
+        income: None,
+        settled: false,
+        event_id: UUID4::new(),
+        ts_event: UnixNanos::from(1),
+        ts_init: UnixNanos::from(2),
+    };
+    Position::new_from_operation_checked(instrument, leg).unwrap()
+}
+
+fn short_position(
+    instrument: &InstrumentAny,
+    trader_id: TraderId,
+    strategy_id: StrategyId,
+    account_id: AccountId,
+    quantity: &str,
+) -> Position {
+    let position_id = PositionId::new(format!("{}-{strategy_id}", instrument.id()));
+    let order = OrderTestBuilder::new(OrderType::Market)
+        .trader_id(trader_id)
+        .strategy_id(strategy_id)
+        .instrument_id(instrument.id())
+        .side(OrderSide::Sell)
+        .quantity(Quantity::from(quantity))
+        .build();
+    let event = TestOrderEventStubs::filled(
+        &order,
+        instrument,
+        Some(TradeId::new("SHORT-BACKTEST")),
+        Some(position_id),
+        Some(Price::from("0.50")),
+        Some(Quantity::from(quantity)),
+        Some(LiquiditySide::Taker),
+        None,
+        None,
+        Some(account_id),
+    );
+    let OrderEventAny::Filled(fill) = event else {
+        panic!("expected a filled event");
+    };
+    Position::new(instrument, fill)
+}
+
+#[rstest]
+fn test_backtest_ctf_convert_applies_effects_and_cash() {
+    use nautilus_common::{
+        messages::execution::{
+            PositionOperationEffects, PositionOperationResult, PositionOperationStatus,
+            PositionOperationTokenAmount, QueryPositionOperation, SubmitPositionOperation,
+        },
+        msgbus::ShareableMessageHandler,
+    };
+    use nautilus_model::position_operation::PositionOperationType;
+
+    let venue = Venue::new("POLYMARKET");
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    let clock = Rc::new(RefCell::new(VirtualClock::new()));
+    let config = SimulatedVenueConfig::builder()
+        .venue(venue)
+        .oms_type(OmsType::Netting)
+        .account_type(AccountType::Cash)
+        .book_type(BookType::L1_MBP)
+        .starting_balances(vec![Money::new(1_000.0, Currency::pUSD())])
+        .default_leverage(Decimal::ONE)
+        .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
+        .build()
+        .unwrap();
+    let exchange = Rc::new(RefCell::new(
+        SimulatedExchange::new(config, cache.clone(), clock.clone()).unwrap(),
+    ));
+
+    let market = serde_json::json!({
+        "market_id": "0xnegrisk",
+        "fee_bips": 100,
+        "conditions": [
+            {
+                "question_index": 0,
+                "condition_id": "0xc0",
+                "yes_token_id": "1000",
+                "no_token_id": "1001",
+            },
+            {
+                "question_index": 1,
+                "condition_id": "0xc1",
+                "yes_token_id": "1100",
+                "no_token_id": "1101",
+            },
+            {
+                "question_index": 2,
+                "condition_id": "0xc2",
+                "yes_token_id": "1200",
+                "no_token_id": "1201",
+            },
+        ],
+    });
+    let no0 = make_neg_risk_instrument("0xc0", "1001", "No", &market);
+    let no1 = make_neg_risk_instrument("0xc1", "1101", "No", &market);
+    let yes2 = make_neg_risk_instrument("0xc2", "1200", "Yes", &market);
+    for instrument in [&no0, &no1, &yes2] {
+        exchange
+            .borrow_mut()
+            .add_instrument(instrument.clone())
+            .unwrap();
+        cache
+            .borrow_mut()
+            .add_instrument(instrument.clone())
+            .unwrap();
+    }
+
+    for instrument in [&no0, &no1] {
+        let position = operation_position(
+            instrument,
+            TraderId::test_default(),
+            StrategyId::test_default(),
+            AccountId::test_default(),
+            "100",
+            Decimal::new(50, 0),
+        );
+        cache
+            .borrow_mut()
+            .add_position_without_order(&position, OmsType::Netting)
+            .unwrap();
+    }
+
+    let execution_client = BacktestExecutionClient::new(
+        TraderId::test_default(),
+        AccountId::test_default(),
+        &exchange,
+        cache.clone(),
+        clock.clone(),
+        None,
+        None,
+    );
+    exchange
+        .borrow_mut()
+        .register_client(Rc::new(execution_client.clone()));
+
+    let engine = Rc::new(RefCell::new(ExecutionEngine::new(
+        clock,
+        cache.clone(),
+        None,
+    )));
+    ExecutionEngine::register_msgbus_handlers(&engine);
+    engine
+        .borrow_mut()
+        .register_client(Box::new(execution_client.clone()))
+        .unwrap();
+
+    let results = Rc::new(RefCell::new(Vec::new()));
+    let captured = results.clone();
+    msgbus::subscribe_any(
+        nautilus_common::msgbus::switchboard::get_event_position_operation_topic(
+            StrategyId::test_default(),
+        )
+        .into(),
+        ShareableMessageHandler::from_typed(move |result: &PositionOperationResult| {
+            captured.borrow_mut().push(result.clone());
+        }),
+        None,
+    );
+    let account_cache = cache.clone();
+    msgbus::register_account_state_endpoint(
+        MessagingSwitchboard::portfolio_update_account(),
+        TypedHandler::from(move |state: &AccountState| {
+            account_cache
+                .borrow_mut()
+                .update_account_state(state)
+                .unwrap();
+        }),
+    );
+
+    let operation_id = UUID4::new();
+    let command = SubmitPositionOperation::new(
+        TraderId::test_default(),
+        Some(execution_client.client_id()),
+        StrategyId::test_default(),
+        operation_id,
+        PositionOperationType::Convert,
+        vec![no0.id(), no1.id()],
+        Some(Quantity::from("100")),
+        UnixNanos::from(1),
+    );
+    engine
+        .borrow()
+        .execute(TradingCommand::SubmitPositionOperation(command));
+    let second_operation_id = UUID4::new();
+    let conflicting = SubmitPositionOperation::new(
+        TraderId::test_default(),
+        Some(execution_client.client_id()),
+        StrategyId::test_default(),
+        second_operation_id,
+        PositionOperationType::Convert,
+        vec![no0.id(), no1.id()],
+        Some(Quantity::from("100")),
+        UnixNanos::from(1),
+    );
+    engine
+        .borrow()
+        .execute(TradingCommand::SubmitPositionOperation(conflicting));
+    exchange
+        .borrow_mut()
+        .process(UnixNanos::from(1_000_000_000));
+
+    // A normal sell of a reserved input must be rejected while the convert awaits application.
+    let reserved_sell = OrderTestBuilder::new(OrderType::Market)
+        .instrument_id(no0.id())
+        .strategy_id(StrategyId::test_default())
+        .client_order_id(ClientOrderId::from("O-RESERVED-SELL"))
+        .side(OrderSide::Sell)
+        .quantity(Quantity::from("100"))
+        .build();
+    cache
+        .borrow_mut()
+        .add_order(
+            reserved_sell.clone(),
+            None,
+            Some(execution_client.client_id()),
+            false,
+        )
+        .unwrap();
+    exchange
+        .borrow_mut()
+        .process_quote_tick(&QuoteTick::new(
+            no0.id(),
+            Price::from("0.50"),
+            Price::from("0.51"),
+            Quantity::from("100"),
+            Quantity::from("100"),
+            UnixNanos::from(1),
+            UnixNanos::from(1),
+        ))
+        .unwrap();
+    exchange
+        .borrow_mut()
+        .send(TradingCommand::SubmitOrder(SubmitOrder::from_order(
+            &reserved_sell,
+            TraderId::test_default(),
+            Some(execution_client.client_id()),
+            None,
+            UUID4::new(),
+            UnixNanos::from(1),
+        )));
+    exchange
+        .borrow_mut()
+        .process(UnixNanos::from(1_500_000_000));
+    assert_eq!(
+        cache
+            .borrow()
+            .order(&reserved_sell.client_order_id())
+            .unwrap()
+            .status(),
+        OrderStatus::Rejected,
+        "a sell of reserved convert inventory must be rejected"
+    );
+
+    assert!(
+        cache.borrow().account(&AccountId::test_default()).is_none(),
+        "conversion cash must wait for core application"
+    );
+
+    execution_client.drain_queued_position_operation_results();
+
+    let published = results.borrow().clone();
+    assert_eq!(published.len(), 2);
+    let result = &published[0];
+    assert_eq!(result.operation_id, operation_id);
+    assert_eq!(
+        result.status,
+        PositionOperationStatus::Confirmed,
+        "{:?}",
+        result.message
+    );
+    let effects = result
+        .effects
+        .clone()
+        .expect("confirmed convert carries effects");
+    assert_eq!(effects.collateral_delta, "99");
+    assert_eq!(effects.spent.len(), 2);
+    assert!(effects.spent.iter().all(|amount| amount.quantity == "100"));
+    assert_eq!(
+        effects.received,
+        vec![PositionOperationTokenAmount {
+            token_id: "1200".to_string(),
+            quantity: "99".to_string(),
+        }]
+    );
+
+    // The conflicting operation never becomes venue inventory; its inputs stay reserved by the
+    // first operation until core application completes.
+    let rejected = &published[1];
+    assert_eq!(rejected.operation_id, second_operation_id);
+    assert_eq!(rejected.status, PositionOperationStatus::Rejected);
+    assert!(rejected.effects.is_none());
+    assert!(
+        rejected
+            .message
+            .as_deref()
+            .unwrap()
+            .contains("after pending operations"),
+        "{:?}",
+        rejected.message
+    );
+
+    execution_client.drain_queued_position_operation_results();
+    let published = results.borrow().clone();
+    assert_eq!(published.len(), 3);
+    assert_eq!(published[2].operation_id, operation_id);
+    assert_eq!(
+        published[2].status,
+        PositionOperationStatus::Applied,
+        "the core must notify the strategy that application completed",
+    );
+    assert!(published[2].effects.is_none());
+
+    let account = cache
+        .borrow()
+        .account(&AccountId::test_default())
+        .expect("expected a simulated account state")
+        .clone();
+    assert_eq!(
+        account.balances()[&Currency::pUSD()].total.as_decimal(),
+        Decimal::from_str("1099").unwrap()
+    );
+
+    let no0_position = cache
+        .borrow()
+        .position(&PositionId::new(format!(
+            "{}-{}",
+            no0.id(),
+            StrategyId::test_default()
+        )))
+        .expect("NO input position must exist")
+        .cloned();
+    let no1_position = cache
+        .borrow()
+        .position(&PositionId::new(format!(
+            "{}-{}",
+            no1.id(),
+            StrategyId::test_default()
+        )))
+        .expect("NO input position must exist")
+        .cloned();
+    let yes_position = cache
+        .borrow()
+        .position(&PositionId::new(format!(
+            "{}-{}",
+            yes2.id(),
+            StrategyId::test_default()
+        )))
+        .expect("YES output position must exist")
+        .cloned();
+    assert!(no0_position.is_closed());
+    assert!(no1_position.is_closed());
+    assert_eq!(yes_position.quantity, Quantity::from("99"));
+    assert_eq!(yes_position.cost_open, Decimal::from_str("1").unwrap());
+
+    engine
+        .borrow()
+        .execute(TradingCommand::QueryPositionOperation(
+            QueryPositionOperation::new(
+                TraderId::test_default(),
+                Some(execution_client.client_id()),
+                StrategyId::test_default(),
+                operation_id,
+                UnixNanos::from(3),
+            ),
+        ));
+    exchange
+        .borrow_mut()
+        .process(UnixNanos::from(3_000_000_000));
+    execution_client.drain_queued_position_operation_results();
+
+    let published = results.borrow().clone();
+    assert_eq!(published.len(), 4);
+    assert_eq!(published[3].operation_id, operation_id);
+    assert_eq!(
+        published[3].status,
+        PositionOperationStatus::Applied,
+        "the exchange query must reflect core application",
+    );
+
+    // Inject an anomalous Confirmed result for exhausted inputs. The core must not apply it or
+    // add its cash a second time.
+    let injected = PositionOperationResult::new(
+        TraderId::test_default(),
+        StrategyId::test_default(),
+        execution_client.client_id(),
+        AccountId::test_default(),
+        UUID4::new(),
+        PositionOperationType::Convert,
+        PositionOperationStatus::Confirmed,
+        vec![no0.id(), no1.id(), yes2.id()],
+        None,
+        None,
+        None,
+        Some(PositionOperationEffects {
+            received: vec![PositionOperationTokenAmount {
+                token_id: "1200".to_string(),
+                quantity: "99".to_string(),
+            }],
+            spent: vec![
+                PositionOperationTokenAmount {
+                    token_id: "1001".to_string(),
+                    quantity: "100".to_string(),
+                },
+                PositionOperationTokenAmount {
+                    token_id: "1101".to_string(),
+                    quantity: "100".to_string(),
+                },
+            ],
+            collateral_delta: "99".to_string(),
+            payouts: Vec::new(),
+        }),
+        UUID4::new(),
+        UnixNanos::from(4_000_000_000),
+        UnixNanos::from(4_000_000_001),
+    );
+    msgbus::send_any_value(
+        MessagingSwitchboard::exec_engine_position_operation(),
+        &injected,
+    );
+
+    let account = cache
+        .borrow()
+        .account(&AccountId::test_default())
+        .expect("expected a simulated account state")
+        .clone();
+    assert_eq!(
+        account.balances()[&Currency::pUSD()].total.as_decimal(),
+        Decimal::from_str("1099").unwrap()
+    );
+    let yes_after = cache
+        .borrow()
+        .position(&PositionId::new(format!(
+            "{}-{}",
+            yes2.id(),
+            StrategyId::test_default()
+        )))
+        .expect("YES output position must exist")
+        .cloned();
+    assert_eq!(yes_after.quantity, Quantity::from("99"));
+    assert_eq!(
+        results.borrow().len(),
+        4,
+        "an anomalous Confirmed result must not be applied"
+    );
+}
+
+#[rstest]
+fn test_backtest_convert_rejects_pending_clob_sell_fill() {
+    use nautilus_common::{
+        messages::execution::{
+            PositionOperationResult, PositionOperationStatus, SubmitPositionOperation,
+        },
+        msgbus::ShareableMessageHandler,
+    };
+    use nautilus_model::position_operation::PositionOperationType;
+
+    let venue = Venue::new("POLYMARKET");
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    let clock = Rc::new(RefCell::new(VirtualClock::new()));
+    let config = SimulatedVenueConfig::builder()
+        .venue(venue)
+        .oms_type(OmsType::Netting)
+        .account_type(AccountType::Cash)
+        .book_type(BookType::L1_MBP)
+        .starting_balances(vec![Money::new(1_000.0, Currency::pUSD())])
+        .default_leverage(Decimal::ONE)
+        .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
+        .build()
+        .unwrap();
+    let exchange = Rc::new(RefCell::new(
+        SimulatedExchange::new(config, cache.clone(), clock.clone()).unwrap(),
+    ));
+
+    let market = serde_json::json!({
+        "market_id": "0xnegrisk",
+        "fee_bips": 100,
+        "conditions": [
+            {
+                "question_index": 0,
+                "condition_id": "0xc0",
+                "yes_token_id": "1000",
+                "no_token_id": "1001",
+            },
+            {
+                "question_index": 1,
+                "condition_id": "0xc1",
+                "yes_token_id": "1100",
+                "no_token_id": "1101",
+            },
+            {
+                "question_index": 2,
+                "condition_id": "0xc2",
+                "yes_token_id": "1200",
+                "no_token_id": "1201",
+            },
+        ],
+    });
+    let no0 = make_neg_risk_instrument("0xc0", "1001", "No", &market);
+    let no1 = make_neg_risk_instrument("0xc1", "1101", "No", &market);
+    let yes2 = make_neg_risk_instrument("0xc2", "1200", "Yes", &market);
+    for instrument in [&no0, &no1, &yes2] {
+        exchange
+            .borrow_mut()
+            .add_instrument(instrument.clone())
+            .unwrap();
+        cache
+            .borrow_mut()
+            .add_instrument(instrument.clone())
+            .unwrap();
+    }
+
+    for instrument in [&no0, &no1] {
+        let position = operation_position(
+            instrument,
+            TraderId::test_default(),
+            StrategyId::test_default(),
+            AccountId::test_default(),
+            "100",
+            Decimal::new(50, 0),
+        );
+        cache
+            .borrow_mut()
+            .add_position_without_order(&position, OmsType::Netting)
+            .unwrap();
+    }
+
+    let execution_client = BacktestExecutionClient::new(
+        TraderId::test_default(),
+        AccountId::test_default(),
+        &exchange,
+        cache.clone(),
+        clock.clone(),
+        None,
+        None,
+    );
+    exchange
+        .borrow_mut()
+        .register_client(Rc::new(execution_client.clone()));
+
+    // No engine msgbus handlers: the sell fill stays pending in the matching engine, as it would
+    // between a venue response and core application.
+    let engine = Rc::new(RefCell::new(ExecutionEngine::new(
+        clock,
+        cache.clone(),
+        None,
+    )));
+    engine
+        .borrow_mut()
+        .register_client(Box::new(execution_client.clone()))
+        .unwrap();
+
+    let results = Rc::new(RefCell::new(Vec::new()));
+    let captured = results.clone();
+    msgbus::subscribe_any(
+        nautilus_common::msgbus::switchboard::get_event_position_operation_topic(
+            StrategyId::test_default(),
+        )
+        .into(),
+        ShareableMessageHandler::from_typed(move |result: &PositionOperationResult| {
+            captured.borrow_mut().push(result.clone());
+        }),
+        None,
+    );
+
+    exchange
+        .borrow_mut()
+        .process_quote_tick(&QuoteTick::new(
+            no0.id(),
+            Price::from("0.50"),
+            Price::from("0.51"),
+            Quantity::new(100.0, 6),
+            Quantity::new(100.0, 6),
+            UnixNanos::from(1),
+            UnixNanos::from(1),
+        ))
+        .unwrap();
+
+    let sell = OrderTestBuilder::new(OrderType::Market)
+        .instrument_id(no0.id())
+        .strategy_id(StrategyId::test_default())
+        .client_order_id(ClientOrderId::from("O-PENDING-SELL"))
+        .side(OrderSide::Sell)
+        .quantity(Quantity::from("100"))
+        .build();
+    cache
+        .borrow_mut()
+        .add_order(
+            sell.clone(),
+            None,
+            Some(execution_client.client_id()),
+            false,
+        )
+        .unwrap();
+    exchange
+        .borrow_mut()
+        .send(TradingCommand::SubmitOrder(SubmitOrder::from_order(
+            &sell,
+            TraderId::test_default(),
+            Some(execution_client.client_id()),
+            None,
+            UUID4::new(),
+            UnixNanos::from(1),
+        )));
+    exchange
+        .borrow_mut()
+        .process(UnixNanos::from(1_000_000_000));
+
+    let no0_position_id = PositionId::new(format!("{}-{}", no0.id(), StrategyId::test_default()));
+    assert_eq!(
+        cache.borrow().position(&no0_position_id).unwrap().quantity,
+        Quantity::from("100"),
+        "the sell fill must remain pending core application"
+    );
+    let pending = exchange
+        .borrow()
+        .get_matching_engine(&no0.id())
+        .unwrap()
+        .pending_fill_quantity(no0_position_id)
+        .unwrap();
+    assert_eq!(
+        pending,
+        dec!(-100),
+        "the sell fill must be recorded as pending"
+    );
+
+    let operation_id = UUID4::new();
+    let convert = SubmitPositionOperation::new(
+        TraderId::test_default(),
+        Some(execution_client.client_id()),
+        StrategyId::test_default(),
+        operation_id,
+        PositionOperationType::Convert,
+        vec![no0.id(), no1.id()],
+        Some(Quantity::from("100")),
+        UnixNanos::from(1),
+    );
+    engine
+        .borrow()
+        .execute(TradingCommand::SubmitPositionOperation(convert));
+    exchange
+        .borrow_mut()
+        .process(UnixNanos::from(2_000_000_000));
+    execution_client.drain_queued_position_operation_results();
+
+    let captured = results.borrow();
+    let result = captured
+        .iter()
+        .find(|result| result.operation_id == operation_id)
+        .expect("expected a position operation result");
+    assert_eq!(result.status, PositionOperationStatus::Rejected);
+    assert!(result.effects.is_none());
+    assert!(
+        result
+            .message
+            .as_deref()
+            .unwrap()
+            .contains("after pending operations and fills"),
+        "{:?}",
+        result.message
+    );
+}
+
+#[rstest]
+fn test_backtest_partial_convert_settles_remainder_after_applied_callback() {
+    use nautilus_common::messages::execution::SubmitPositionOperation;
+    use nautilus_model::position_operation::PositionOperationType;
+
+    let venue = Venue::new("POLYMARKET");
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    let clock = Rc::new(RefCell::new(VirtualClock::new()));
+    let config = SimulatedVenueConfig::builder()
+        .venue(venue)
+        .oms_type(OmsType::Netting)
+        .account_type(AccountType::Cash)
+        .book_type(BookType::L1_MBP)
+        .starting_balances(vec![Money::new(1_000.0, Currency::pUSD())])
+        .default_leverage(Decimal::ONE)
+        .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
+        .build()
+        .unwrap();
+    let exchange = Rc::new(RefCell::new(
+        SimulatedExchange::new(config, cache.clone(), clock.clone()).unwrap(),
+    ));
+
+    let market = serde_json::json!({
+        "market_id": "0xnegrisk",
+        "fee_bips": 100,
+        "conditions": [
+            {
+                "question_index": 0,
+                "condition_id": "0xc0",
+                "yes_token_id": "1000",
+                "no_token_id": "1001",
+            },
+            {
+                "question_index": 1,
+                "condition_id": "0xc1",
+                "yes_token_id": "1100",
+                "no_token_id": "1101",
+            },
+            {
+                "question_index": 2,
+                "condition_id": "0xc2",
+                "yes_token_id": "1200",
+                "no_token_id": "1201",
+            },
+        ],
+    });
+    let no0 = make_neg_risk_instrument("0xc0", "1001", "No", &market);
+    let no1 = make_neg_risk_instrument("0xc1", "1101", "No", &market);
+    let yes2 = make_neg_risk_instrument("0xc2", "1200", "Yes", &market);
+    for instrument in [&no0, &no1, &yes2] {
+        exchange
+            .borrow_mut()
+            .add_instrument(instrument.clone())
+            .unwrap();
+        cache
+            .borrow_mut()
+            .add_instrument(instrument.clone())
+            .unwrap();
+    }
+    for instrument in [&no0, &no1] {
+        let position = operation_position(
+            instrument,
+            TraderId::test_default(),
+            StrategyId::test_default(),
+            AccountId::test_default(),
+            "200",
+            Decimal::new(100, 0),
+        );
+        cache
+            .borrow_mut()
+            .add_position_without_order(&position, OmsType::Netting)
+            .unwrap();
+    }
+
+    let _portfolio = Rc::new(RefCell::new(Portfolio::new(
+        clock.clone(),
+        cache.clone(),
+        None,
+    )));
+    let execution_client = BacktestExecutionClient::new(
+        TraderId::test_default(),
+        AccountId::test_default(),
+        &exchange,
+        cache.clone(),
+        clock.clone(),
+        None,
+        None,
+    );
+    exchange
+        .borrow_mut()
+        .register_client(Rc::new(execution_client.clone()));
+    exchange.borrow_mut().initialize_account();
+
+    let engine = Rc::new(RefCell::new(ExecutionEngine::new(
+        clock,
+        cache.clone(),
+        None,
+    )));
+    ExecutionEngine::register_msgbus_handlers(&engine);
+    engine
+        .borrow_mut()
+        .register_client(Box::new(execution_client.clone()))
+        .unwrap();
+
+    // A book price well below the authoritative payout distinguishes the deferred close price.
+    exchange
+        .borrow_mut()
+        .process_quote_tick(&QuoteTick::new(
+            no0.id(),
+            Price::from("0.40"),
+            Price::from("0.41"),
+            Quantity::new(100.0, 6),
+            Quantity::new(100.0, 6),
+            UnixNanos::from(1),
+            UnixNanos::from(1),
+        ))
+        .unwrap();
+
+    let operation_id = UUID4::new();
+    let convert = SubmitPositionOperation::new(
+        TraderId::test_default(),
+        Some(execution_client.client_id()),
+        StrategyId::test_default(),
+        operation_id,
+        PositionOperationType::Convert,
+        vec![no0.id(), no1.id()],
+        Some(Quantity::from("100")),
+        UnixNanos::from(1),
+    );
+    engine
+        .borrow()
+        .execute(TradingCommand::SubmitPositionOperation(convert));
+    exchange
+        .borrow_mut()
+        .process(UnixNanos::from(1_000_000_000));
+
+    let close = InstrumentClose::new(
+        no0.id(),
+        Price::from("1"),
+        InstrumentCloseType::ContractExpired,
+        UnixNanos::from(2),
+        UnixNanos::from(2),
+    );
+    exchange
+        .borrow_mut()
+        .process_instrument_close(close)
+        .unwrap();
+
+    // Applying the confirmed result releases the reservation from the engine callback. The
+    // remainder's expiration events are queued and drained after the engine borrow is released.
+    execution_client.drain_queued_position_operation_results();
+
+    let no0_position_id = PositionId::new(format!("{}-{}", no0.id(), StrategyId::test_default()));
+    let no0_position = cache
+        .borrow()
+        .position(&no0_position_id)
+        .expect("NO0 position must exist")
+        .cloned();
+    assert!(no0_position.is_closed());
+    assert_eq!(no0_position.quantity, Quantity::zero(6));
+
+    let no1_position_id = PositionId::new(format!("{}-{}", no1.id(), StrategyId::test_default()));
+    let no1_position = cache
+        .borrow()
+        .position(&no1_position_id)
+        .expect("NO1 position must exist")
+        .cloned();
+    assert!(no1_position.is_open());
+    assert_eq!(no1_position.quantity, Quantity::from("100"));
+
+    let yes_position = cache
+        .borrow()
+        .position(&PositionId::new(format!(
+            "{}-{}",
+            yes2.id(),
+            StrategyId::test_default()
+        )))
+        .expect("YES output position must exist")
+        .cloned();
+    assert_eq!(yes_position.quantity, Quantity::from("99"));
+
+    let account = cache
+        .borrow()
+        .account(&AccountId::test_default())
+        .expect("expected a simulated account state")
+        .clone();
+    assert_eq!(
+        account.balances()[&Currency::pUSD()].total.as_decimal(),
+        Decimal::from_str("1199").unwrap(),
+        "cash must include the direct return and the remainder payout at the close price"
+    );
+}
+
+#[rstest]
+fn test_backtest_rejects_v2_ctf_convert() {
+    use nautilus_common::{
+        messages::execution::{
+            PositionOperationResult, PositionOperationStatus, SubmitPositionOperation,
+        },
+        msgbus::ShareableMessageHandler,
+    };
+    use nautilus_model::position_operation::PositionOperationType;
+
+    let venue = Venue::new("POLYMARKET");
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    let clock = Rc::new(RefCell::new(VirtualClock::new()));
+    let config = SimulatedVenueConfig::builder()
+        .venue(venue)
+        .oms_type(OmsType::Netting)
+        .account_type(AccountType::Cash)
+        .book_type(BookType::L1_MBP)
+        .starting_balances(vec![Money::new(1_000.0, Currency::pUSD())])
+        .default_leverage(Decimal::ONE)
+        .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
+        .build()
+        .unwrap();
+    let exchange = Rc::new(RefCell::new(
+        SimulatedExchange::new(config, cache.clone(), clock.clone()).unwrap(),
+    ));
+
+    let market = serde_json::json!({
+        "market_id": "0xnegrisk",
+        "fee_bips": 0,
+        "conditions": [
+            {
+                "question_index": 0,
+                "condition_id": "0xc0",
+                "yes_token_id": "1000",
+                "no_token_id": "1001",
+            },
+            {
+                "question_index": 1,
+                "condition_id": "0xc1",
+                "yes_token_id": "1100",
+                "no_token_id": "1101",
+            },
+            {
+                "question_index": 2,
+                "condition_id": "0xc2",
+                "yes_token_id": "1200",
+                "no_token_id": "1201",
+            },
+        ],
+    });
+    let no0 = make_neg_risk_instrument_version("0xc0", "1001", "No", &market, "v2");
+    let no1 = make_neg_risk_instrument("0xc1", "1101", "No", &market);
+    let yes2 = make_neg_risk_instrument("0xc2", "1200", "Yes", &market);
+    for instrument in [&no0, &no1, &yes2] {
+        exchange
+            .borrow_mut()
+            .add_instrument(instrument.clone())
+            .unwrap();
+        cache
+            .borrow_mut()
+            .add_instrument(instrument.clone())
+            .unwrap();
+    }
+    for instrument in [&no0, &no1] {
+        let position = operation_position(
+            instrument,
+            TraderId::test_default(),
+            StrategyId::test_default(),
+            AccountId::test_default(),
+            "100",
+            Decimal::new(50, 0),
+        );
+        cache
+            .borrow_mut()
+            .add_position_without_order(&position, OmsType::Netting)
+            .unwrap();
+    }
+
+    let execution_client = BacktestExecutionClient::new(
+        TraderId::test_default(),
+        AccountId::test_default(),
+        &exchange,
+        cache.clone(),
+        clock.clone(),
+        None,
+        None,
+    );
+    exchange
+        .borrow_mut()
+        .register_client(Rc::new(execution_client.clone()));
+    let engine = Rc::new(RefCell::new(ExecutionEngine::new(
+        clock,
+        cache.clone(),
+        None,
+    )));
+    ExecutionEngine::register_msgbus_handlers(&engine);
+    engine
+        .borrow_mut()
+        .register_client(Box::new(execution_client.clone()))
+        .unwrap();
+
+    let results = Rc::new(RefCell::new(Vec::<PositionOperationResult>::new()));
+    let captured = results.clone();
+    msgbus::subscribe_any(
+        nautilus_common::msgbus::switchboard::get_event_position_operation_topic(
+            StrategyId::test_default(),
+        )
+        .into(),
+        ShareableMessageHandler::from_typed(move |result: &PositionOperationResult| {
+            captured.borrow_mut().push(result.clone());
+        }),
+        None,
+    );
+
+    let command = SubmitPositionOperation::new(
+        TraderId::test_default(),
+        Some(execution_client.client_id()),
+        StrategyId::test_default(),
+        UUID4::new(),
+        PositionOperationType::Convert,
+        vec![no0.id(), no1.id()],
+        Some(Quantity::from("100")),
+        UnixNanos::from(1),
+    );
+    engine
+        .borrow()
+        .execute(TradingCommand::SubmitPositionOperation(command));
+    exchange
+        .borrow_mut()
+        .process(UnixNanos::from(1_000_000_000));
+    execution_client.drain_queued_position_operation_results();
+
+    let result = results
+        .borrow()
+        .first()
+        .cloned()
+        .expect("expected a position operation result");
+    assert_eq!(result.status, PositionOperationStatus::Rejected);
+    assert!(
+        result
+            .message
+            .as_deref()
+            .is_some_and(|message| message.contains("V2 CTF convert"))
+    );
+    assert!(cache.borrow().account(&AccountId::test_default()).is_none());
+}
+
+#[rstest]
+#[case(AccountType::Margin, OmsType::Netting)]
+#[case(AccountType::Cash, OmsType::Hedging)]
+fn test_backtest_rejects_convert_outside_cash_netting(
+    #[case] account_type: AccountType,
+    #[case] oms_type: OmsType,
+) {
+    use nautilus_common::{
+        messages::execution::{
+            PositionOperationResult, PositionOperationStatus, SubmitPositionOperation,
+        },
+        msgbus::ShareableMessageHandler,
+    };
+    use nautilus_model::position_operation::PositionOperationType;
+
+    let venue = Venue::new("POLYMARKET");
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    let clock = Rc::new(RefCell::new(VirtualClock::new()));
+    let config = SimulatedVenueConfig::builder()
+        .venue(venue)
+        .oms_type(oms_type)
+        .account_type(account_type)
+        .book_type(BookType::L1_MBP)
+        .starting_balances(vec![Money::new(1_000.0, Currency::pUSD())])
+        .default_leverage(Decimal::ONE)
+        .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
+        .build()
+        .unwrap();
+    let exchange = Rc::new(RefCell::new(
+        SimulatedExchange::new(config, cache.clone(), clock.clone()).unwrap(),
+    ));
+
+    let market = serde_json::json!({
+        "market_id": "0xnegrisk",
+        "fee_bips": 0,
+        "conditions": [
+            {
+                "question_index": 0,
+                "condition_id": "0xc0",
+                "yes_token_id": "1000",
+                "no_token_id": "1001",
+            },
+            {
+                "question_index": 1,
+                "condition_id": "0xc1",
+                "yes_token_id": "1100",
+                "no_token_id": "1101",
+            },
+            {
+                "question_index": 2,
+                "condition_id": "0xc2",
+                "yes_token_id": "1200",
+                "no_token_id": "1201",
+            },
+        ],
+    });
+    let no0 = make_neg_risk_instrument("0xc0", "1001", "No", &market);
+    let no1 = make_neg_risk_instrument("0xc1", "1101", "No", &market);
+    let yes2 = make_neg_risk_instrument("0xc2", "1200", "Yes", &market);
+    for instrument in [&no0, &no1, &yes2] {
+        exchange
+            .borrow_mut()
+            .add_instrument(instrument.clone())
+            .unwrap();
+        cache
+            .borrow_mut()
+            .add_instrument(instrument.clone())
+            .unwrap();
+    }
+    for instrument in [&no0, &no1] {
+        let position = operation_position(
+            instrument,
+            TraderId::test_default(),
+            StrategyId::test_default(),
+            AccountId::test_default(),
+            "100",
+            Decimal::new(50, 0),
+        );
+        cache
+            .borrow_mut()
+            .add_position_without_order(&position, OmsType::Netting)
+            .unwrap();
+    }
+
+    let execution_client = BacktestExecutionClient::new(
+        TraderId::test_default(),
+        AccountId::test_default(),
+        &exchange,
+        cache.clone(),
+        clock.clone(),
+        None,
+        None,
+    );
+    exchange
+        .borrow_mut()
+        .register_client(Rc::new(execution_client.clone()));
+    let engine = Rc::new(RefCell::new(ExecutionEngine::new(
+        clock,
+        cache.clone(),
+        None,
+    )));
+    ExecutionEngine::register_msgbus_handlers(&engine);
+
+    let results = Rc::new(RefCell::new(Vec::<PositionOperationResult>::new()));
+    let captured = results.clone();
+    msgbus::subscribe_any(
+        nautilus_common::msgbus::switchboard::get_event_position_operation_topic(
+            StrategyId::test_default(),
+        )
+        .into(),
+        ShareableMessageHandler::from_typed(move |result: &PositionOperationResult| {
+            captured.borrow_mut().push(result.clone());
+        }),
+        None,
+    );
+
+    let command = SubmitPositionOperation::new(
+        TraderId::test_default(),
+        Some(execution_client.client_id()),
+        StrategyId::test_default(),
+        UUID4::new(),
+        PositionOperationType::Convert,
+        vec![no0.id(), no1.id()],
+        Some(Quantity::from("100")),
+        UnixNanos::from(1),
+    );
+    execution_client.submit_position_operation(command).unwrap();
+    exchange
+        .borrow_mut()
+        .process(UnixNanos::from(1_000_000_000));
+    execution_client.drain_queued_position_operation_results();
+
+    let result = results
+        .borrow()
+        .first()
+        .cloned()
+        .expect("expected a position operation result");
+    assert_eq!(result.status, PositionOperationStatus::Rejected);
+    assert!(
+        result
+            .message
+            .as_deref()
+            .is_some_and(|message| message.contains("Cash/NETTING"))
+    );
+    assert!(cache.borrow().account(&AccountId::test_default()).is_none());
+    for instrument in [&no0, &no1] {
+        let position = cache
+            .borrow()
+            .position(&PositionId::new(format!(
+                "{}-{}",
+                instrument.id(),
+                StrategyId::test_default()
+            )))
+            .expect("input position must remain")
+            .cloned();
+        assert!(position.is_open());
+        assert_eq!(position.quantity, Quantity::from("100"));
+    }
+}
+
+#[rstest]
+fn test_backtest_frozen_account_convert_does_not_add_cash() {
+    use nautilus_common::{
+        messages::execution::{
+            PositionOperationResult, PositionOperationStatus, SubmitPositionOperation,
+        },
+        msgbus::ShareableMessageHandler,
+    };
+    use nautilus_model::position_operation::PositionOperationType;
+
+    let venue = Venue::new("POLYMARKET");
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    let clock = Rc::new(RefCell::new(VirtualClock::new()));
+    let config = SimulatedVenueConfig::builder()
+        .venue(venue)
+        .oms_type(OmsType::Netting)
+        .account_type(AccountType::Cash)
+        .frozen_account(true)
+        .book_type(BookType::L1_MBP)
+        .starting_balances(vec![Money::new(1_000.0, Currency::pUSD())])
+        .default_leverage(Decimal::ONE)
+        .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
+        .build()
+        .unwrap();
+    let exchange = Rc::new(RefCell::new(
+        SimulatedExchange::new(config, cache.clone(), clock.clone()).unwrap(),
+    ));
+
+    let market = serde_json::json!({
+        "market_id": "0xnegrisk",
+        "fee_bips": 100,
+        "conditions": [
+            {
+                "question_index": 0,
+                "condition_id": "0xc0",
+                "yes_token_id": "1000",
+                "no_token_id": "1001",
+            },
+            {
+                "question_index": 1,
+                "condition_id": "0xc1",
+                "yes_token_id": "1100",
+                "no_token_id": "1101",
+            },
+            {
+                "question_index": 2,
+                "condition_id": "0xc2",
+                "yes_token_id": "1200",
+                "no_token_id": "1201",
+            },
+        ],
+    });
+    let no0 = make_neg_risk_instrument("0xc0", "1001", "No", &market);
+    let no1 = make_neg_risk_instrument("0xc1", "1101", "No", &market);
+    let yes2 = make_neg_risk_instrument("0xc2", "1200", "Yes", &market);
+    for instrument in [&no0, &no1, &yes2] {
+        exchange
+            .borrow_mut()
+            .add_instrument(instrument.clone())
+            .unwrap();
+        cache
+            .borrow_mut()
+            .add_instrument(instrument.clone())
+            .unwrap();
+    }
+    for instrument in [&no0, &no1] {
+        let position = operation_position(
+            instrument,
+            TraderId::test_default(),
+            StrategyId::test_default(),
+            AccountId::test_default(),
+            "100",
+            Decimal::new(50, 0),
+        );
+        cache
+            .borrow_mut()
+            .add_position_without_order(&position, OmsType::Netting)
+            .unwrap();
+    }
+
+    cache
+        .borrow_mut()
+        .add_instrument_close(InstrumentClose::new(
+            yes2.id(),
+            Price::from("1"),
+            InstrumentCloseType::ContractExpired,
+            UnixNanos::from(5),
+            UnixNanos::from(5),
+        ))
+        .unwrap();
+
+    let execution_client = BacktestExecutionClient::new(
+        TraderId::test_default(),
+        AccountId::test_default(),
+        &exchange,
+        cache.clone(),
+        clock.clone(),
+        None,
+        None,
+    );
+    exchange
+        .borrow_mut()
+        .register_client(Rc::new(execution_client.clone()));
+    let engine = Rc::new(RefCell::new(ExecutionEngine::new(
+        clock,
+        cache.clone(),
+        None,
+    )));
+    ExecutionEngine::register_msgbus_handlers(&engine);
+    engine
+        .borrow_mut()
+        .register_client(Box::new(execution_client.clone()))
+        .unwrap();
+
+    let results = Rc::new(RefCell::new(Vec::<PositionOperationResult>::new()));
+    let captured = results.clone();
+    msgbus::subscribe_any(
+        nautilus_common::msgbus::switchboard::get_event_position_operation_topic(
+            StrategyId::test_default(),
+        )
+        .into(),
+        ShareableMessageHandler::from_typed(move |result: &PositionOperationResult| {
+            captured.borrow_mut().push(result.clone());
+        }),
+        None,
+    );
+
+    let command = SubmitPositionOperation::new(
+        TraderId::test_default(),
+        Some(execution_client.client_id()),
+        StrategyId::test_default(),
+        UUID4::new(),
+        PositionOperationType::Convert,
+        vec![no0.id(), no1.id()],
+        Some(Quantity::from("100")),
+        UnixNanos::from(1),
+    );
+    engine
+        .borrow()
+        .execute(TradingCommand::SubmitPositionOperation(command));
+    exchange
+        .borrow_mut()
+        .process(UnixNanos::from(1_000_000_000));
+    execution_client.drain_queued_position_operation_results();
+
+    assert_eq!(
+        results.borrow()[0].status,
+        PositionOperationStatus::Confirmed
+    );
+    assert!(
+        cache.borrow().account(&AccountId::test_default()).is_none(),
+        "frozen accounts must not receive simulated operation cash"
+    );
+    let yes_position = cache
+        .borrow()
+        .position(&PositionId::new(format!(
+            "{}-{}",
+            yes2.id(),
+            StrategyId::test_default()
+        )))
+        .expect("YES output position must exist")
+        .cloned();
+    assert!(yes_position.is_closed());
+    assert!(yes_position.is_settled());
+    assert_eq!(yes_position.quantity, Quantity::from("0"));
+}
+
+#[rstest]
+#[case(true)]
+#[case(false)]
+fn test_backtest_convert_checks_active_order_scope(#[case] targeted_order: bool) {
+    use nautilus_common::{
+        messages::execution::{
+            PositionOperationResult, PositionOperationStatus, SubmitPositionOperation,
+        },
+        msgbus::ShareableMessageHandler,
+    };
+    use nautilus_model::position_operation::PositionOperationType;
+
+    let venue = Venue::new("POLYMARKET");
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    let clock = Rc::new(RefCell::new(VirtualClock::new()));
+    let config = SimulatedVenueConfig::builder()
+        .venue(venue)
+        .oms_type(OmsType::Netting)
+        .account_type(AccountType::Cash)
+        .book_type(BookType::L1_MBP)
+        .starting_balances(vec![Money::new(1_000.0, Currency::pUSD())])
+        .default_leverage(Decimal::ONE)
+        .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
+        .build()
+        .unwrap();
+    let exchange = Rc::new(RefCell::new(
+        SimulatedExchange::new(config, cache.clone(), clock.clone()).unwrap(),
+    ));
+
+    let market = serde_json::json!({
+        "market_id": "0xnegrisk",
+        "fee_bips": 100,
+        "conditions": [
+            {
+                "question_index": 0,
+                "condition_id": "0xc0",
+                "yes_token_id": "1000",
+                "no_token_id": "1001",
+            },
+            {
+                "question_index": 1,
+                "condition_id": "0xc1",
+                "yes_token_id": "1100",
+                "no_token_id": "1101",
+            },
+            {
+                "question_index": 2,
+                "condition_id": "0xc2",
+                "yes_token_id": "1200",
+                "no_token_id": "1201",
+            },
+        ],
+    });
+    let no0 = make_neg_risk_instrument("0xc0", "1001", "No", &market);
+    let no1 = make_neg_risk_instrument("0xc1", "1101", "No", &market);
+    let yes2 = make_neg_risk_instrument("0xc2", "1200", "Yes", &market);
+    let unrelated = make_neg_risk_instrument("0xother", "9999", "Yes", &market);
+    for instrument in [&no0, &no1, &yes2, &unrelated] {
+        exchange
+            .borrow_mut()
+            .add_instrument(instrument.clone())
+            .unwrap();
+        cache
+            .borrow_mut()
+            .add_instrument(instrument.clone())
+            .unwrap();
+    }
+    for instrument in [&no0, &no1] {
+        let position = operation_position(
+            instrument,
+            TraderId::test_default(),
+            StrategyId::test_default(),
+            AccountId::test_default(),
+            "100",
+            Decimal::new(50, 0),
+        );
+        cache
+            .borrow_mut()
+            .add_position_without_order(&position, OmsType::Netting)
+            .unwrap();
+    }
+
+    let order_instrument = if targeted_order { &yes2 } else { &unrelated };
+    let order = OrderTestBuilder::new(OrderType::Limit)
+        .instrument_id(order_instrument.id())
+        .side(OrderSide::Buy)
+        .price(Price::from("0.4000"))
+        .quantity(Quantity::from("1.0000"))
+        .client_order_id(ClientOrderId::from("O-ACTIVE-SCOPE"))
+        .submit(true)
+        .build();
+    cache
+        .borrow_mut()
+        .add_order(order.clone(), None, None, false)
+        .unwrap();
+    cache
+        .borrow_mut()
+        .update_order(&TestOrderEventStubs::accepted(
+            &order,
+            AccountId::test_default(),
+            VenueOrderId::from("V-ACTIVE-SCOPE"),
+        ))
+        .unwrap();
+
+    let execution_client = BacktestExecutionClient::new(
+        TraderId::test_default(),
+        AccountId::test_default(),
+        &exchange,
+        cache,
+        clock,
+        None,
+        None,
+    );
+    exchange
+        .borrow_mut()
+        .register_client(Rc::new(execution_client.clone()));
+
+    let results = Rc::new(RefCell::new(Vec::<PositionOperationResult>::new()));
+    let captured = results.clone();
+    msgbus::subscribe_any(
+        nautilus_common::msgbus::switchboard::get_event_position_operation_topic(
+            StrategyId::test_default(),
+        )
+        .into(),
+        ShareableMessageHandler::from_typed(move |result: &PositionOperationResult| {
+            captured.borrow_mut().push(result.clone());
+        }),
+        None,
+    );
+
+    let command = SubmitPositionOperation::new(
+        TraderId::test_default(),
+        Some(execution_client.client_id()),
+        StrategyId::test_default(),
+        UUID4::new(),
+        PositionOperationType::Convert,
+        vec![no0.id(), no1.id()],
+        Some(Quantity::from("100")),
+        UnixNanos::from(1),
+    );
+    execution_client.submit_position_operation(command).unwrap();
+    exchange
+        .borrow_mut()
+        .process(UnixNanos::from(1_000_000_000));
+    execution_client.drain_queued_position_operation_results();
+
+    let result = results
+        .borrow()
+        .first()
+        .cloned()
+        .expect("expected a position operation result");
+    if targeted_order {
+        assert_eq!(result.status, PositionOperationStatus::Rejected);
+        assert!(
+            result
+                .message
+                .as_deref()
+                .is_some_and(|message| message.contains("active orders"))
+        );
+    } else {
+        assert_eq!(result.status, PositionOperationStatus::Confirmed);
+        assert_eq!(
+            result
+                .effects
+                .expect("confirmed convert carries effects")
+                .collateral_delta,
+            "99"
+        );
+    }
+}
+
+#[rstest]
+#[case("0", Decimal::new(-50, 0), Some(Decimal::new(1_000, 0)))]
+#[case("1", Decimal::new(49, 0), Some(Decimal::new(1_099, 0)))]
+fn test_backtest_ctf_convert_settles_output_payout_cash(
+    #[case] close_price: &str,
+    #[case] expected_pnl: Decimal,
+    #[case] expected_cash: Option<Decimal>,
+) {
+    use nautilus_common::{
+        messages::execution::{
+            PositionOperationResult, PositionOperationStatus, SubmitPositionOperation,
+        },
+        msgbus::ShareableMessageHandler,
+    };
+    use nautilus_model::position_operation::PositionOperationType;
+
+    let venue = Venue::new("POLYMARKET");
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    let clock = Rc::new(RefCell::new(VirtualClock::new()));
+    let config = SimulatedVenueConfig::builder()
+        .venue(venue)
+        .oms_type(OmsType::Netting)
+        .account_type(AccountType::Cash)
+        .book_type(BookType::L1_MBP)
+        .starting_balances(vec![Money::new(1_000.0, Currency::pUSD())])
+        .default_leverage(Decimal::ONE)
+        .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
+        .build()
+        .unwrap();
+    let exchange = Rc::new(RefCell::new(
+        SimulatedExchange::new(config, cache.clone(), clock.clone()).unwrap(),
+    ));
+
+    let market = serde_json::json!({
+        "market_id": "0xnegrisk",
+        "fee_bips": 100,
+        "conditions": [
+            {
+                "question_index": 0,
+                "condition_id": "0xc0",
+                "yes_token_id": "1000",
+                "no_token_id": "1001",
+            },
+            {
+                "question_index": 1,
+                "condition_id": "0xc1",
+                "yes_token_id": "1100",
+                "no_token_id": "1101",
+            },
+        ],
+    });
+    let no0 = make_neg_risk_instrument("0xc0", "1001", "No", &market);
+    let yes1 = make_neg_risk_instrument("0xc1", "1100", "Yes", &market);
+    for instrument in [&no0, &yes1] {
+        exchange
+            .borrow_mut()
+            .add_instrument(instrument.clone())
+            .unwrap();
+        cache
+            .borrow_mut()
+            .add_instrument(instrument.clone())
+            .unwrap();
+    }
+    let position = operation_position(
+        &no0,
+        TraderId::test_default(),
+        StrategyId::test_default(),
+        AccountId::test_default(),
+        "100",
+        Decimal::new(50, 0),
+    );
+    cache
+        .borrow_mut()
+        .add_position_without_order(&position, OmsType::Netting)
+        .unwrap();
+    let close = InstrumentClose::new(
+        yes1.id(),
+        Price::from(close_price),
+        InstrumentCloseType::ContractExpired,
+        UnixNanos::from(5),
+        UnixNanos::from(5),
+    );
+    cache.borrow_mut().add_instrument_close(close).unwrap();
+
+    let account_id = AccountId::test_default();
+    let cash_account = CashAccount::new(
+        AccountState::new(
+            account_id,
+            AccountType::Cash,
+            vec![AccountBalance::new(
+                Money::from_decimal(Decimal::new(1_000, 0), Currency::pUSD()).unwrap(),
+                Money::zero(Currency::pUSD()),
+                Money::from_decimal(Decimal::new(1_000, 0), Currency::pUSD()).unwrap(),
+            )],
+            vec![],
+            false,
+            UUID4::default(),
+            UnixNanos::default(),
+            UnixNanos::default(),
+            None,
+        ),
+        false,
+        false,
+    );
+    cache
+        .borrow_mut()
+        .add_account(AccountAny::Cash(cash_account))
+        .unwrap();
+    cache.borrow_mut().build_index();
+
+    let portfolio = Rc::new(RefCell::new(Portfolio::new(
+        clock.clone(),
+        cache.clone(),
+        None,
+    )));
+
+    let execution_client = BacktestExecutionClient::new(
+        TraderId::test_default(),
+        AccountId::test_default(),
+        &exchange,
+        cache.clone(),
+        clock.clone(),
+        None,
+        None,
+    );
+    exchange
+        .borrow_mut()
+        .register_client(Rc::new(execution_client.clone()));
+    let engine = Rc::new(RefCell::new(ExecutionEngine::new(
+        clock,
+        cache.clone(),
+        None,
+    )));
+    ExecutionEngine::register_msgbus_handlers(&engine);
+    engine
+        .borrow_mut()
+        .register_client(Box::new(execution_client.clone()))
+        .unwrap();
+
+    let results = Rc::new(RefCell::new(Vec::<PositionOperationResult>::new()));
+    let captured = results.clone();
+    msgbus::subscribe_any(
+        nautilus_common::msgbus::switchboard::get_event_position_operation_topic(
+            StrategyId::test_default(),
+        )
+        .into(),
+        ShareableMessageHandler::from_typed(move |result: &PositionOperationResult| {
+            captured.borrow_mut().push(result.clone());
+        }),
+        None,
+    );
+    let account_cache = cache.clone();
+    msgbus::register_account_state_endpoint(
+        MessagingSwitchboard::portfolio_update_account(),
+        TypedHandler::from(move |state: &AccountState| {
+            account_cache
+                .borrow_mut()
+                .update_account_state(state)
+                .unwrap();
+        }),
+    );
+
+    let operation_id = UUID4::new();
+    let command = SubmitPositionOperation::new(
+        TraderId::test_default(),
+        Some(execution_client.client_id()),
+        StrategyId::test_default(),
+        operation_id,
+        PositionOperationType::Convert,
+        vec![no0.id()],
+        Some(Quantity::from("100")),
+        UnixNanos::from(1),
+    );
+    engine
+        .borrow()
+        .execute(TradingCommand::SubmitPositionOperation(command));
+    exchange
+        .borrow_mut()
+        .process(UnixNanos::from(1_000_000_000));
+    execution_client.drain_queued_position_operation_results();
+    let result = results
+        .borrow()
+        .first()
+        .cloned()
+        .expect("expected a position operation result");
+    assert_eq!(result.status, PositionOperationStatus::Confirmed);
+    assert_eq!(result.effects.as_ref().unwrap().collateral_delta, "0");
+
+    execution_client.drain_queued_position_operation_results();
+    assert_eq!(results.borrow()[1].status, PositionOperationStatus::Applied);
+    assert!(results.borrow()[1].effects.is_none());
+
+    let cash = cache
+        .borrow()
+        .account(&AccountId::test_default())
+        .map(|account| account.balances()[&Currency::pUSD()].total.as_decimal());
+    assert_eq!(cash, expected_cash);
+    let yes_position = cache
+        .borrow()
+        .position(&PositionId::new(format!(
+            "{}-{}",
+            yes1.id(),
+            StrategyId::test_default()
+        )))
+        .expect("settled YES output must be received")
+        .cloned();
+    assert!(yes_position.is_closed());
+    assert!(yes_position.is_settled());
+    assert_eq!(yes_position.quantity, Quantity::from("0"));
+    assert_eq!(
+        yes_position.realized_pnl,
+        Some(Money::from_decimal(expected_pnl, Currency::pUSD()).unwrap())
+    );
+    assert!(matches!(
+        yes_position.replay_events.as_slice(),
+        [
+            PositionReplayEvent::Operation(leg),
+            PositionReplayEvent::InstrumentClosed(_)
+        ] if leg.quantity == Quantity::from("99")
+    ));
+
+    msgbus::send_any_value(
+        MessagingSwitchboard::exec_engine_position_operation(),
+        &result,
+    );
+    let cash_after_duplicate = cache
+        .borrow()
+        .account(&AccountId::test_default())
+        .map(|account| account.balances()[&Currency::pUSD()].total.as_decimal());
+    assert_eq!(
+        cash_after_duplicate, expected_cash,
+        "duplicate results must not add settlement cash again"
+    );
+
+    exchange
+        .borrow_mut()
+        .process_instrument_close(close)
+        .unwrap();
+    let cash_after_close = cache
+        .borrow()
+        .account(&AccountId::test_default())
+        .map(|account| account.balances()[&Currency::pUSD()].total.as_decimal());
+    assert_eq!(
+        cash_after_close, expected_cash,
+        "duplicate close must not add settlement cash again"
+    );
+
+    let mut portfolio = portfolio.borrow_mut();
+    assert_eq!(
+        portfolio.realized_pnl(&yes1.id()),
+        Some(Money::from_decimal(expected_pnl, Currency::pUSD()).unwrap())
+    );
+    assert_eq!(portfolio.net_position(&yes1.id()), Decimal::ZERO);
+}
+
+#[rstest]
+fn test_backtest_convert_uses_settlement_received_before_application() {
+    use nautilus_common::{
+        messages::execution::{
+            PositionOperationResult, PositionOperationStatus, SubmitPositionOperation,
+        },
+        msgbus::ShareableMessageHandler,
+    };
+    use nautilus_model::position_operation::PositionOperationType;
+
+    let venue = Venue::new("POLYMARKET");
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    let clock = Rc::new(RefCell::new(VirtualClock::new()));
+    let config = SimulatedVenueConfig::builder()
+        .venue(venue)
+        .oms_type(OmsType::Netting)
+        .account_type(AccountType::Cash)
+        .book_type(BookType::L1_MBP)
+        .starting_balances(vec![Money::new(1_000.0, Currency::pUSD())])
+        .default_leverage(Decimal::ONE)
+        .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
+        .build()
+        .unwrap();
+    let exchange = Rc::new(RefCell::new(
+        SimulatedExchange::new(config, cache.clone(), clock.clone()).unwrap(),
+    ));
+
+    let market = serde_json::json!({
+        "market_id": "0xnegrisk",
+        "fee_bips": 100,
+        "conditions": [
+            {
+                "question_index": 0,
+                "condition_id": "0xc0",
+                "yes_token_id": "1000",
+                "no_token_id": "1001",
+            },
+            {
+                "question_index": 1,
+                "condition_id": "0xc1",
+                "yes_token_id": "1100",
+                "no_token_id": "1101",
+            },
+        ],
+    });
+    let no0 = make_neg_risk_instrument("0xc0", "1001", "No", &market);
+    let yes1 = make_neg_risk_instrument("0xc1", "1100", "Yes", &market);
+    for instrument in [&no0, &yes1] {
+        exchange
+            .borrow_mut()
+            .add_instrument(instrument.clone())
+            .unwrap();
+        cache
+            .borrow_mut()
+            .add_instrument(instrument.clone())
+            .unwrap();
+    }
+    let position = operation_position(
+        &no0,
+        TraderId::test_default(),
+        StrategyId::test_default(),
+        AccountId::test_default(),
+        "100",
+        Decimal::new(50, 0),
+    );
+    cache
+        .borrow_mut()
+        .add_position_without_order(&position, OmsType::Netting)
+        .unwrap();
+
+    let portfolio = Rc::new(RefCell::new(Portfolio::new(
+        clock.clone(),
+        cache.clone(),
+        None,
+    )));
+    let execution_client = BacktestExecutionClient::new(
+        TraderId::test_default(),
+        AccountId::test_default(),
+        &exchange,
+        cache.clone(),
+        clock.clone(),
+        None,
+        None,
+    );
+    exchange
+        .borrow_mut()
+        .register_client(Rc::new(execution_client.clone()));
+    let engine = Rc::new(RefCell::new(ExecutionEngine::new(
+        clock,
+        cache.clone(),
+        None,
+    )));
+    ExecutionEngine::register_msgbus_handlers(&engine);
+    engine
+        .borrow_mut()
+        .register_client(Box::new(execution_client.clone()))
+        .unwrap();
+
+    let results = Rc::new(RefCell::new(Vec::<PositionOperationResult>::new()));
+    let captured = results.clone();
+    msgbus::subscribe_any(
+        nautilus_common::msgbus::switchboard::get_event_position_operation_topic(
+            StrategyId::test_default(),
+        )
+        .into(),
+        ShareableMessageHandler::from_typed(move |result: &PositionOperationResult| {
+            captured.borrow_mut().push(result.clone());
+        }),
+        None,
+    );
+    let account_cache = cache.clone();
+    msgbus::register_account_state_endpoint(
+        MessagingSwitchboard::portfolio_update_account(),
+        TypedHandler::from(move |state: &AccountState| {
+            account_cache
+                .borrow_mut()
+                .update_account_state(state)
+                .unwrap();
+        }),
+    );
+
+    let operation_id = UUID4::new();
+    let command = SubmitPositionOperation::new(
+        TraderId::test_default(),
+        Some(execution_client.client_id()),
+        StrategyId::test_default(),
+        operation_id,
+        PositionOperationType::Convert,
+        vec![no0.id()],
+        Some(Quantity::from("100")),
+        UnixNanos::from(1),
+    );
+    engine
+        .borrow()
+        .execute(TradingCommand::SubmitPositionOperation(command));
+    exchange
+        .borrow_mut()
+        .process(UnixNanos::from(1_000_000_000));
+
+    // The payout arrives after the venue confirms, but before the core applies the operation.
+    cache
+        .borrow_mut()
+        .add_instrument_close(InstrumentClose::new(
+            yes1.id(),
+            Price::from("1"),
+            InstrumentCloseType::ContractExpired,
+            UnixNanos::from(5),
+            UnixNanos::from(5),
+        ))
+        .unwrap();
+    execution_client.drain_queued_position_operation_results();
+    execution_client.drain_queued_position_operation_results();
+    let result = results
+        .borrow()
+        .first()
+        .cloned()
+        .expect("expected a confirmed result");
+    assert_eq!(result.status, PositionOperationStatus::Confirmed);
+
+    let cash = cache
+        .borrow()
+        .account(&AccountId::test_default())
+        .map(|account| account.balances()[&Currency::pUSD()].total.as_decimal());
+    assert_eq!(cash, Some(Decimal::new(1_099, 0)));
+    let yes_position = cache
+        .borrow()
+        .position(&PositionId::new(format!(
+            "{}-{}",
+            yes1.id(),
+            StrategyId::test_default()
+        )))
+        .expect("settled output must be received")
+        .cloned();
+    assert!(yes_position.is_closed());
+    assert!(yes_position.is_settled());
+    assert_eq!(
+        yes_position.realized_pnl,
+        Some(Money::from_decimal(Decimal::new(49, 0), Currency::pUSD()).unwrap())
+    );
+    let mut portfolio = portfolio.borrow_mut();
+    assert_eq!(
+        portfolio.realized_pnl(&yes1.id()),
+        Some(Money::from_decimal(Decimal::new(49, 0), Currency::pUSD()).unwrap())
+    );
+    assert_eq!(portfolio.net_position(&yes1.id()), Decimal::ZERO);
+
+    msgbus::send_any_value(
+        MessagingSwitchboard::exec_engine_position_operation(),
+        &result,
+    );
+    let cash_after_duplicate = cache
+        .borrow()
+        .account(&AccountId::test_default())
+        .map(|account| account.balances()[&Currency::pUSD()].total.as_decimal());
+    assert_eq!(
+        cash_after_duplicate,
+        Some(Decimal::new(1_099, 0)),
+        "duplicate results must not add settlement cash again"
+    );
+}
+
+#[rstest]
+fn test_backtest_ctf_convert_rejects_open_short_output_target() {
+    use nautilus_common::{
+        messages::execution::{
+            PositionOperationResult, PositionOperationStatus, SubmitPositionOperation,
+        },
+        msgbus::ShareableMessageHandler,
+    };
+    use nautilus_model::position_operation::PositionOperationType;
+
+    let venue = Venue::new("POLYMARKET");
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    let clock = Rc::new(RefCell::new(VirtualClock::new()));
+    let config = SimulatedVenueConfig::builder()
+        .venue(venue)
+        .oms_type(OmsType::Netting)
+        .account_type(AccountType::Cash)
+        .book_type(BookType::L1_MBP)
+        .starting_balances(vec![Money::new(1_000.0, Currency::pUSD())])
+        .default_leverage(Decimal::ONE)
+        .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
+        .build()
+        .unwrap();
+    let exchange = Rc::new(RefCell::new(
+        SimulatedExchange::new(config, cache.clone(), clock.clone()).unwrap(),
+    ));
+
+    let market = serde_json::json!({
+        "market_id": "0xnegrisk",
+        "fee_bips": 100,
+        "conditions": [
+            {
+                "question_index": 0,
+                "condition_id": "0xc0",
+                "yes_token_id": "1000",
+                "no_token_id": "1001",
+            },
+            {
+                "question_index": 1,
+                "condition_id": "0xc1",
+                "yes_token_id": "1100",
+                "no_token_id": "1101",
+            },
+        ],
+    });
+    let no0 = make_neg_risk_instrument("0xc0", "1001", "No", &market);
+    let yes1 = make_neg_risk_instrument("0xc1", "1100", "Yes", &market);
+    for instrument in [&no0, &yes1] {
+        exchange
+            .borrow_mut()
+            .add_instrument(instrument.clone())
+            .unwrap();
+        cache
+            .borrow_mut()
+            .add_instrument(instrument.clone())
+            .unwrap();
+    }
+
+    let long = operation_position(
+        &no0,
+        TraderId::test_default(),
+        StrategyId::test_default(),
+        AccountId::test_default(),
+        "100",
+        Decimal::new(50, 0),
+    );
+    cache
+        .borrow_mut()
+        .add_position_without_order(&long, OmsType::Netting)
+        .unwrap();
+    let short = short_position(
+        &yes1,
+        TraderId::test_default(),
+        StrategyId::test_default(),
+        AccountId::test_default(),
+        "100",
+    );
+    assert!(short.is_short());
+    cache
+        .borrow_mut()
+        .add_position_without_order(&short, OmsType::Netting)
+        .unwrap();
+
+    let account_id = AccountId::test_default();
+    let cash_account = CashAccount::new(
+        AccountState::new(
+            account_id,
+            AccountType::Cash,
+            vec![AccountBalance::new(
+                Money::from_decimal(Decimal::new(1_000, 0), Currency::pUSD()).unwrap(),
+                Money::zero(Currency::pUSD()),
+                Money::from_decimal(Decimal::new(1_000, 0), Currency::pUSD()).unwrap(),
+            )],
+            vec![],
+            false,
+            UUID4::default(),
+            UnixNanos::default(),
+            UnixNanos::default(),
+            None,
+        ),
+        false,
+        false,
+    );
+    cache
+        .borrow_mut()
+        .add_account(AccountAny::Cash(cash_account))
+        .unwrap();
+    cache.borrow_mut().build_index();
+
+    let execution_client = BacktestExecutionClient::new(
+        TraderId::test_default(),
+        AccountId::test_default(),
+        &exchange,
+        cache.clone(),
+        clock.clone(),
+        None,
+        None,
+    );
+    exchange
+        .borrow_mut()
+        .register_client(Rc::new(execution_client.clone()));
+    let engine = Rc::new(RefCell::new(ExecutionEngine::new(
+        clock,
+        cache.clone(),
+        None,
+    )));
+    ExecutionEngine::register_msgbus_handlers(&engine);
+    engine
+        .borrow_mut()
+        .register_client(Box::new(execution_client.clone()))
+        .unwrap();
+
+    let results = Rc::new(RefCell::new(Vec::<PositionOperationResult>::new()));
+    let captured = results.clone();
+    msgbus::subscribe_any(
+        nautilus_common::msgbus::switchboard::get_event_position_operation_topic(
+            StrategyId::test_default(),
+        )
+        .into(),
+        ShareableMessageHandler::from_typed(move |result: &PositionOperationResult| {
+            captured.borrow_mut().push(result.clone());
+        }),
+        None,
+    );
+    let account_cache = cache.clone();
+    msgbus::register_account_state_endpoint(
+        MessagingSwitchboard::portfolio_update_account(),
+        TypedHandler::from(move |state: &AccountState| {
+            account_cache
+                .borrow_mut()
+                .update_account_state(state)
+                .unwrap();
+        }),
+    );
+
+    let operation_id = UUID4::new();
+    let command = SubmitPositionOperation::new(
+        TraderId::test_default(),
+        Some(execution_client.client_id()),
+        StrategyId::test_default(),
+        operation_id,
+        PositionOperationType::Convert,
+        vec![no0.id()],
+        Some(Quantity::from("100")),
+        UnixNanos::from(1),
+    );
+    engine
+        .borrow()
+        .execute(TradingCommand::SubmitPositionOperation(command));
+    exchange
+        .borrow_mut()
+        .process(UnixNanos::from(1_000_000_000));
+    execution_client.drain_queued_position_operation_results();
+
+    let result = results
+        .borrow()
+        .iter()
+        .find(|result| result.operation_id == operation_id)
+        .cloned()
+        .expect("expected a position operation result");
+    assert_eq!(result.status, PositionOperationStatus::Rejected);
+    assert!(
+        result
+            .message
+            .as_deref()
+            .is_some_and(|message| message.contains("open short position")),
+        "{:?}",
+        result.message
+    );
+    assert!(!results.borrow().iter().any(|result| {
+        result.operation_id == operation_id
+            && matches!(
+                result.status,
+                PositionOperationStatus::Confirmed | PositionOperationStatus::Applied
+            )
+    }));
+
+    let cash = cache
+        .borrow()
+        .account(&account_id)
+        .map(|account| account.balances()[&Currency::pUSD()].total.as_decimal());
+    assert_eq!(cash, Some(Decimal::new(1_000, 0)));
+    let long = cache
+        .borrow()
+        .position(&long.id)
+        .expect("input position must remain")
+        .cloned();
+    assert_eq!(long.quantity, Quantity::from("100"));
+    assert!(long.is_open());
+    let short = cache
+        .borrow()
+        .position(&short.id)
+        .expect("output short must remain")
+        .cloned();
+    assert!(short.is_short());
+    assert_eq!(short.quantity, Quantity::from("100"));
 }

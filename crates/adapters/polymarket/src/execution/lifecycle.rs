@@ -29,6 +29,7 @@ use nautilus_common::{
     msgbus::{self, TypedHandler},
 };
 use nautilus_core::{collections::AtomicMap, string::secret::SecretString, time::AtomicTime};
+use nautilus_execution::reconciliation::inferred_reconciliation_trade_ids_including_voided;
 use nautilus_live::{ExecutionClientCore, execution::context::OrderContext, task::TaskGroupGuard};
 use nautilus_model::{
     enums::OrderSide,
@@ -847,9 +848,22 @@ impl PolymarketExecutionClient {
             }
 
             // Retained core events reconstruct observed fills and voids; their presence is
-            // authoritative for the settlement registry.
+            // authoritative for the settlement registry. Older inferred fills predate the
+            // provenance marker, so recover it from the complete order history.
+            let inferred_trade_ids = inferred_reconciliation_trade_ids_including_voided(order)
+                .unwrap_or_else(|e| {
+                    log::warn!(
+                        "Cannot identify inferred fills for {} during cache hydration: {e}",
+                        order.client_order_id()
+                    );
+                    Vec::new()
+                });
+
             for event in order.events() {
                 match event {
+                    OrderEventAny::Filled(fill) if inferred_trade_ids.contains(&fill.trade_id) => {
+                        self.settlement.hydrate_inferred_fill(fill);
+                    }
                     OrderEventAny::Filled(fill) => self.settlement.hydrate_fill(fill),
                     OrderEventAny::FillVoided(voided) => self.settlement.hydrate_void(voided),
                     _ => {}
@@ -1867,6 +1881,10 @@ mod tests {
         msgbus::{publish_order_event, publish_position_event, switchboard},
     };
     use nautilus_core::{UUID4, UnixNanos, nanos::DurationNanos};
+    use nautilus_execution::reconciliation::{
+        create_inferred_fill_for_qty, generate_reconciliation_order_events,
+        inferred_reconciliation_trade_ids, reconcile_fill_report,
+    };
     use nautilus_live::ExecutionClientCore;
     use nautilus_model::{
         enums::{
@@ -1889,6 +1907,7 @@ mod tests {
             LimitOrder, Order, OrderAny, OrderList, OrderTestBuilder, stubs::TestOrderEventStubs,
         },
         position::Position,
+        reports::{FillReport, OrderStatusReport},
         types::{
             AccountBalance, Currency, Money, Price, Price as ModelPrice, Quantity,
             Quantity as ModelQuantity,
@@ -2154,14 +2173,17 @@ mod tests {
             position_id: position.id,
             account_id: position.account_id,
             opening_order_id: position.opening_order_id,
+            opening_operation_id: position.opening_operation_id,
+            operation_id: None,
             closing_order_id: position.closing_order_id,
+            closing_operation_id: position.closing_operation_id,
             entry: position.entry,
             side: PositionSide::Flat,
             signed_qty: 0.into(),
             quantity: Quantity::zero(position.size_precision),
             peak_quantity: position.peak_qty,
-            last_qty: Quantity::zero(position.size_precision),
-            last_px: Price::zero(position.price_precision),
+            last_qty: Some(Quantity::zero(position.size_precision)),
+            last_px: Some(Price::zero(position.price_precision)),
             currency: position.quote_currency,
             avg_px_open: position.avg_px_open,
             avg_px_close: position.avg_px_close,
@@ -2298,6 +2320,365 @@ mod tests {
         assert_eq!(
             leg_application(&client.settlement, &TradeId::from("trade-restart")),
             Some(LegApplication::VoidObserved)
+        );
+    }
+
+    #[rstest]
+    fn load_orders_from_cache_marks_legacy_inferred_fill_provenance() {
+        let (client, cache) = test_client();
+        let instrument = test_binary_option("0xLEGACY-INFERRED", false, false);
+        let account_id = AccountId::from("POLYMARKET-001");
+
+        let (order, trade_id) = {
+            let mut cache = cache.borrow_mut();
+            cache.add_instrument(instrument.clone()).unwrap();
+            let order = OrderTestBuilder::new(OrderType::Market)
+                .instrument_id(instrument.id())
+                .side(OrderSide::Buy)
+                .quantity(Quantity::from("10.00"))
+                .build();
+            let order = cache_accepted(&mut cache, order);
+            let report = OrderStatusReport::new(
+                account_id,
+                instrument.id(),
+                Some(order.client_order_id()),
+                order.venue_order_id().unwrap(),
+                OrderSide::Buy.into(),
+                OrderType::Market,
+                TimeInForce::Gtc,
+                OrderStatus::Filled,
+                Quantity::from("10.00"),
+                Quantity::from("10.00"),
+                UnixNanos::from(1),
+                UnixNanos::from(1),
+                UnixNanos::from(1),
+                None,
+            )
+            .with_avg_px(rust_decimal::Decimal::new(5, 1));
+            let event = create_inferred_fill_for_qty(
+                &order,
+                &report,
+                &account_id,
+                &instrument,
+                Quantity::from("10.00"),
+                UnixNanos::from(2),
+                None,
+            )
+            .expect("inferred fill fixture");
+            let OrderEventAny::Filled(mut fill) = event else {
+                panic!("expected an inferred fill");
+            };
+            // Simulate a retained event written before the provenance marker existed.
+            fill.info = None;
+            let trade_id = fill.trade_id;
+            let order = cache.update_order(&OrderEventAny::Filled(fill)).unwrap();
+            (order, trade_id)
+        };
+
+        assert_eq!(
+            inferred_reconciliation_trade_ids(&order).unwrap(),
+            vec![trade_id]
+        );
+
+        client.load_orders_from_cache();
+
+        assert!(client.settlement.pending_resolutions().is_empty());
+        client
+            .settlement
+            .request_recovered_settlement_resolution(&[instrument.id()]);
+        assert!(
+            client.settlement.pending_resolutions().is_empty(),
+            "a legacy inferred ID must not enter the targeted REST queue"
+        );
+        assert!(
+            client
+                .settlement
+                .ensure_operation_inputs_terminal(Some(instrument.id()), "position operation")
+                .is_err(),
+            "the recovered inferred fill must still block operation preparation"
+        );
+    }
+
+    #[rstest]
+    fn load_orders_from_cache_marks_fully_voided_legacy_inferred_fill_provenance() {
+        let (client, cache) = test_client();
+        let instrument = test_binary_option("0xLEGACY-INFERRED-VOID", false, false);
+        let account_id = AccountId::from("POLYMARKET-001");
+
+        let (order, trade_id) = {
+            let mut cache = cache.borrow_mut();
+            cache.add_instrument(instrument.clone()).unwrap();
+            let order = OrderTestBuilder::new(OrderType::Market)
+                .instrument_id(instrument.id())
+                .side(OrderSide::Buy)
+                .quantity(Quantity::from("10.00"))
+                .build();
+            let order = cache_accepted(&mut cache, order);
+            let venue_order_id = order.venue_order_id().unwrap();
+            let fill_report = OrderStatusReport::new(
+                account_id,
+                instrument.id(),
+                Some(order.client_order_id()),
+                venue_order_id,
+                OrderSide::Buy.into(),
+                OrderType::Market,
+                TimeInForce::Gtc,
+                OrderStatus::Filled,
+                Quantity::from("10.00"),
+                Quantity::from("10.00"),
+                UnixNanos::from(1),
+                UnixNanos::from(1),
+                UnixNanos::from(1),
+                None,
+            )
+            .with_avg_px(rust_decimal::Decimal::new(5, 1));
+            let event = create_inferred_fill_for_qty(
+                &order,
+                &fill_report,
+                &account_id,
+                &instrument,
+                Quantity::from("10.00"),
+                UnixNanos::from(2),
+                None,
+            )
+            .expect("inferred fill fixture");
+            let OrderEventAny::Filled(mut fill) = event else {
+                panic!("expected an inferred fill");
+            };
+            // Simulate a retained event written before the provenance marker existed.
+            fill.info = None;
+            let trade_id = fill.trade_id;
+            let order = cache.update_order(&OrderEventAny::Filled(fill)).unwrap();
+
+            let void_report = OrderStatusReport::new(
+                account_id,
+                instrument.id(),
+                Some(order.client_order_id()),
+                venue_order_id,
+                OrderSide::Buy.into(),
+                OrderType::Market,
+                TimeInForce::Gtc,
+                OrderStatus::Voided,
+                Quantity::from("10.00"),
+                Quantity::from("0.00"),
+                UnixNanos::from(10),
+                UnixNanos::from(10),
+                UnixNanos::from(10),
+                None,
+            );
+            let void_events = generate_reconciliation_order_events(
+                &order,
+                &void_report,
+                Some(&instrument),
+                UnixNanos::from(11),
+            );
+            let mut order = order;
+
+            for event in &void_events {
+                order = cache.update_order(event).unwrap();
+            }
+
+            assert!(order.trade_ids().is_empty());
+            (order, trade_id)
+        };
+
+        assert!(
+            inferred_reconciliation_trade_ids(&order)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            inferred_reconciliation_trade_ids_including_voided(&order).unwrap(),
+            vec![trade_id]
+        );
+
+        client.load_orders_from_cache();
+
+        assert!(client.settlement.pending_resolutions().is_empty());
+        client
+            .settlement
+            .request_recovered_settlement_resolution(&[instrument.id()]);
+        assert!(
+            client.settlement.pending_resolutions().is_empty(),
+            "a fully voided legacy inferred ID must not enter the targeted REST queue"
+        );
+        assert!(
+            client
+                .settlement
+                .ensure_operation_inputs_terminal(Some(instrument.id()), "position operation")
+                .is_ok(),
+            "a fully voided inferred fill holds no inventory and must not block on its own"
+        );
+    }
+
+    #[rstest]
+    fn load_orders_from_cache_keeps_partially_voided_legacy_inferred_fill_blocking() {
+        let (client, cache) = test_client();
+        let instrument = test_binary_option("0xLEGACY-INFERRED-PARTIAL", false, false);
+        let account_id = AccountId::from("POLYMARKET-001");
+
+        let trade_id = {
+            let mut cache = cache.borrow_mut();
+            cache.add_instrument(instrument.clone()).unwrap();
+            let order = OrderTestBuilder::new(OrderType::Market)
+                .instrument_id(instrument.id())
+                .side(OrderSide::Buy)
+                .quantity(Quantity::from("10.00"))
+                .build();
+            let order = cache_accepted(&mut cache, order);
+            let venue_order_id = order.venue_order_id().unwrap();
+            let fill_report = OrderStatusReport::new(
+                account_id,
+                instrument.id(),
+                Some(order.client_order_id()),
+                venue_order_id,
+                OrderSide::Buy.into(),
+                OrderType::Market,
+                TimeInForce::Gtc,
+                OrderStatus::Filled,
+                Quantity::from("10.00"),
+                Quantity::from("10.00"),
+                UnixNanos::from(1),
+                UnixNanos::from(1),
+                UnixNanos::from(1),
+                None,
+            )
+            .with_avg_px(rust_decimal::Decimal::new(5, 1));
+            let event = create_inferred_fill_for_qty(
+                &order,
+                &fill_report,
+                &account_id,
+                &instrument,
+                Quantity::from("10.00"),
+                UnixNanos::from(2),
+                None,
+            )
+            .expect("inferred fill fixture");
+            let OrderEventAny::Filled(mut fill) = event else {
+                panic!("expected an inferred fill");
+            };
+            // Simulate a retained event written before the provenance marker existed.
+            fill.info = None;
+            let trade_id = fill.trade_id;
+            let order = cache.update_order(&OrderEventAny::Filled(fill)).unwrap();
+
+            let void_report = OrderStatusReport::new(
+                account_id,
+                instrument.id(),
+                Some(order.client_order_id()),
+                venue_order_id,
+                OrderSide::Buy.into(),
+                OrderType::Market,
+                TimeInForce::Gtc,
+                OrderStatus::Voided,
+                Quantity::from("10.00"),
+                Quantity::from("6.00"),
+                UnixNanos::from(10),
+                UnixNanos::from(10),
+                UnixNanos::from(10),
+                None,
+            );
+            let void_events = generate_reconciliation_order_events(
+                &order,
+                &void_report,
+                Some(&instrument),
+                UnixNanos::from(11),
+            );
+            let mut order = order;
+
+            for event in &void_events {
+                order = cache.update_order(event).unwrap();
+            }
+
+            assert_eq!(
+                inferred_reconciliation_trade_ids_including_voided(&order).unwrap(),
+                vec![trade_id]
+            );
+            trade_id
+        };
+
+        client.load_orders_from_cache();
+
+        assert_eq!(
+            leg_application(&client.settlement, &trade_id),
+            Some(LegApplication::VoidObserved)
+        );
+        assert!(client.settlement.pending_resolutions().is_empty());
+        client
+            .settlement
+            .request_recovered_settlement_resolution(&[instrument.id()]);
+        assert!(
+            client.settlement.pending_resolutions().is_empty(),
+            "a partially voided legacy inferred ID must not enter the targeted REST queue"
+        );
+        assert!(
+            client
+                .settlement
+                .ensure_operation_inputs_terminal(Some(instrument.id()), "position operation")
+                .is_err(),
+            "a partial void leaves inventory that cannot be proven without a terminal read"
+        );
+    }
+
+    #[rstest]
+    #[case::uuid_v4("00000000-0000-4000-8000-000000000011")]
+    #[case::uuid_v5("00000000-0000-5000-8000-000000000012")]
+    fn load_orders_from_cache_keeps_real_rest_trade_queryable(#[case] venue_trade_id: &str) {
+        let (client, cache) = test_client();
+        let instrument = test_binary_option("0xLEGACY-REST", false, false);
+        let account_id = AccountId::from("POLYMARKET-001");
+
+        let order = {
+            let mut cache = cache.borrow_mut();
+            cache.add_instrument(instrument.clone()).unwrap();
+            let order = OrderTestBuilder::new(OrderType::Market)
+                .instrument_id(instrument.id())
+                .side(OrderSide::Buy)
+                .quantity(Quantity::from("10.00"))
+                .build();
+            let order = cache_accepted(&mut cache, order);
+            let fill_report = FillReport::new(
+                account_id,
+                instrument.id(),
+                order.venue_order_id().unwrap(),
+                TradeId::new(venue_trade_id),
+                OrderSide::Buy,
+                Quantity::from("10.00"),
+                Price::from("0.500"),
+                Money::from("0 pUSD"),
+                LiquiditySide::Taker,
+                Some(order.client_order_id()),
+                None,
+                UnixNanos::from(1),
+                UnixNanos::from(1),
+                None,
+            );
+            let event =
+                reconcile_fill_report(&order, &fill_report, &instrument, UnixNanos::from(2), false)
+                    .expect("real REST fill fixture");
+            let OrderEventAny::Filled(fill) = event else {
+                panic!("expected a fill");
+            };
+            assert!(fill.info.is_none());
+            cache.update_order(&OrderEventAny::Filled(fill)).unwrap()
+        };
+
+        assert!(
+            inferred_reconciliation_trade_ids(&order)
+                .unwrap()
+                .is_empty(),
+            "a real REST trade ID must not be classified as inferred"
+        );
+
+        client.load_orders_from_cache();
+
+        assert!(client.settlement.pending_resolutions().is_empty());
+        client
+            .settlement
+            .request_recovered_settlement_resolution(&[instrument.id()]);
+        assert_eq!(
+            client.settlement.pending_resolutions(),
+            vec![venue_trade_id.to_string()]
         );
     }
 

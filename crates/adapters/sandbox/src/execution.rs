@@ -30,8 +30,10 @@ use nautilus_common::{
         execution::{
             BatchCancelOrders, BatchModifyOrders, CancelAllOrders, CancelOrder,
             GenerateFillReports, GenerateOrderStatusReport, GenerateOrderStatusReports,
-            GeneratePositionStatusReports, ModifyOrder, QueryAccount, QueryOrder, SubmitOrder,
-            SubmitOrderList, TradingCommand,
+            GeneratePositionStatusReports, ModifyOrder, PositionOperationEffects,
+            PositionOperationResult, PositionOperationStatus, PositionOperationTokenAmount,
+            QueryAccount, QueryOrder, QueryPositionOperation, SubmitOrder, SubmitOrderList,
+            SubmitPositionOperation, TradingCommand,
         },
     },
     msgbus::{
@@ -52,18 +54,24 @@ use nautilus_execution::{
 };
 use nautilus_model::{
     accounts::AccountAny,
+    ctf::{
+        MARKET_VERSION_KEY, MARKET_VERSION_V2, NegRiskMarketMetadata, base_units_to_decimal,
+        convert_amounts, ensure_instrument_active, quantity_to_base_units,
+    },
     data::{
         Bar, InstrumentClose, InstrumentStatus, OrderBookDeltas, OrderBookDepth, QuoteTick,
         TradeTick,
     },
-    enums::OmsType,
+    enums::{AccountType, InstrumentCloseType, OmsType},
     events::{OrderCancelDenied, OrderEventAny, OrderModifyDenied, OrderRejected, PositionEvent},
-    identifiers::{AccountId, ClientId, ClientOrderId, InstrumentId, Venue},
+    identifiers::{AccountId, ClientId, ClientOrderId, InstrumentId, PositionId, Venue},
     instruments::{Instrument, InstrumentAny},
     orders::{Order, OrderAny},
+    position_operation::{PositionOperationDirection, PositionOperationType},
     reports::{ExecutionMassStatus, FillReport, OrderStatusReport, PositionStatusReport},
-    types::{AccountBalance, MarginBalance, Money},
+    types::{AccountBalance, Currency, MarginBalance, Money, Quantity},
 };
+use rust_decimal::Decimal;
 use ustr::Ustr;
 
 use crate::config::SandboxExecutionClientConfig;
@@ -178,6 +186,13 @@ impl SandboxExecutionClient {
             .map(FillModelHandle::from)
             .unwrap_or_default();
 
+        let factory = OrderEventFactory::new(
+            core.trader_id,
+            core.account_id,
+            core.account_type,
+            core.base_currency,
+        );
+
         let inner = Rc::new_cyclic(|weak: &std::rc::Weak<RefCell<SandboxInner>>| {
             RefCell::new(SandboxInner {
                 clock: clock.clone(),
@@ -195,16 +210,14 @@ impl SandboxExecutionClient {
                 inbound_seq: 0,
                 client_id: core.client_id,
                 account_id: core.account_id,
+                factory: factory.clone(),
+                position_operations: AHashMap::new(),
+                pending_position_operation_cash: AHashMap::new(),
+                pending_position_operation_inputs: AHashMap::new(),
+                retained_convert_dependencies: AHashSet::new(),
                 self_weak: WeakCell::from(weak.clone()),
             })
         });
-
-        let factory = OrderEventFactory::new(
-            core.trader_id,
-            core.account_id,
-            core.account_type,
-            core.base_currency,
-        );
 
         Ok(Self {
             core: RefCell::new(core),
@@ -587,6 +600,10 @@ impl SandboxExecutionClient {
         }
 
         inner.clear_inbound_queue();
+        inner.position_operations.clear();
+        inner.pending_position_operation_cash.clear();
+        inner.pending_position_operation_inputs.clear();
+        inner.retained_convert_dependencies.clear();
         self.cancel_inbound_alert();
 
         log::info!(
@@ -883,6 +900,107 @@ impl ExecutionClient for SandboxExecutionClient {
         Ok(())
     }
 
+    fn submit_position_operation(&self, cmd: SubmitPositionOperation) -> anyhow::Result<()> {
+        let mut inner = self.inner.borrow_mut();
+        if inner.config.latency_model.is_none() {
+            inner.apply_submit_position_operation(&cmd);
+        } else {
+            inner.defer_or_apply(TradingCommand::SubmitPositionOperation(cmd));
+        }
+        Ok(())
+    }
+
+    fn on_position_operation_applied(
+        &self,
+        operation_id: UUID4,
+        legs: &[nautilus_model::position_operation::PositionOperationLeg],
+        _transaction_hash: Option<&str>,
+    ) {
+        let mut inner = self.inner.borrow_mut();
+        if let Some(reservations) = inner
+            .pending_position_operation_inputs
+            .remove(&operation_id)
+        {
+            for (instrument_id, position_id, quantity) in reservations {
+                if let Some(engine) = inner.matching_engines.get_mut(&instrument_id) {
+                    engine.release_position_operation(position_id, quantity);
+                }
+            }
+        }
+        if let Some((_, _, status)) = inner.position_operations.get_mut(&operation_id) {
+            *status = PositionOperationStatus::Applied;
+        }
+
+        if let Err(e) = inner.apply_pending_position_operation_cash(operation_id, legs) {
+            log::error!(
+                "Failed to apply simulated cash for position operation {operation_id}: {e}"
+            );
+        }
+    }
+
+    fn on_position_operation_applied_result(
+        &self,
+        result: &PositionOperationResult,
+        _legs: &[nautilus_model::position_operation::PositionOperationLeg],
+    ) {
+        let Some(sender) = try_get_exec_event_sender() else {
+            log::error!(
+                "Cannot send applied position operation {}: execution event sender is unavailable",
+                result.operation_id
+            );
+            return;
+        };
+        if let Err(e) = sender.send(ExecutionEvent::PositionOperation(result.clone())) {
+            log::error!(
+                "Failed to send applied position operation {}: {e}",
+                result.operation_id
+            );
+        }
+    }
+
+    fn query_position_operation(&self, cmd: QueryPositionOperation) -> anyhow::Result<()> {
+        let inner = self.inner.borrow();
+        let Some((operation, instrument_ids, status)) =
+            inner.position_operations.get(&cmd.operation_id).cloned()
+        else {
+            anyhow::bail!(
+                "sandbox has no record for position operation {}",
+                cmd.operation_id
+            );
+        };
+
+        let Some(sender) = try_get_exec_event_sender() else {
+            anyhow::bail!("execution event sender is unavailable");
+        };
+        let ts_event = self.clock.borrow().timestamp_ns();
+        let ts_init = self.clock.borrow().timestamp_ns();
+        let result = PositionOperationResult::new(
+            cmd.trader_id,
+            cmd.strategy_id,
+            inner.client_id,
+            inner.account_id,
+            cmd.operation_id,
+            operation,
+            status,
+            instrument_ids,
+            None,
+            None,
+            None,
+            None,
+            UUID4::new(),
+            ts_event,
+            ts_init,
+        );
+
+        if let Err(e) = sender.send(ExecutionEvent::PositionOperation(result)) {
+            log::error!(
+                "Failed to send position operation {} query result: {e}",
+                cmd.operation_id
+            );
+        }
+        Ok(())
+    }
+
     async fn generate_order_status_report(
         &self,
         cmd: &GenerateOrderStatusReport,
@@ -983,6 +1101,15 @@ fn order_status_report(order: &OrderAny, ts_init: UnixNanos) -> Option<OrderStat
 }
 
 // Wrapped in `Rc<RefCell<>>` so message handlers can hold weak references
+/// A simulated CTF convert before its venue result is sent.
+struct SimulatedConvert {
+    instrument_ids: Vec<InstrumentId>,
+    effects: PositionOperationEffects,
+    collateral: Decimal,
+    /// Input quantities the confirmed operation reserves until core applies it.
+    reservations: Vec<(InstrumentId, PositionId, Quantity)>,
+}
+
 struct SandboxInner {
     clock: Rc<RefCell<dyn Clock>>,
     cache: Rc<RefCell<Cache>>,
@@ -1004,6 +1131,25 @@ struct SandboxInner {
     inbound_seq: u64,
     client_id: ClientId,
     account_id: AccountId,
+    factory: OrderEventFactory,
+    /// Operations submitted in this session, keyed by operation identity for deduplication.
+    position_operations: AHashMap<
+        UUID4,
+        (
+            PositionOperationType,
+            Vec<InstrumentId>,
+            PositionOperationStatus,
+        ),
+    >,
+    /// Direct conversion cash retained until the core confirms application.
+    pending_position_operation_cash: AHashMap<UUID4, Decimal>,
+    /// Input token quantities confirmed by the venue but not yet applied by core, keyed by
+    /// operation. These remain reserved so a second operation or sell cannot consume the same
+    /// inventory.
+    pending_position_operation_inputs: AHashMap<UUID4, Vec<(InstrumentId, PositionId, Quantity)>>,
+    /// Instruments whose closed definitions and settlement evidence must survive normal cleanup
+    /// while the same negative-risk event can still produce them as convert outputs.
+    retained_convert_dependencies: AHashSet<InstrumentId>,
     self_weak: WeakCell<Self>,
 }
 
@@ -1038,6 +1184,506 @@ impl PartialEq for DelayedCommand {
 }
 
 impl Eq for DelayedCommand {}
+
+impl SandboxInner {
+    fn apply_submit_position_operation(&mut self, cmd: &SubmitPositionOperation) {
+        if self.config.account_type != AccountType::Cash || self.config.oms_type != OmsType::Netting
+        {
+            self.send_position_operation_result(
+                cmd,
+                PositionOperationStatus::Rejected,
+                cmd.instrument_ids.clone(),
+                None,
+                Some("sandbox position operations require a Cash/NETTING account".to_string()),
+            );
+            return;
+        }
+
+        if let Err(e) = cmd.validate() {
+            self.send_position_operation_result(
+                cmd,
+                PositionOperationStatus::Rejected,
+                cmd.instrument_ids.clone(),
+                None,
+                Some(e.to_string()),
+            );
+            return;
+        }
+
+        if cmd.operation != PositionOperationType::Convert {
+            self.send_position_operation_result(
+                cmd,
+                PositionOperationStatus::Rejected,
+                cmd.instrument_ids.clone(),
+                None,
+                Some(format!(
+                    "sandbox supports only CTF convert, was {}",
+                    cmd.operation
+                )),
+            );
+            return;
+        }
+
+        if self.position_operations.contains_key(&cmd.operation_id) {
+            return;
+        }
+
+        let SimulatedConvert {
+            instrument_ids,
+            effects,
+            collateral,
+            reservations,
+        } = match self.simulate_convert(cmd) {
+            Ok(simulated) => simulated,
+            Err(e) => {
+                self.send_position_operation_result(
+                    cmd,
+                    PositionOperationStatus::Rejected,
+                    cmd.instrument_ids.clone(),
+                    None,
+                    Some(e.to_string()),
+                );
+                return;
+            }
+        };
+
+        if !self.config.frozen_account && !collateral.is_zero() {
+            // Cash is applied only after the core confirms it applied the position changes, so a
+            // rejected or partially applied operation cannot change the simulated balance.
+            self.pending_position_operation_cash
+                .insert(cmd.operation_id, collateral);
+        }
+
+        if !reservations.is_empty() {
+            for (instrument_id, position_id, quantity) in &reservations {
+                let instrument = self.cache.borrow().instrument(instrument_id).cloned();
+                if let Some(instrument) = instrument {
+                    self.ensure_matching_engine(&instrument);
+                }
+                if let Some(engine) = self.matching_engines.get_mut(instrument_id) {
+                    engine.reserve_position_operation(*position_id, *quantity);
+                }
+            }
+            self.pending_position_operation_inputs
+                .insert(cmd.operation_id, reservations);
+        }
+
+        self.send_position_operation_result(
+            cmd,
+            PositionOperationStatus::Confirmed,
+            instrument_ids.clone(),
+            Some(effects),
+            None,
+        );
+        self.position_operations.insert(
+            cmd.operation_id,
+            (
+                cmd.operation,
+                instrument_ids,
+                PositionOperationStatus::Confirmed,
+            ),
+        );
+    }
+
+    fn pending_operation_reserved_quantity(&self, position_id: PositionId) -> Decimal {
+        self.pending_position_operation_inputs
+            .values()
+            .flatten()
+            .filter(|(_, reserved_position_id, _)| *reserved_position_id == position_id)
+            .map(|(_, _, quantity)| quantity.as_decimal())
+            .sum()
+    }
+
+    fn simulate_convert(
+        &mut self,
+        cmd: &SubmitPositionOperation,
+    ) -> anyhow::Result<SimulatedConvert> {
+        let quantity = cmd
+            .quantity
+            .ok_or_else(|| anyhow::anyhow!("CTF convert requires a quantity"))?;
+        let input_base = quantity_to_base_units(quantity)?;
+        let now = self.clock.borrow().timestamp_ns();
+
+        for instrument_id in &cmd.instrument_ids {
+            if let Some(engine) = self.matching_engines.get_mut(instrument_id) {
+                engine.purge_applied_pending_fills();
+            }
+        }
+
+        let mut market: Option<NegRiskMarketMetadata> = None;
+        let mut indices: Vec<u8> = Vec::new();
+        let mut spent = Vec::with_capacity(cmd.instrument_ids.len());
+        let mut reservations = Vec::with_capacity(cmd.instrument_ids.len());
+
+        {
+            let cache = self.cache.borrow();
+
+            for instrument_id in &cmd.instrument_ids {
+                let instrument = cache.instrument(instrument_id).ok_or_else(|| {
+                    anyhow::anyhow!("instrument {instrument_id} is not in the cache")
+                })?;
+                let InstrumentAny::BinaryOption(binary) = instrument else {
+                    anyhow::bail!("position operations require binary option instruments");
+                };
+                let positions = cache.positions_open(
+                    None,
+                    Some(instrument_id),
+                    Some(&cmd.strategy_id),
+                    Some(&self.account_id),
+                    None,
+                );
+                anyhow::ensure!(
+                    positions.len() <= 1,
+                    "multiple open positions for {instrument_id} in NETTING mode"
+                );
+                let position = positions.first();
+                let pending = position
+                    .map(|position| {
+                        self.matching_engines
+                            .get(instrument_id)
+                            .map(|engine| engine.pending_fill_quantity(position.id))
+                            .transpose()
+                            .map(Option::unwrap_or_default)
+                    })
+                    .transpose()?
+                    .unwrap_or_default();
+                let available = position.map_or(Decimal::ZERO, |position| {
+                    (position.signed_decimal_qty() + pending).max(Decimal::ZERO)
+                });
+                // Operations confirmed before core application have not changed the cache yet.
+                // Their inputs stay reserved so a second operation cannot consume them again.
+                let reserved = position
+                    .map(|position| self.pending_operation_reserved_quantity(position.id))
+                    .unwrap_or_default();
+                let available_after_pending = available - reserved;
+                anyhow::ensure!(
+                    available_after_pending >= quantity.as_decimal(),
+                    "sandbox convert requires {} available {instrument_id} after pending operations and fills, found {available_after_pending}",
+                    quantity.as_decimal()
+                );
+                anyhow::ensure!(
+                    !cache.instrument_close(instrument_id).is_some_and(|close| {
+                        close.close_type == InstrumentCloseType::ContractExpired
+                    }),
+                    "sandbox convert input {instrument_id} is already economically settled"
+                );
+                ensure_instrument_active(
+                    instrument_id,
+                    binary.activation_ns,
+                    binary.expiration_ns,
+                    now,
+                )?;
+
+                let info = binary
+                    .info
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("instrument {instrument_id} has no metadata"))?;
+                anyhow::ensure!(
+                    info.get_str(MARKET_VERSION_KEY) != Some(MARKET_VERSION_V2),
+                    "sandbox does not support V2 CTF convert for {instrument_id}"
+                );
+                let parsed = NegRiskMarketMetadata::parse(info)?;
+
+                if let Some(existing) = &market {
+                    anyhow::ensure!(
+                        existing == &parsed,
+                        "conversion inputs span different negative-risk markets"
+                    );
+                } else {
+                    market = Some(parsed);
+                }
+
+                let token_id = info
+                    .get_str("token_id")
+                    .ok_or_else(|| anyhow::anyhow!("instrument {instrument_id} has no token_id"))?;
+                let condition_id = info.get_str("condition_id").ok_or_else(|| {
+                    anyhow::anyhow!("instrument {instrument_id} has no condition_id")
+                })?;
+                let outcome = binary
+                    .outcome
+                    .map(|outcome| outcome.to_string())
+                    .unwrap_or_default();
+                anyhow::ensure!(
+                    outcome.eq_ignore_ascii_case("no"),
+                    "conversion inputs must be NO instruments"
+                );
+
+                let market = market.as_ref().expect("market was just set");
+                let condition = market.condition_for_no_token(token_id).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "token {token_id} is not a NO outcome of negative-risk market {}",
+                        market.market_id
+                    )
+                })?;
+                anyhow::ensure!(
+                    condition.condition_id == condition_id,
+                    "instrument {instrument_id} condition does not match its negative-risk metadata"
+                );
+                anyhow::ensure!(
+                    !indices.contains(&condition.question_index),
+                    "conversion inputs select question index {} more than once",
+                    condition.question_index
+                );
+
+                indices.push(condition.question_index);
+                spent.push(PositionOperationTokenAmount {
+                    token_id: token_id.to_string(),
+                    quantity: base_units_to_decimal(input_base)?.to_string(),
+                });
+                if let Some(position) = position {
+                    reservations.push((*instrument_id, position.id, quantity));
+                }
+            }
+        }
+
+        let market = market
+            .ok_or_else(|| anyhow::anyhow!("CTF convert requires at least one NO instrument"))?;
+        let amounts = convert_amounts(input_base, market.fee_bips, indices.len())
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+        let mut received = Vec::new();
+        let mut instrument_ids = cmd.instrument_ids.clone();
+        {
+            let cache = self.cache.borrow();
+            let instruments = cache.instruments(&self.config.venue, None);
+
+            for condition in &market.conditions {
+                if indices.contains(&condition.question_index) {
+                    continue;
+                }
+
+                let output = instruments
+                    .iter()
+                    .find_map(|instrument| {
+                        let InstrumentAny::BinaryOption(binary) = instrument else {
+                            return None;
+                        };
+                        let info = binary.info.as_ref()?;
+                        (info.get_str("token_id") == Some(condition.yes_token_id.as_str()))
+                            .then_some(*instrument)
+                    })
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "missing YES instrument for conversion output token {}",
+                            condition.yes_token_id
+                        )
+                    })?;
+                let InstrumentAny::BinaryOption(binary) = output else {
+                    unreachable!("output was matched as a binary option");
+                };
+
+                let output_quantity = base_units_to_decimal(amounts.per_outcome)?;
+                let has_open_short = cache
+                    .positions_open(
+                        None,
+                        Some(&output.id()),
+                        Some(&cmd.strategy_id),
+                        Some(&self.account_id),
+                        None,
+                    )
+                    .iter()
+                    .any(|position| position.signed_decimal_qty() < Decimal::ZERO);
+                anyhow::ensure!(
+                    !has_open_short,
+                    "sandbox conversion output {} has an open short position for strategy {}",
+                    output.id(),
+                    cmd.strategy_id
+                );
+
+                if let Some(close) = cache.instrument_close(&output.id()) {
+                    anyhow::ensure!(
+                        close.close_type == InstrumentCloseType::ContractExpired,
+                        "sandbox conversion output {} has a non-settlement close",
+                        output.id()
+                    );
+                } else {
+                    ensure_instrument_active(
+                        &output.id(),
+                        binary.activation_ns,
+                        binary.expiration_ns,
+                        now,
+                    )?;
+                }
+
+                instrument_ids.push(output.id());
+                received.push(PositionOperationTokenAmount {
+                    token_id: condition.yes_token_id.clone(),
+                    quantity: output_quantity.to_string(),
+                });
+            }
+        }
+
+        instrument_ids.sort();
+        instrument_ids.dedup();
+
+        {
+            let cache = self.cache.borrow();
+            for instrument_id in &instrument_ids {
+                anyhow::ensure!(
+                    cache
+                        .orders_open(None, Some(instrument_id), None, None, None)
+                        .is_empty(),
+                    "sandbox convert cannot proceed while active orders exist for {instrument_id}"
+                );
+            }
+        }
+
+        let collateral = base_units_to_decimal(amounts.collateral_return)?;
+        let effects = PositionOperationEffects {
+            received,
+            spent,
+            collateral_delta: collateral.to_string(),
+            payouts: Vec::new(),
+        };
+
+        Ok(SimulatedConvert {
+            instrument_ids,
+            effects,
+            collateral,
+            reservations,
+        })
+    }
+
+    fn apply_simulated_collateral(&mut self, collateral: Decimal) -> anyhow::Result<()> {
+        if self.config.frozen_account || collateral.is_zero() {
+            return Ok(());
+        }
+
+        let currency = Currency::pUSD();
+        let mut balances: Vec<AccountBalance> = {
+            let cache = self.cache.borrow();
+            match cache.account_owned(&self.account_id) {
+                Some(account) => account.balances().into_values().collect(),
+                None => self
+                    .balances
+                    .values()
+                    .map(|money| AccountBalance::new(*money, Money::zero(money.currency), *money))
+                    .collect(),
+            }
+        };
+
+        let delta =
+            Money::from_decimal(collateral, currency).map_err(|e| anyhow::anyhow!("{e}"))?;
+        if let Some(balance) = balances
+            .iter_mut()
+            .find(|balance| balance.currency == currency)
+        {
+            balance.total = balance.total + delta;
+            balance.free = balance.free + delta;
+        } else {
+            balances.push(AccountBalance::new(delta, Money::zero(currency), delta));
+        }
+
+        if let Some(total) = balances
+            .iter()
+            .find(|balance| balance.currency == currency)
+            .map(|balance| balance.total)
+        {
+            self.balances.insert(currency.code.to_string(), total);
+        }
+
+        let ts_event = self.clock.borrow().timestamp_ns();
+        let ts_init = self.clock.borrow().timestamp_ns();
+        let state = self.factory.generate_account_state(
+            balances,
+            Vec::new(),
+            false,
+            ts_event,
+            ts_init,
+            None,
+        );
+        msgbus::send_account_state(MessagingSwitchboard::portfolio_update_account(), &state);
+        Ok(())
+    }
+
+    fn position_operation_settlement_cash(
+        &self,
+        legs: &[nautilus_model::position_operation::PositionOperationLeg],
+    ) -> Decimal {
+        let cache = self.cache.borrow();
+        legs.iter()
+            .filter(|leg| leg.direction == PositionOperationDirection::Open)
+            .filter_map(|leg| {
+                let close = cache.instrument_close(&leg.instrument_id)?;
+                if close.close_type != InstrumentCloseType::ContractExpired {
+                    return None;
+                }
+                let position = cache.position(&leg.position_id)?;
+                if !position.is_closed() || !position.is_settled() {
+                    return None;
+                }
+                Some(leg.quantity.as_decimal() * close.close_price.as_decimal())
+            })
+            .sum()
+    }
+
+    fn apply_pending_position_operation_cash(
+        &mut self,
+        operation_id: UUID4,
+        legs: &[nautilus_model::position_operation::PositionOperationLeg],
+    ) -> anyhow::Result<()> {
+        let collateral = self
+            .pending_position_operation_cash
+            .remove(&operation_id)
+            .unwrap_or_default();
+        let total = collateral + self.position_operation_settlement_cash(legs);
+        if self.config.frozen_account || total.is_zero() {
+            return Ok(());
+        }
+
+        if let Err(e) = self.apply_simulated_collateral(total) {
+            if !collateral.is_zero() {
+                self.pending_position_operation_cash
+                    .insert(operation_id, collateral);
+            }
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    fn send_position_operation_result(
+        &self,
+        cmd: &SubmitPositionOperation,
+        status: PositionOperationStatus,
+        instrument_ids: Vec<InstrumentId>,
+        effects: Option<PositionOperationEffects>,
+        message: Option<String>,
+    ) {
+        let Some(sender) = try_get_exec_event_sender() else {
+            log::error!(
+                "Cannot send position operation {} result: execution event sender is unavailable",
+                cmd.operation_id
+            );
+            return;
+        };
+        let ts_event = self.clock.borrow().timestamp_ns();
+        let ts_init = self.clock.borrow().timestamp_ns();
+        let result = PositionOperationResult::new(
+            cmd.trader_id,
+            cmd.strategy_id,
+            self.client_id,
+            self.account_id,
+            cmd.operation_id,
+            cmd.operation,
+            status,
+            instrument_ids,
+            None,
+            None,
+            message,
+            effects,
+            UUID4::new(),
+            ts_event,
+            ts_init,
+        );
+
+        if let Err(e) = sender.send(ExecutionEvent::PositionOperation(result)) {
+            log::error!(
+                "Failed to send position operation {} result: {e}",
+                cmd.operation_id
+            );
+        }
+    }
+}
 
 impl SandboxInner {
     fn load_open_orders(&mut self) {
@@ -1241,13 +1887,22 @@ impl SandboxInner {
     fn process_instrument_close(&mut self, close: &InstrumentClose) {
         let instrument_id = close.instrument_id;
 
-        // A delayed close belongs to an existing exposure lifecycle. Unlike an
-        // instrument status update, it must not recreate execution state from
-        // cache after rotation/unsubscribe; pending-settlement ownership stays
-        // with the already-initialized matching engine.
+        // A delayed close belongs to an existing exposure lifecycle. Recreate execution state
+        // only for a retained convert output whose settlement message can arrive after cleanup.
         if let Some(engine) = self.matching_engines.get_mut(&instrument_id) {
             engine.process_instrument_close(*close);
             self.sync_expired_cleanup(instrument_id);
+        } else if close.close_type == InstrumentCloseType::ContractExpired
+            && self.retained_convert_dependencies.contains(&instrument_id)
+        {
+            if self.ensure_engine_for(instrument_id) {
+                self.seed_cached_market_data(instrument_id);
+
+                if let Some(engine) = self.matching_engines.get_mut(&instrument_id) {
+                    engine.process_instrument_close(*close);
+                    self.sync_expired_cleanup(instrument_id);
+                }
+            }
         } else {
             log::warn!(
                 "Ignoring instrument close for {instrument_id}: no existing matching engine",
@@ -1255,6 +1910,124 @@ impl SandboxInner {
         }
 
         self.drain_oto_commands();
+    }
+
+    fn has_pending_convert_for(&self, instrument_id: InstrumentId) -> bool {
+        self.position_operations
+            .values()
+            .any(|(operation, instrument_ids, status)| {
+                *operation == PositionOperationType::Convert
+                    && *status != PositionOperationStatus::Applied
+                    && instrument_ids.contains(&instrument_id)
+            })
+    }
+
+    /// Returns whether normal expiry cleanup must retain this settled YES definition.
+    ///
+    /// A negative-risk event can still produce the settled YES as a convert output while any
+    /// other condition's NO instrument remains available and unsettled for a supported input.
+    fn should_retain_convert_dependency(&self, instrument_id: InstrumentId) -> bool {
+        let cache = self.cache.borrow();
+        let Some(InstrumentAny::BinaryOption(output)) = cache.instrument(&instrument_id) else {
+            return false;
+        };
+
+        if !output
+            .outcome
+            .is_some_and(|outcome| outcome.as_str().eq_ignore_ascii_case("yes"))
+        {
+            return false;
+        }
+        let Some(info) = output.info.as_ref() else {
+            return false;
+        };
+
+        if info.get_bool("neg_risk") != Some(true) {
+            return false;
+        }
+
+        if !cache
+            .instrument_close(&instrument_id)
+            .is_some_and(|close| close.close_type == InstrumentCloseType::ContractExpired)
+        {
+            return false;
+        }
+        let Ok(market) = NegRiskMarketMetadata::parse(info) else {
+            return false;
+        };
+        let Some(output_token) = info.get_str("token_id") else {
+            return false;
+        };
+        let now = self.clock.borrow().timestamp_ns();
+        let instruments = cache.instruments(&self.config.venue, None);
+
+        for condition in &market.conditions {
+            if condition.yes_token_id == output_token {
+                continue;
+            }
+            let Some(input) = instruments.iter().find(|instrument| {
+                let InstrumentAny::BinaryOption(binary) = instrument else {
+                    return false;
+                };
+                binary
+                    .info
+                    .as_ref()
+                    .and_then(|info| info.get_str("token_id"))
+                    == Some(condition.no_token_id.as_str())
+            }) else {
+                continue;
+            };
+            let InstrumentAny::BinaryOption(input) = input else {
+                continue;
+            };
+
+            if input
+                .info
+                .as_ref()
+                .and_then(|info| info.get_str(MARKET_VERSION_KEY))
+                == Some(MARKET_VERSION_V2)
+            {
+                continue;
+            }
+
+            if cache
+                .instrument_close(&input.id)
+                .is_some_and(|close| close.close_type == InstrumentCloseType::ContractExpired)
+            {
+                continue;
+            }
+
+            if input.expiration_ns.is_zero() || now < input.expiration_ns {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn release_retained_convert_dependencies(&mut self) {
+        let retained: Vec<InstrumentId> =
+            self.retained_convert_dependencies.iter().copied().collect();
+
+        for instrument_id in retained {
+            let has_open_positions = self.cache.borrow().has_positions_open(
+                Some(&self.config.venue),
+                Some(&instrument_id),
+                None,
+                None,
+                None,
+            );
+
+            if has_open_positions
+                || self.should_retain_convert_dependency(instrument_id)
+                || self.has_pending_convert_for(instrument_id)
+            {
+                continue;
+            }
+            self.retained_convert_dependencies.remove(&instrument_id);
+            self.cache
+                .borrow_mut()
+                .purge_instrument_skip_order_guard(instrument_id);
+        }
     }
 
     fn is_expired_now(&self, instrument_id: InstrumentId) -> bool {
@@ -1305,9 +2078,48 @@ impl SandboxInner {
         }
 
         self.matching_engines.remove(&instrument_id);
+
+        if self.should_retain_convert_dependency(instrument_id)
+            || self.has_pending_convert_for(instrument_id)
+        {
+            let (instrument, close) = {
+                let cache = self.cache.borrow();
+                (
+                    cache.instrument(&instrument_id).cloned(),
+                    cache.instrument_close(&instrument_id).copied(),
+                )
+            };
+            {
+                let mut cache = self.cache.borrow_mut();
+                cache.purge_instrument_skip_order_guard(instrument_id);
+
+                if cache.instrument(&instrument_id).is_none()
+                    && let Some(instrument) = instrument
+                    && let Err(e) = cache.add_instrument(instrument)
+                {
+                    log::error!(
+                        "Failed to restore retained convert instrument {instrument_id}: {e}"
+                    );
+                }
+
+                if cache.instrument_close(&instrument_id).is_none()
+                    && let Some(close) = close
+                    && let Err(e) = cache.add_instrument_close(close)
+                {
+                    log::error!(
+                        "Failed to restore retained settlement evidence for {instrument_id}: {e}"
+                    );
+                }
+            }
+            self.retained_convert_dependencies.insert(instrument_id);
+            return;
+        }
+
+        self.retained_convert_dependencies.remove(&instrument_id);
         self.cache
             .borrow_mut()
             .purge_instrument_skip_order_guard(instrument_id);
+        self.release_retained_convert_dependencies();
     }
 
     fn sync_expired_cleanup_many(&mut self, instrument_ids: &[InstrumentId]) {
@@ -1338,6 +2150,7 @@ impl SandboxInner {
             self.sync_expired_cleanup(instrument_id);
         }
 
+        self.release_retained_convert_dependencies();
         self.drain_oto_commands();
     }
 
@@ -1373,6 +2186,12 @@ impl SandboxInner {
             TradingCommand::CancelOrders(cmd) => self.apply_batch_cancel_orders(cmd),
             TradingCommand::CancelAllOrders(cmd) => self.apply_cancel_all_orders(cmd),
             TradingCommand::QueryOrder(_) | TradingCommand::QueryAccount(_) => {}
+            TradingCommand::SubmitPositionOperation(cmd) => {
+                self.apply_submit_position_operation(cmd);
+            }
+            TradingCommand::QueryPositionOperation(_) => {
+                // Queries are answered directly by the client from retained operation state.
+            }
         }
         Ok(())
     }
@@ -1460,7 +2279,10 @@ impl SandboxInner {
             }
             // Cancel-all carries no individual command IDs to deny
             TradingCommand::CancelAllOrders(_) => {}
-            TradingCommand::QueryOrder(_) | TradingCommand::QueryAccount(_) => {}
+            TradingCommand::QueryOrder(_)
+            | TradingCommand::QueryAccount(_)
+            | TradingCommand::SubmitPositionOperation(_)
+            | TradingCommand::QueryPositionOperation(_) => {}
         }
     }
 
@@ -1811,6 +2633,10 @@ impl SandboxInner {
             TradingCommand::QueryOrder(_) | TradingCommand::QueryAccount(_) => {
                 Ok(DurationNanos::ZERO)
             }
+            TradingCommand::SubmitPositionOperation(_) => {
+                latency_model.get_insert_latency(command, ts_now)
+            }
+            TradingCommand::QueryPositionOperation(_) => Ok(DurationNanos::ZERO),
         }
     }
 

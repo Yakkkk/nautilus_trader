@@ -31,12 +31,62 @@ use ahash::AHashSet;
 use bytes::Bytes;
 use nautilus_core::{UUID4, UnixNanos};
 use nautilus_model::{
-    identifiers::{AccountId, InstrumentId, PositionId},
+    identifiers::{AccountId, InstrumentId, PositionId, StrategyId},
     position::Position,
-    types::Money,
+    types::{Money, Quantity},
 };
+use serde::{Deserialize, Serialize};
 
 use super::Cache;
+
+/// Returns the stable identity of a position cycle.
+///
+/// The opening operation or order distinguishes cycles that receive the same instrument at the
+/// same timestamp. Both identifiers survive NETTING snapshot archival, unlike the `PositionId`.
+#[must_use]
+pub fn settled_cycle_id(position: &Position) -> String {
+    format!(
+        "{}:{}:{}:{}:{}:{}",
+        position.instrument_id,
+        position.strategy_id,
+        position.account_id,
+        position.ts_opened,
+        position
+            .opening_operation_id
+            .map_or_else(String::new, |operation_id| operation_id.to_string()),
+        position
+            .opening_order_id
+            .map_or_else(String::new, |order_id| order_id.to_string()),
+    )
+}
+
+/// Physical token holding created when a position cycle was economically settled.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SettledPositionSource {
+    /// Position that held the tokens when the cycle settled.
+    pub position_id: PositionId,
+    /// Instrument of the settled tokens.
+    pub instrument_id: InstrumentId,
+    /// Strategy that owned the cycle.
+    pub strategy_id: StrategyId,
+    /// Account that owned the cycle.
+    pub account_id: AccountId,
+    /// Cycle opening timestamp.
+    pub ts_opened: UnixNanos,
+    /// Stable cycle identity, including the opening operation or order.
+    pub cycle_id: String,
+    /// Physical quantity held at settlement.
+    pub quantity: Quantity,
+}
+
+impl SettledPositionSource {
+    /// Prefix for durable settled-position source entries.
+    pub const PREFIX: &str = "position-settlement-source";
+
+    fn key(&self) -> String {
+        format!("{}:{}:{}", Self::PREFIX, self.instrument_id, self.cycle_id)
+    }
+}
 
 /// Cache-owned reference to a snapshot blob.
 ///
@@ -162,6 +212,108 @@ impl Cache {
         self.store_position_snapshot(position.id, snapshot, encoded);
 
         Ok(())
+    }
+
+    /// Records the physical quantity a settled position cycle still holds.
+    ///
+    /// The source is keyed by the cycle's stable identity rather than its `PositionId`, because
+    /// archiving a closed cycle assigns a new ID. Recording the same cycle twice is a no-op.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if serializing the source or writing it to the cache fails.
+    pub fn record_settled_position_source(
+        &mut self,
+        position: &Position,
+        quantity: Quantity,
+    ) -> anyhow::Result<()> {
+        if quantity.is_zero() {
+            return Ok(());
+        }
+
+        let source = SettledPositionSource {
+            position_id: position.id,
+            instrument_id: position.instrument_id,
+            strategy_id: position.strategy_id,
+            account_id: position.account_id,
+            ts_opened: position.ts_opened,
+            cycle_id: settled_cycle_id(position),
+            quantity,
+        };
+        let key = source.key();
+        if self.get(&key)?.is_some() {
+            return Ok(());
+        }
+
+        let encoded = Bytes::from(serde_json::to_vec(&source)?);
+        self.add(&key, encoded)
+    }
+
+    /// Restores position snapshot frames for an instrument and account from generic cache entries.
+    ///
+    /// A normal cache load restores the snapshot blobs but not their in-memory frame index. A
+    /// redeem source query needs the archived cycles, so this restores only the relevant frames
+    /// on demand instead of decoding every persisted snapshot at startup.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if reading generic cache entries fails. Individual malformed or
+    /// incomplete frames are logged and skipped.
+    pub fn restore_position_snapshots_for(
+        &mut self,
+        instrument_id: &InstrumentId,
+        account_id: AccountId,
+    ) -> anyhow::Result<()> {
+        let mut entries = Vec::new();
+        let mut blobs = self.general_entries_with_prefix(CacheSnapshotRef::POSITION_PREFIX);
+        if blobs.is_empty() && self.general.is_empty() && self.database.is_some() {
+            self.cache_general()?;
+            blobs = self.general_entries_with_prefix(CacheSnapshotRef::POSITION_PREFIX);
+        }
+
+        for (blob_ref, blob) in blobs {
+            let Ok((position_id, index)) = parse_position_snapshot_blob_ref(&blob_ref) else {
+                continue;
+            };
+            let Ok(position) = decode_position_snapshot_blob(&position_id, blob.as_ref()) else {
+                continue;
+            };
+
+            if position.instrument_id == *instrument_id && position.account_id == account_id {
+                entries.push((position_id, index, blob_ref, blob));
+            }
+        }
+
+        entries.sort_by(|left, right| {
+            left.0
+                .as_str()
+                .cmp(right.0.as_str())
+                .then(left.1.cmp(&right.1))
+        });
+
+        for (_, _, blob_ref, blob) in entries {
+            if let Err(e) = self.restore_snapshot_blob(&blob_ref, blob) {
+                log::warn!("Failed to restore position snapshot {blob_ref}: {e}");
+            }
+        }
+        Ok(())
+    }
+
+    /// Returns physical holdings recorded for settled cycles of an instrument and account.
+    #[must_use]
+    pub fn settled_position_source_records(
+        &self,
+        instrument_id: &InstrumentId,
+        account_id: AccountId,
+    ) -> Vec<SettledPositionSource> {
+        let prefix = format!("{}:{}:", SettledPositionSource::PREFIX, instrument_id);
+        self.general_entries_with_prefix(&prefix)
+            .into_iter()
+            .filter_map(|(_, bytes)| serde_json::from_slice::<SettledPositionSource>(&bytes).ok())
+            .filter(|source| {
+                source.instrument_id == *instrument_id && source.account_id == account_id
+            })
+            .collect()
     }
 
     /// Creates a snapshot of the `position` and returns its encoded cache-owned reference.

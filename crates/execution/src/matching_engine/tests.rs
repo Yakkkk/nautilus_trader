@@ -1680,6 +1680,90 @@ fn test_pending_modify_updates_acknowledge_individually_and_reset() {
 }
 
 #[rstest]
+fn test_modify_sell_rejected_while_position_operation_reserved() {
+    let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt());
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    let mut engine = OrderMatchingEngine::new(
+        instrument.clone(),
+        1,
+        FillModelHandle::default(),
+        FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into(),
+        BookType::L2_MBP,
+        OmsType::Netting,
+        AccountType::Margin,
+        Rc::new(RefCell::new(VirtualClock::new())),
+        cache,
+        OrderMatchingEngineConfig::default(),
+    );
+    engine.set_event_handler(Rc::new(|_| {}));
+
+    let mut order = OrderTestBuilder::new(OrderType::Limit)
+        .instrument_id(instrument.id())
+        .side(OrderSide::Sell)
+        .quantity(Quantity::from("1.000"))
+        .price(Price::from("1000.00"))
+        .submit(true)
+        .build();
+    let id = order.client_order_id();
+    let position_id = PositionId::new(format!("{}-{}", instrument.id(), order.strategy_id()));
+    process_cached_order(&mut engine, &mut order, AccountId::from("ACCOUNT-001"));
+
+    engine.reserve_position_operation(position_id, Quantity::from("1.000"));
+
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let captured = events.clone();
+    engine.set_event_handler(Rc::new(move |event| captured.borrow_mut().push(event)));
+    engine.process_modify(
+        &ModifyOrder::new(
+            order.trader_id(),
+            None,
+            order.strategy_id(),
+            order.instrument_id(),
+            id,
+            None,
+            Some(Quantity::from("2.000")),
+            None,
+            None,
+            UUID4::new(),
+            UnixNanos::from(1),
+            None,
+            None,
+        ),
+        AccountId::from("ACCOUNT-001"),
+    );
+
+    assert!(matches!(
+        events.borrow().as_slice(),
+        [OrderEventAny::ModifyRejected(_)]
+    ));
+
+    engine.release_position_operation(position_id, Quantity::from("1.000"));
+    engine.process_modify(
+        &ModifyOrder::new(
+            order.trader_id(),
+            None,
+            order.strategy_id(),
+            order.instrument_id(),
+            id,
+            None,
+            Some(Quantity::from("2.000")),
+            None,
+            None,
+            UUID4::new(),
+            UnixNanos::from(2),
+            None,
+            None,
+        ),
+        AccountId::from("ACCOUNT-001"),
+    );
+
+    assert!(matches!(
+        events.borrow().last(),
+        Some(OrderEventAny::Updated(_))
+    ));
+}
+
+#[rstest]
 #[case::accepted_parent(false, false)]
 #[case::rejected_parent(true, false)]
 #[case::child_listed_first(false, true)]

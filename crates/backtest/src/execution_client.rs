@@ -25,11 +25,12 @@ use nautilus_common::{
     factories::OrderEventFactory,
     messages::execution::{
         BatchCancelOrders, BatchModifyOrders, CancelAllOrders, CancelOrder, ModifyOrder,
-        QueryAccount, QueryOrder, SubmitOrder, SubmitOrderList, TradingCommand,
+        PositionOperationResult, QueryAccount, QueryOrder, QueryPositionOperation, SubmitOrder,
+        SubmitOrderList, SubmitPositionOperation, TradingCommand,
     },
-    msgbus::{self, MessagingSwitchboard},
+    msgbus::{self, MessagingSwitchboard, switchboard},
 };
-use nautilus_core::{Params, UnixNanos, WeakCell};
+use nautilus_core::{Params, UUID4, UnixNanos, WeakCell};
 use nautilus_execution::client::core::ExecutionClientCore;
 use nautilus_model::{
     accounts::AccountAny,
@@ -37,10 +38,14 @@ use nautilus_model::{
     events::OrderEventAny,
     identifiers::{AccountId, ClientId, ClientOrderId, TraderId, Venue},
     orders::OrderAny,
+    position_operation::PositionOperationLeg,
     types::{AccountBalance, MarginBalance},
 };
 
 use crate::exchange::SimulatedExchange;
+
+/// Applied position operation legs awaiting release after the core callback.
+type QueuedPositionOperationApplication = (UUID4, Vec<PositionOperationLeg>);
 
 /// Execution client implementation for backtesting trading operations.
 ///
@@ -62,6 +67,18 @@ pub struct BacktestExecutionClient {
     /// borrow via its `execute` handler. Instead, events are buffered here
     /// and drained by the engine after the execute borrow is released.
     queued_events: Rc<RefCell<Vec<OrderEventAny>>>,
+    /// Position operation results buffered until the exchange borrow is released.
+    ///
+    /// The simulated exchange reports a confirmed operation from inside its own mutable borrow.
+    /// Delivering the result synchronously would re-enter the exchange through the core's applied
+    /// callback, so results are buffered alongside order events and drained by the engine.
+    queued_position_operation_results: Rc<RefCell<Vec<PositionOperationResult>>>,
+    /// Applied position operation legs buffered until the execution engine borrow is released.
+    ///
+    /// The engine invokes the applied callback from inside its own mutable borrow. Releasing the
+    /// exchange reservation there can emit expiration fills that re-enter the engine, so the
+    /// release is deferred to the client event drain.
+    queued_position_operation_applications: Rc<RefCell<Vec<QueuedPositionOperationApplication>>>,
     routing: bool,
     _frozen_account: bool,
 }
@@ -89,15 +106,22 @@ impl BacktestExecutionClient {
     ) -> Self {
         let routing = routing.unwrap_or(false);
         let frozen_account = frozen_account.unwrap_or(false);
-        let exchange_id = exchange.borrow().id;
-        let account_type = exchange.borrow().account_type;
-        let base_currency = exchange.borrow().base_currency;
+        let (exchange_id, account_type, base_currency, oms_type, queued_position_operation_results) = {
+            let exchange = exchange.borrow();
+            (
+                exchange.id,
+                exchange.account_type,
+                exchange.base_currency,
+                exchange.oms_type,
+                exchange.position_operation_result_queue(),
+            )
+        };
 
         let core = ExecutionClientCore::new(
             trader_id,
             ClientId::from(exchange_id.as_str()),
             Venue::from(exchange_id.as_str()),
-            exchange.borrow().oms_type,
+            oms_type,
             account_id,
             account_type,
             base_currency,
@@ -113,6 +137,8 @@ impl BacktestExecutionClient {
             cache,
             clock,
             queued_events: Rc::new(RefCell::new(Vec::new())),
+            queued_position_operation_results,
+            queued_position_operation_applications: Rc::new(RefCell::new(Vec::new())),
             routing,
             _frozen_account: frozen_account,
         }
@@ -129,6 +155,52 @@ impl BacktestExecutionClient {
         for event in events {
             msgbus::send_order_event(endpoint, event);
         }
+    }
+
+    /// Drain buffered position operation results, sending each to the exec engine.
+    ///
+    /// Applied legs queued by the engine callback are released afterwards, once the engine borrow
+    /// has been released, and the order events produced by their venue settlement are drained.
+    pub fn drain_queued_position_operation_results(&self) {
+        let results: Vec<PositionOperationResult> = self
+            .queued_position_operation_results
+            .borrow_mut()
+            .drain(..)
+            .collect();
+        let endpoint = MessagingSwitchboard::exec_engine_position_operation();
+        for result in results {
+            msgbus::send_any_value(endpoint, &result);
+            msgbus::publish_any(
+                switchboard::get_event_position_operation_topic(result.strategy_id),
+                &result,
+            );
+        }
+
+        self.drain_queued_position_operation_applications();
+    }
+
+    /// Releases applied operations buffered during the core callback and drains their events.
+    pub fn drain_queued_position_operation_applications(&self) {
+        let applications: Vec<QueuedPositionOperationApplication> = self
+            .queued_position_operation_applications
+            .borrow_mut()
+            .drain(..)
+            .collect();
+
+        for (operation_id, legs) in applications {
+            let Some(exchange) = self.exchange.upgrade() else {
+                continue;
+            };
+            let mut exchange = exchange.borrow_mut();
+            exchange.mark_position_operation_applied(operation_id);
+            if let Err(e) = exchange.apply_pending_position_operation_cash(operation_id, &legs) {
+                log::error!(
+                    "Failed to apply simulated cash for position operation {operation_id}: {e}"
+                );
+            }
+        }
+
+        self.drain_queued_events();
     }
 
     pub(crate) fn order_event_handler(&self) -> Rc<dyn Fn(OrderEventAny)> {
@@ -194,6 +266,10 @@ impl ExecutionClient for BacktestExecutionClient {
 
     fn reset(&mut self) -> anyhow::Result<()> {
         self.queued_events.borrow_mut().clear();
+        self.queued_position_operation_results.borrow_mut().clear();
+        self.queued_position_operation_applications
+            .borrow_mut()
+            .clear();
         Ok(())
     }
 
@@ -236,6 +312,53 @@ impl ExecutionClient for BacktestExecutionClient {
                 .send(TradingCommand::SubmitOrderList(cmd));
         } else {
             log::error!("submit_order_list: SimulatedExchange has been dropped");
+        }
+        Ok(())
+    }
+
+    fn on_position_operation_applied(
+        &self,
+        operation_id: UUID4,
+        legs: &[PositionOperationLeg],
+        _transaction_hash: Option<&str>,
+    ) {
+        self.queued_position_operation_applications
+            .borrow_mut()
+            .push((operation_id, legs.to_vec()));
+    }
+
+    fn on_position_operation_applied_result(
+        &self,
+        result: &PositionOperationResult,
+        _legs: &[PositionOperationLeg],
+    ) {
+        self.queued_position_operation_results
+            .borrow_mut()
+            .push(result.clone());
+    }
+
+    fn settles_contract_expirations(&self) -> bool {
+        true
+    }
+
+    fn submit_position_operation(&self, cmd: SubmitPositionOperation) -> anyhow::Result<()> {
+        if let Some(exchange) = self.exchange.upgrade() {
+            exchange
+                .borrow_mut()
+                .send(TradingCommand::SubmitPositionOperation(cmd));
+        } else {
+            log::error!("submit_position_operation: SimulatedExchange has been dropped");
+        }
+        Ok(())
+    }
+
+    fn query_position_operation(&self, cmd: QueryPositionOperation) -> anyhow::Result<()> {
+        if let Some(exchange) = self.exchange.upgrade() {
+            exchange
+                .borrow_mut()
+                .send(TradingCommand::QueryPositionOperation(cmd));
+        } else {
+            log::error!("query_position_operation: SimulatedExchange has been dropped");
         }
         Ok(())
     }
@@ -304,7 +427,10 @@ impl ExecutionClient for BacktestExecutionClient {
 
 #[cfg(test)]
 mod tests {
-    use nautilus_common::{clock::VirtualClock, messages::execution::QueryOrder};
+    use nautilus_common::{
+        clock::VirtualClock,
+        messages::execution::{PositionOperationStatus, QueryOrder},
+    };
     use nautilus_core::{DurationNanos, UUID4};
     use nautilus_execution::models::{
         fee::{FeeModelAny, MakerTakerFeeModel},
@@ -314,6 +440,7 @@ mod tests {
         enums::{AccountType, BookType, OmsType},
         events::OrderSubmitted,
         identifiers::{InstrumentId, StrategyId},
+        position_operation::PositionOperationType,
         stubs::TestDefault,
         types::{Currency, Money},
     };
@@ -409,11 +536,61 @@ mod tests {
         let handler = client.order_event_handler();
         handler(event.clone());
         assert_eq!(*client.queued_events.borrow(), vec![event]);
+        client
+            .queued_position_operation_results
+            .borrow_mut()
+            .push(PositionOperationResult::new(
+                TraderId::test_default(),
+                StrategyId::test_default(),
+                ClientId::test_default(),
+                AccountId::test_default(),
+                UUID4::new(),
+                PositionOperationType::Convert,
+                PositionOperationStatus::Confirmed,
+                Vec::new(),
+                None,
+                None,
+                None,
+                None,
+                UUID4::new(),
+                UnixNanos::from(1),
+                UnixNanos::from(1),
+            ));
+        client
+            .queued_position_operation_applications
+            .borrow_mut()
+            .push((UUID4::new(), Vec::new()));
 
         cloned.reset().unwrap();
 
+        // Assert the reset itself cleared every queue before the drain can hide a miss.
         assert_eq!(*client.queued_events.borrow(), Vec::<OrderEventAny>::new());
         assert_eq!(*cloned.queued_events.borrow(), Vec::<OrderEventAny>::new());
+        assert!(client.queued_position_operation_results.borrow().is_empty());
+        assert!(cloned.queued_position_operation_results.borrow().is_empty());
+        assert!(
+            client
+                .queued_position_operation_applications
+                .borrow()
+                .is_empty(),
+            "reset must clear buffered operation applications shared across clones"
+        );
+        assert!(
+            cloned
+                .queued_position_operation_applications
+                .borrow()
+                .is_empty()
+        );
+
+        // Draining after reset must be a no-op rather than executing a stale application.
+        cloned.drain_queued_position_operation_applications();
+        assert_eq!(*client.queued_events.borrow(), Vec::<OrderEventAny>::new());
+        assert!(
+            client
+                .queued_position_operation_applications
+                .borrow()
+                .is_empty()
+        );
     }
 
     #[rstest]

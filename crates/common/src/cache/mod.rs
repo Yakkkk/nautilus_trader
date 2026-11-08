@@ -94,8 +94,8 @@ use nautilus_model::{
         price::PriceRaw,
     },
 };
-pub use position::CacheSnapshotRef;
 use position::PositionSnapshotFrame;
+pub use position::{CacheSnapshotRef, SettledPositionSource, settled_cycle_id};
 pub use refs::{AccountRef, AccountRefMut, OrderRef, OrderRefMut, PositionRef, PositionRefMut};
 use rust_decimal::Decimal;
 use ustr::Ustr;
@@ -3795,12 +3795,17 @@ impl Cache {
         self.index.strategy_orders.entry(strategy_id).or_default();
 
         if index_order {
-            self.index_position_id_in_memory(
-                &position_id,
-                &instrument_id.venue,
-                &opening_order_id,
-                &strategy_id,
-            );
+            if let Some(opening_order_id) = opening_order_id {
+                self.index_position_id_in_memory(
+                    &position_id,
+                    &instrument_id.venue,
+                    &opening_order_id,
+                    &strategy_id,
+                );
+            } else {
+                // Operation-opened positions have no order to index.
+                self.index_position(&position_id, &instrument_id.venue, &strategy_id);
+            }
         } else {
             self.index_position(&position_id, &instrument_id.venue, &strategy_id);
         }
@@ -3827,7 +3832,7 @@ impl Cache {
         log::debug!("Adding general {key}");
         self.general.insert(key.clone(), value.clone());
 
-        if index_order {
+        if index_order && let Some(opening_order_id) = opening_order_id {
             self.persist_position_id(&position_id, &opening_order_id)?;
         }
 
@@ -3844,6 +3849,24 @@ impl Cache {
             database.add(key, value)?;
         }
 
+        Ok(())
+    }
+
+    /// Validates a position update without changing cache state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the position key, OMS type, or serialized payload is invalid.
+    pub fn validate_position_update(
+        &self,
+        position: &Position,
+        oms_type: OmsType,
+    ) -> anyhow::Result<()> {
+        let oms_type = resolve_position_oms(position, oms_type);
+        let key = position_oms_key(position.id);
+        check_valid_string_utf8(&key, stringify!(key))?;
+        let value = Bytes::from(serde_json::to_vec(&oms_type)?);
+        check_predicate_false(value.is_empty(), stringify!(value))?;
         Ok(())
     }
 
@@ -4295,14 +4318,46 @@ impl Cache {
         let Some(position_cell) = self.positions.get(&position_id).cloned() else {
             anyhow::bail!("Cannot update position {position_id}: not found in cache");
         };
+        let ts_opened = position_cell.borrow().ts_opened;
+        self.update_position_from_instrument_close_at(
+            position_id,
+            close,
+            close.ts_event.max(ts_opened),
+        )
+    }
 
-        let position = {
+    /// Updates a cached position from an instrument close with an explicit confirmation time.
+    ///
+    /// The close keeps its original market result timestamp in replay, while the position records
+    /// `ts_confirmed` as `ts_last`/`ts_closed`. This prevents an output received after the market
+    /// resolved from appearing closed before it was opened.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the position is not already held in the cache or the close cannot be
+    /// applied. An error leaves the position unchanged.
+    pub fn update_position_from_instrument_close_at(
+        &mut self,
+        position_id: PositionId,
+        close: InstrumentClose,
+        ts_confirmed: UnixNanos,
+    ) -> anyhow::Result<Position> {
+        let Some(position_cell) = self.positions.get(&position_id).cloned() else {
+            anyhow::bail!("Cannot update position {position_id}: not found in cache");
+        };
+
+        let (position, physical_settled) = {
             let mut position = position_cell.borrow_mut();
-            position.apply_instrument_close(close)?;
-            position.clone_without_events()
+            let physical_settled = position.quantity;
+            position.apply_instrument_close_at(close, ts_confirmed)?;
+            (position.clone_without_events(), physical_settled)
         };
 
         self.refresh_position_indexes(&position);
+
+        if let Err(e) = self.record_settled_position_source(&position, physical_settled) {
+            log::error!("Failed to record settled source for position {position_id}: {e}");
+        }
 
         if let Some(database) = &mut self.database
             && let Err(e) = database.update_position(&position_cell.borrow())
@@ -6655,6 +6710,19 @@ impl Cache {
         check_valid_string_utf8(key, stringify!(key))?;
 
         Ok(self.general.get(key))
+    }
+
+    /// Returns all general entries whose keys start with `prefix`, sorted by key.
+    #[must_use]
+    pub fn general_entries_with_prefix(&self, prefix: &str) -> Vec<(String, Bytes)> {
+        let mut entries: Vec<(String, Bytes)> = self
+            .general
+            .iter()
+            .filter(|(key, _)| key.starts_with(prefix))
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        entries.sort_by(|(a, _), (b, _)| a.cmp(b));
+        entries
     }
 
     // -- DATA QUERIES ----------------------------------------------------------------------------

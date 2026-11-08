@@ -60,7 +60,8 @@ mod tests;
 
 pub use ids::{
     create_inferred_reconciliation_trade_id, create_position_reconciliation_venue_order_id,
-    inferred_reconciliation_trade_ids, is_inferred_reconciliation_trade_id_format,
+    inferred_reconciliation_trade_ids, inferred_reconciliation_trade_ids_including_voided,
+    is_inferred_reconciliation_trade_id_format,
 };
 pub use orders::{
     create_incremental_inferred_fill, create_inferred_fill_for_qty, create_reconciliation_rejected,
@@ -82,6 +83,12 @@ pub use types::ReconciliationResult;
 
 /// Order tag marking a synthetic order that reconciliation creates to align a position.
 pub const RECONCILIATION_ORDER_TAG: &str = "RECONCILIATION";
+
+/// `OrderFilled.info` key marking a trade ID inferred from an order status report.
+///
+/// The marker records provenance that cannot be recovered from the ID itself; a real venue
+/// `FillReport` may carry a UUID trade ID or reconciliation events without carrying this key.
+pub const INFERRED_RECONCILIATION_FILL_INFO_KEY: &str = "inferred_reconciliation_fill";
 
 fn reconciliation_price(value: Decimal, instrument: &InstrumentAny) -> CorrectnessResult<Price> {
     // Reconstructed averages need not lie on price ticks, keep their representable precision

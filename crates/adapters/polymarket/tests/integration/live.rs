@@ -25,9 +25,10 @@ use nautilus_common::{
     cache::Cache,
     messages::execution::{
         GenerateFillReportsBuilder, GenerateOrderStatusReport, GenerateOrderStatusReportsBuilder,
-        QueryAccount, QueryOrder, TradingCommand,
+        PositionOperationResult, PositionOperationStatus, QueryAccount, QueryOrder,
+        SubmitPositionOperation, TradingCommand,
     },
-    msgbus::{self, TypedHandler},
+    msgbus::{self, MessagingSwitchboard, ShareableMessageHandler, TypedHandler},
     testing::wait_until_async,
 };
 use nautilus_core::{Params, UUID4, UnixNanos};
@@ -36,13 +37,19 @@ use nautilus_live::{
     testing::{ExecutionHarness, RoutedKind},
 };
 use nautilus_model::{
-    enums::{LiquiditySide, OrderSide, OrderStatus, OrderType, TimeInForce},
+    data::InstrumentClose,
+    enums::{
+        AssetClass, InstrumentCloseType, LiquiditySide, OmsType, OrderSide, OrderStatus, OrderType,
+        TimeInForce,
+    },
     events::{OrderEventAny, OrderRejected, OrderUpdated},
     identifiers::{
-        AccountId, ClientOrderId, InstrumentId, StrategyId, TradeId, TraderId, VenueOrderId,
+        AccountId, ClientOrderId, InstrumentId, StrategyId, Symbol, TradeId, TraderId, VenueOrderId,
     },
-    instruments::InstrumentAny,
+    instruments::{BinaryOption, Instrument, InstrumentAny},
     orders::{Order, OrderAny, OrderTestBuilder, stubs::TestOrderEventStubs},
+    position::Position,
+    position_operation::{PositionOperationDirection, PositionOperationLeg, PositionOperationType},
     reports::{ExecutionMassStatus, FillReport, OrderStatusReport},
     types::{AccountBalance, Currency, Money, Price, Quantity},
 };
@@ -54,6 +61,7 @@ use ustr::Ustr;
 use crate::{
     harness,
     mock_venue::{DEFAULT_ACCEPTED_ORDER_ID, load_json},
+    positions::TestServerState as PositionServerState,
 };
 
 const DEADLINE: Duration = Duration::from_secs(5);
@@ -3748,4 +3756,1471 @@ fn seed_partially_filled(execution: &ExecutionHarness, order: &OrderAny) {
         None,
         Some(account_id),
     ));
+}
+
+fn operation_fill_trade(
+    id: &str,
+    asset_id: &str,
+    market: &str,
+    outcome: &str,
+    taker_order_id: &str,
+    status: &str,
+) -> Value {
+    let mut trade = user_trade("ws_user_trade_full.json", status);
+    trade["id"] = json!(id);
+    trade["asset_id"] = json!(asset_id);
+    trade["market"] = json!(market);
+    trade["outcome"] = json!(outcome);
+    trade["taker_order_id"] = json!(taker_order_id);
+    trade["maker_orders"][0]["asset_id"] = json!(asset_id);
+    trade["maker_orders"][0]["matched_amount"] = json!("100.0000");
+    trade["maker_orders"][0]["outcome"] = json!(outcome);
+    trade["maker_orders"][0]["price"] = json!("0.5000");
+    trade
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "test helper mirrors the fill identity and instrument metadata"
+)]
+async fn confirmed_ws_buy_fill(
+    instrument: &InstrumentAny,
+    condition_id: &str,
+    asset_id: &str,
+    outcome: &str,
+    strategy_id: StrategyId,
+    client_order_id: &str,
+    venue_order_id: &str,
+    trade_id: &str,
+) -> (OrderAny, OrderAny, Value) {
+    let cached_instrument = instrument.clone();
+    let mut h = Box::pin(harness::Harness::build_with_cache(move |h| {
+        h.cache()
+            .borrow_mut()
+            .add_instrument(cached_instrument)
+            .unwrap();
+    }))
+    .await;
+
+    if let Some(response) = h.mock_state.order_response.lock().await.as_mut() {
+        response["orderID"] = json!(venue_order_id);
+    }
+
+    let order = OrderTestBuilder::new(OrderType::Limit)
+        .trader_id(TraderId::from(harness::TRADER_ID))
+        .strategy_id(strategy_id)
+        .instrument_id(instrument.id())
+        .client_order_id(ClientOrderId::from(client_order_id))
+        .side(OrderSide::Buy)
+        .price(Price::from("0.5000"))
+        .quantity(Quantity::from("100.0000"))
+        .time_in_force(TimeInForce::Gtc)
+        .build();
+    h.submit_via_risk(&order);
+    assert!(
+        h.pump_until(DEADLINE, |cache| {
+            order_reached(cache, &order, OrderStatus::Accepted)
+        })
+        .await,
+        "recovered buy order did not reach Accepted",
+    );
+
+    let mut trade = operation_fill_trade(
+        trade_id,
+        asset_id,
+        condition_id,
+        outcome,
+        venue_order_id,
+        "MATCHED",
+    );
+    h.mock_state.send_user(trade.clone()).await;
+    assert!(
+        h.pump_until(DEADLINE, |cache| {
+            order_reached(cache, &order, OrderStatus::Filled)
+        })
+        .await,
+        "recovered buy order did not fill",
+    );
+    trade["status"] = json!("CONFIRMED");
+    h.mock_state.send_user(trade.clone()).await;
+
+    let filled = cached_order(&h, &order);
+    (order, filled, trade)
+}
+
+const POSITION_MARKET_ID: &str =
+    "0x2222222222222222222222222222222222222222222222222222222222222200";
+const POSITION_STRATEGY_ID: &str = "S-POSITION-001";
+
+fn position_market() -> Value {
+    json!({
+        "market_id": POSITION_MARKET_ID,
+        "fee_bips": 100,
+        "conditions": [
+            {
+                "question_index": 0,
+                "condition_id": format!("0x{}{:02x}", "11".repeat(31), 0),
+                "yes_token_id": "512",
+                "no_token_id": "256",
+            },
+            {
+                "question_index": 1,
+                "condition_id": format!("0x{}{:02x}", "11".repeat(31), 1),
+                "yes_token_id": "513",
+                "no_token_id": "257",
+            },
+        ],
+    })
+}
+
+fn position_instrument(condition: &str, token_id: u64, outcome: &str) -> InstrumentAny {
+    let market = position_market();
+    let info = serde_json::from_value(json!({
+        "market_version": "v1",
+        "condition_id": condition,
+        "token_id": token_id.to_string(),
+        "neg_risk": true,
+        "neg_risk_market": market,
+        "gamma_event": {"negRiskMarketID": POSITION_MARKET_ID},
+    }))
+    .unwrap();
+    let instrument = BinaryOption::builder()
+        .instrument_id(InstrumentId::from(
+            format!("TOKEN-{token_id}.POLYMARKET").as_str(),
+        ))
+        .raw_symbol(Symbol::new(format!("TOKEN-{token_id}")))
+        .asset_class(AssetClass::Alternative)
+        .currency(Currency::pUSD())
+        .activation_ns(UnixNanos::default())
+        .expiration_ns(UnixNanos::from(4_000_000_000_000_000_000u64))
+        .price_precision(4)
+        .size_precision(4)
+        .price_increment(Price::from("0.0001"))
+        .size_increment(Quantity::from("0.0001"))
+        .outcome(Ustr::from(outcome))
+        .info(info)
+        .ts_event(UnixNanos::default())
+        .ts_init(UnixNanos::default())
+        .build()
+        .unwrap();
+    InstrumentAny::BinaryOption(instrument)
+}
+
+fn seed_operation_position(
+    harness: &ExecutionHarness,
+    instrument: &InstrumentAny,
+    quantity: Quantity,
+    cost: Decimal,
+) {
+    let strategy_id = StrategyId::from(POSITION_STRATEGY_ID);
+    let account_id = harness.account_id();
+    let position_id =
+        nautilus_model::identifiers::PositionId::from(format!("{}-{strategy_id}", instrument.id()));
+    let leg = PositionOperationLeg {
+        operation_id: UUID4::new(),
+        operation: PositionOperationType::Convert,
+        direction: PositionOperationDirection::Open,
+        trader_id: harness.trader_id(),
+        strategy_id,
+        account_id,
+        instrument_id: instrument.id(),
+        position_id,
+        quantity,
+        cost,
+        income: None,
+        settled: false,
+        event_id: UUID4::new(),
+        ts_event: UnixNanos::from(1),
+        ts_init: UnixNanos::from(2),
+    };
+    let position = Position::new_from_operation_checked(instrument, leg).unwrap();
+    harness
+        .cache()
+        .borrow_mut()
+        .add_position_without_order(&position, OmsType::Netting)
+        .unwrap();
+}
+
+#[rstest]
+#[tokio::test]
+async fn managed_convert_routes_to_position_cache_account_and_portfolio() {
+    let position_state = PositionServerState::default();
+    let no0 = position_instrument(&format!("0x{}{:02x}", "11".repeat(31), 0), 256, "No");
+    let no1 = position_instrument(&format!("0x{}{:02x}", "11".repeat(31), 1), 257, "No");
+    let (no0_id, no1_id) = (no0.id(), no1.id());
+
+    let (mut h, position_state) = Box::pin(harness::Harness::build_with_position_operations(
+        |h| {
+            h.cache().borrow_mut().add_instrument(no0.clone()).unwrap();
+            h.cache().borrow_mut().add_instrument(no1.clone()).unwrap();
+            seed_operation_position(h, &no0, Quantity::from("100.0000"), Decimal::from(50));
+            seed_operation_position(h, &no1, Quantity::from("100.0000"), Decimal::from(50));
+        },
+        position_state,
+    ))
+    .await;
+    position_state
+        .set_position_balances([200_000_000, 200_000_000])
+        .await;
+    position_state
+        .configure_convert_receipt(&[(256, 100_000_000), (257, 100_000_000)], &[], 99_000_000)
+        .await;
+    h.mock_state.balance_response.lock().await["balance"] = json!("1099000000");
+
+    let results = Rc::new(RefCell::new(Vec::<PositionOperationResult>::new()));
+    let captured = results.clone();
+    msgbus::subscribe_any(
+        nautilus_common::msgbus::switchboard::get_event_position_operation_topic(StrategyId::from(
+            POSITION_STRATEGY_ID,
+        ))
+        .into(),
+        ShareableMessageHandler::from_typed(move |result: &PositionOperationResult| {
+            captured.borrow_mut().push(result.clone());
+        }),
+        None,
+    );
+
+    let operation_id = UUID4::new();
+    let command = SubmitPositionOperation::new(
+        h.trader_id(),
+        Some(h.client_id()),
+        StrategyId::from(POSITION_STRATEGY_ID),
+        operation_id,
+        PositionOperationType::Convert,
+        vec![no0_id, no1_id],
+        Some(Quantity::from("100.0000")),
+        UnixNanos::default(),
+    );
+    msgbus::send_trading_command(
+        MessagingSwitchboard::risk_engine_execute(),
+        TradingCommand::SubmitPositionOperation(command),
+    );
+
+    let positions_closed = h
+        .pump_until(DEADLINE, |cache| {
+            let no0_closed = cache
+                .position(&nautilus_model::identifiers::PositionId::from(format!(
+                    "{no0_id}-{POSITION_STRATEGY_ID}"
+                )))
+                .is_some_and(|position| position.is_closed());
+            let no1_closed = cache
+                .position(&nautilus_model::identifiers::PositionId::from(format!(
+                    "{no1_id}-{POSITION_STRATEGY_ID}"
+                )))
+                .is_some_and(|position| position.is_closed());
+            no0_closed && no1_closed
+        })
+        .await;
+    assert!(positions_closed, "convert must close both NO positions");
+    h.pump_for(Duration::from_millis(200)).await;
+
+    let confirmed = results
+        .borrow()
+        .iter()
+        .find(|result| {
+            result.operation_id == operation_id
+                && result.status == PositionOperationStatus::Confirmed
+        })
+        .cloned()
+        .expect("strategy topic must receive the confirmed operation");
+    let effects = confirmed
+        .effects
+        .expect("confirmed convert carries effects");
+    assert_eq!(effects.collateral_delta, "99");
+    assert_eq!(effects.spent.len(), 2);
+    assert_eq!(position_state.submit_count(), 1);
+    assert!(
+        !h.exec_engine()
+            .borrow()
+            .is_position_operation_barred(&no0_id)
+    );
+
+    let account = h
+        .cache()
+        .borrow()
+        .account(&h.account_id())
+        .expect("account state must be refreshed")
+        .clone();
+    assert_eq!(
+        account.balances()[&Currency::pUSD()].total.as_decimal(),
+        Decimal::from(1099)
+    );
+    {
+        let mut risk = h.risk_engine().borrow_mut();
+        let portfolio = risk.portfolio_mut();
+        assert_eq!(portfolio.net_position(&no0_id), Decimal::ZERO);
+        assert_eq!(portfolio.net_position(&no1_id), Decimal::ZERO);
+        assert_eq!(
+            portfolio.realized_pnl(&no0_id),
+            Some(Money::new(-0.5, Currency::pUSD()))
+        );
+        assert_eq!(
+            portfolio.realized_pnl(&no1_id),
+            Some(Money::new(-0.5, Currency::pUSD()))
+        );
+    }
+
+    assert!(
+        results.borrow().iter().any(|result| {
+            result.operation_id == operation_id && result.status == PositionOperationStatus::Applied
+        }),
+        "the strategy must receive Applied without polling",
+    );
+
+    msgbus::send_trading_command(
+        MessagingSwitchboard::exec_engine_execute(),
+        TradingCommand::QueryPositionOperation(
+            nautilus_common::messages::execution::QueryPositionOperation::new(
+                h.trader_id(),
+                Some(h.client_id()),
+                StrategyId::from(POSITION_STRATEGY_ID),
+                operation_id,
+                UnixNanos::default(),
+            ),
+        ),
+    );
+    h.pump_for(Duration::from_millis(200)).await;
+    assert!(
+        results.borrow().iter().any(|result| {
+            result.operation_id == operation_id && result.status == PositionOperationStatus::Applied
+        }),
+        "query must report the applied operation"
+    );
+}
+
+#[rstest]
+#[tokio::test]
+async fn managed_convert_receives_and_settles_company_payout_output() {
+    let position_state = PositionServerState::default();
+    let no0 = position_instrument(&format!("0x{}{:02x}", "11".repeat(31), 0), 256, "No");
+    let mut yes1 = position_instrument(&format!("0x{}{:02x}", "11".repeat(31), 1), 513, "Yes");
+    // Production Polymarket instruments use the token ID as the raw symbol, which is the key
+    // the execution client's token lookup uses.
+    if let InstrumentAny::BinaryOption(binary) = &mut yes1 {
+        binary.raw_symbol = Symbol::new("513");
+    }
+    let (no0_id, yes1_id) = (no0.id(), yes1.id());
+    let yes1_position_id =
+        nautilus_model::identifiers::PositionId::from(format!("{yes1_id}-{POSITION_STRATEGY_ID}"));
+
+    let (mut h, position_state) = Box::pin(harness::Harness::build_with_position_operations(
+        |h| {
+            h.cache().borrow_mut().add_instrument(no0.clone()).unwrap();
+            h.cache().borrow_mut().add_instrument(yes1.clone()).unwrap();
+            seed_operation_position(h, &no0, Quantity::from("100.0000"), Decimal::from(50));
+            h.cache()
+                .borrow_mut()
+                .add_instrument_close(InstrumentClose::new(
+                    yes1_id,
+                    Price::from("0"),
+                    InstrumentCloseType::ContractExpired,
+                    UnixNanos::from(5),
+                    UnixNanos::from(5),
+                ))
+                .unwrap();
+        },
+        position_state,
+    ))
+    .await;
+    position_state.set_position_balances([100_000_000, 0]).await;
+    position_state
+        .configure_convert_receipt(&[(256, 100_000_000)], &[(513, 99_000_000)], 0)
+        .await;
+    h.mock_state.balance_response.lock().await["balance"] = json!("1000000000");
+
+    let results = Rc::new(RefCell::new(Vec::<PositionOperationResult>::new()));
+    let captured = results.clone();
+    msgbus::subscribe_any(
+        nautilus_common::msgbus::switchboard::get_event_position_operation_topic(StrategyId::from(
+            POSITION_STRATEGY_ID,
+        ))
+        .into(),
+        ShareableMessageHandler::from_typed(move |result: &PositionOperationResult| {
+            captured.borrow_mut().push(result.clone());
+        }),
+        None,
+    );
+
+    let operation_id = UUID4::new();
+    let command = SubmitPositionOperation::new(
+        h.trader_id(),
+        Some(h.client_id()),
+        StrategyId::from(POSITION_STRATEGY_ID),
+        operation_id,
+        PositionOperationType::Convert,
+        vec![no0_id],
+        Some(Quantity::from("100.0000")),
+        UnixNanos::default(),
+    );
+    msgbus::send_trading_command(
+        MessagingSwitchboard::risk_engine_execute(),
+        TradingCommand::SubmitPositionOperation(command),
+    );
+
+    let settled = h
+        .pump_until(DEADLINE, |cache| {
+            cache
+                .position(&yes1_position_id)
+                .is_some_and(|position| position.is_closed() && position.is_settled())
+        })
+        .await;
+    assert!(settled, "settled YES output must be received and settled");
+    h.pump_for(Duration::from_millis(200)).await;
+
+    let confirmed = results
+        .borrow()
+        .iter()
+        .find(|result| {
+            result.operation_id == operation_id
+                && result.status == PositionOperationStatus::Confirmed
+        })
+        .cloned()
+        .expect("strategy topic must receive the confirmed operation");
+    assert_eq!(
+        confirmed
+            .effects
+            .expect("confirmed convert carries effects")
+            .collateral_delta,
+        "0"
+    );
+    assert!(
+        results.borrow().iter().any(|result| {
+            result.operation_id == operation_id && result.status == PositionOperationStatus::Applied
+        }),
+        "the strategy must receive Applied without polling",
+    );
+
+    let yes_position = h
+        .cache()
+        .borrow()
+        .position(&yes1_position_id)
+        .expect("settled YES output must be cached")
+        .cloned();
+    assert_eq!(yes_position.quantity, Quantity::from("0"));
+    assert_eq!(
+        yes_position.realized_pnl,
+        Some(Money::new(-50.0, Currency::pUSD()))
+    );
+    let account = h
+        .cache()
+        .borrow()
+        .account(&h.account_id())
+        .expect("account state must be refreshed")
+        .clone();
+    assert_eq!(
+        account.balances()[&Currency::pUSD()].total.as_decimal(),
+        Decimal::from(1000)
+    );
+    assert_eq!(
+        h.risk_engine()
+            .borrow_mut()
+            .portfolio_mut()
+            .realized_pnl(&yes1_id),
+        Some(Money::new(-50.0, Currency::pUSD()))
+    );
+}
+
+#[rstest]
+#[tokio::test]
+async fn managed_convert_accepts_stream_confirmed_applied_buy_without_rest_terminal() {
+    let position_state = PositionServerState::default();
+    let condition0 = format!("0x{}{:02x}", "11".repeat(31), 0);
+    let condition1 = format!("0x{}{:02x}", "11".repeat(31), 1);
+    let mut no0 = position_instrument(&condition0, 256, "No");
+    let mut yes1 = position_instrument(&condition1, 513, "Yes");
+    // The execution lookup is keyed by the production token symbol.
+    if let InstrumentAny::BinaryOption(binary) = &mut no0 {
+        binary.raw_symbol = Symbol::new("256");
+    }
+
+    if let InstrumentAny::BinaryOption(binary) = &mut yes1 {
+        binary.raw_symbol = Symbol::new("513");
+    }
+    let (no0_id, yes1_id) = (no0.id(), yes1.id());
+    let strategy_id = StrategyId::from(harness::STRATEGY_ID);
+    let no0_position_id =
+        nautilus_model::identifiers::PositionId::from(format!("{no0_id}-{strategy_id}"));
+    let yes1_position_id =
+        nautilus_model::identifiers::PositionId::from(format!("{yes1_id}-{strategy_id}"));
+
+    let (mut h, position_state) = Box::pin(harness::Harness::build_with_position_operations(
+        |h| {
+            h.cache().borrow_mut().add_instrument(no0.clone()).unwrap();
+            h.cache().borrow_mut().add_instrument(yes1.clone()).unwrap();
+            h.cache()
+                .borrow_mut()
+                .add_instrument_close(InstrumentClose::new(
+                    yes1_id,
+                    Price::from("0"),
+                    InstrumentCloseType::ContractExpired,
+                    UnixNanos::from(5),
+                    UnixNanos::from(5),
+                ))
+                .unwrap();
+        },
+        position_state,
+    ))
+    .await;
+
+    let order = harness::limit_order(no0_id, "O-WS-CONVERT");
+    h.submit_via_risk(&order);
+    assert!(
+        h.pump_until(DEADLINE, |cache| {
+            order_reached(cache, &order, OrderStatus::Accepted)
+        })
+        .await,
+        "order did not reach Accepted",
+    );
+
+    h.mock_state.trade_queries.lock().await.clear();
+    let trade = operation_fill_trade(
+        "trade-ws-confirmed",
+        "256",
+        &condition0,
+        "No",
+        DEFAULT_ACCEPTED_ORDER_ID,
+        "MATCHED",
+    );
+    h.mock_state.send_user(trade.clone()).await;
+    assert!(
+        h.pump_until(DEADLINE, |cache| {
+            order_reached(cache, &order, OrderStatus::Filled)
+        })
+        .await,
+        "WS trade did not fill the buy order",
+    );
+
+    let mut confirmed = trade;
+    confirmed["status"] = json!("CONFIRMED");
+    let balance_queries_before = h.mock_state.balance_queries.lock().await.len();
+    h.mock_state.send_user(confirmed).await;
+    wait_until_async(
+        || async { h.mock_state.balance_queries.lock().await.len() > balance_queries_before },
+        DEADLINE,
+    )
+    .await;
+
+    let no0_position = h
+        .cache()
+        .borrow()
+        .position(&no0_position_id)
+        .expect("applied WS buy must open the NO position")
+        .clone();
+    assert_eq!(no0_position.quantity, Quantity::from("100"));
+    assert!(!no0_position.is_closed());
+    let queries_before_convert = h.mock_state.trade_queries.lock().await.clone();
+    assert!(
+        queries_before_convert
+            .iter()
+            .all(|query| query.get("id") != Some(&"trade-ws-confirmed".to_string())),
+        "normal WS CONFIRMED must not request a trade REST terminal"
+    );
+
+    position_state.set_position_balances([100_000_000, 0]).await;
+    position_state
+        .configure_convert_receipt(&[(256, 100_000_000)], &[(513, 99_000_000)], 0)
+        .await;
+    h.mock_state.balance_response.lock().await["balance"] = json!("1000000000");
+
+    let results = Rc::new(RefCell::new(Vec::<PositionOperationResult>::new()));
+    let captured = results.clone();
+    msgbus::subscribe_any(
+        nautilus_common::msgbus::switchboard::get_event_position_operation_topic(strategy_id)
+            .into(),
+        ShareableMessageHandler::from_typed(move |result: &PositionOperationResult| {
+            captured.borrow_mut().push(result.clone());
+        }),
+        None,
+    );
+
+    let operation_id = UUID4::new();
+    let command = SubmitPositionOperation::new(
+        h.trader_id(),
+        Some(h.client_id()),
+        strategy_id,
+        operation_id,
+        PositionOperationType::Convert,
+        vec![no0_id],
+        Some(Quantity::from("100.0000")),
+        UnixNanos::default(),
+    );
+    msgbus::send_trading_command(
+        MessagingSwitchboard::risk_engine_execute(),
+        TradingCommand::SubmitPositionOperation(command),
+    );
+
+    let converted = h
+        .pump_until(DEADLINE, |cache| {
+            let input_closed = cache
+                .position(&no0_position_id)
+                .is_some_and(|position| position.is_closed());
+            let output_settled = cache
+                .position(&yes1_position_id)
+                .is_some_and(|position| position.is_closed() && position.is_settled());
+            input_closed && output_settled
+        })
+        .await;
+    assert!(
+        converted,
+        "convert must close the WS-bought input and settle the output"
+    );
+    assert!(
+        h.pump_until(DEADLINE, |_| {
+            results.borrow().iter().any(|result| {
+                result.operation_id == operation_id
+                    && result.status == PositionOperationStatus::Applied
+            })
+        })
+        .await,
+        "the strategy must receive Applied without polling"
+    );
+
+    let confirmed = results
+        .borrow()
+        .iter()
+        .find(|result| {
+            result.operation_id == operation_id
+                && result.status == PositionOperationStatus::Confirmed
+        })
+        .cloned()
+        .expect("strategy topic must receive the confirmed operation");
+    assert_eq!(
+        confirmed
+            .effects
+            .expect("confirmed convert carries effects")
+            .collateral_delta,
+        "0"
+    );
+    assert!(
+        results.borrow().iter().any(|result| {
+            result.operation_id == operation_id && result.status == PositionOperationStatus::Applied
+        }),
+        "the strategy must receive Applied without polling",
+    );
+    assert_eq!(position_state.submit_count(), 1);
+    let queries_after_convert = h.mock_state.trade_queries.lock().await.clone();
+    assert_eq!(
+        queries_after_convert, queries_before_convert,
+        "convert must not add a trade REST read for an applied WS CONFIRMED fill"
+    );
+
+    let no0_position = h
+        .cache()
+        .borrow()
+        .position(&no0_position_id)
+        .expect("input position must remain cached")
+        .clone();
+    assert!(no0_position.is_closed());
+    let yes1_position = h
+        .cache()
+        .borrow()
+        .position(&yes1_position_id)
+        .expect("settled output must be cached")
+        .clone();
+    assert!(yes1_position.is_closed());
+    assert!(yes1_position.is_settled());
+    assert_eq!(
+        h.cache()
+            .borrow()
+            .account(&h.account_id())
+            .expect("account state must be refreshed")
+            .balances()[&Currency::pUSD()]
+            .total
+            .as_decimal(),
+        Decimal::from(1000)
+    );
+}
+
+#[rstest]
+#[tokio::test]
+async fn regular_sell_is_not_blocked_by_stream_confirmed_buy_without_rest_terminal() {
+    let mut h = harness::Harness::build().await;
+    let buy = harness::limit_order(h.instrument_id(), "O-SELL-BUY");
+    h.submit_via_risk(&buy);
+    assert!(
+        h.pump_until(DEADLINE, |cache| {
+            order_reached(cache, &buy, OrderStatus::Accepted)
+        })
+        .await,
+        "buy order did not reach Accepted",
+    );
+
+    h.mock_state.trade_queries.lock().await.clear();
+    let mut trade = user_trade("ws_user_trade_full.json", "MATCHED");
+    h.mock_state.send_user(trade.clone()).await;
+    assert!(
+        h.pump_until(DEADLINE, |cache| {
+            order_reached(cache, &buy, OrderStatus::Filled)
+        })
+        .await,
+        "WS trade did not fill the buy order",
+    );
+
+    trade["status"] = json!("CONFIRMED");
+    let balance_queries_before = h.mock_state.balance_queries.lock().await.len();
+    h.mock_state.send_user(trade).await;
+    wait_until_async(
+        || async { h.mock_state.balance_queries.lock().await.len() > balance_queries_before },
+        DEADLINE,
+    )
+    .await;
+    let queries_before_sell = h.mock_state.trade_queries.lock().await.clone();
+    assert!(
+        queries_before_sell
+            .iter()
+            .all(|query| query.get("id") != Some(&"trade-0xfull".to_string())),
+        "normal WS CONFIRMED must not request a trade REST terminal"
+    );
+
+    if let Some(response) = h.mock_state.order_response.lock().await.as_mut() {
+        response["orderID"] =
+            json!("0xsell000000000000000000000000000000000000000000000000000000000001");
+    }
+
+    let sell = OrderTestBuilder::new(OrderType::Limit)
+        .trader_id(TraderId::from(harness::TRADER_ID))
+        .strategy_id(StrategyId::from(harness::STRATEGY_ID))
+        .instrument_id(h.instrument_id())
+        .client_order_id(ClientOrderId::from("O-SELL-CONFIRMED"))
+        .side(OrderSide::Sell)
+        .price(Price::from("0.6000"))
+        .quantity(Quantity::from("25.0000"))
+        .time_in_force(TimeInForce::Gtc)
+        .build();
+    h.submit_via_risk(&sell);
+
+    assert!(
+        h.pump_until(DEADLINE, |cache| {
+            order_reached(cache, &sell, OrderStatus::Accepted)
+        })
+        .await,
+        "regular sell must not wait for a REST terminal on the earlier WS-confirmed buy",
+    );
+    assert_eq!(
+        *h.mock_state.trade_queries.lock().await,
+        queries_before_sell,
+        "submitting a regular sell must not add a trade REST read"
+    );
+}
+
+#[rstest]
+#[tokio::test]
+async fn managed_convert_rechecks_all_output_instruments_under_the_barrier() {
+    let position_state = PositionServerState::default();
+    let condition0 = format!("0x{}{:02x}", "11".repeat(31), 0);
+    let condition1 = format!("0x{}{:02x}", "11".repeat(31), 1);
+    let mut no0 = position_instrument(&condition0, 256, "No");
+    let mut yes1 = position_instrument(&condition1, 513, "Yes");
+
+    if let InstrumentAny::BinaryOption(binary) = &mut no0 {
+        binary.raw_symbol = Symbol::new("256");
+    }
+
+    if let InstrumentAny::BinaryOption(binary) = &mut yes1 {
+        binary.raw_symbol = Symbol::new("513");
+    }
+
+    let (no0_id, yes1_id) = (no0.id(), yes1.id());
+    let strategy_id = StrategyId::from(POSITION_STRATEGY_ID);
+    let no0_position_id =
+        nautilus_model::identifiers::PositionId::from(format!("{no0_id}-{strategy_id}"));
+
+    let (mut h, position_state) = Box::pin(harness::Harness::build_with_position_operations(
+        |h| {
+            h.cache().borrow_mut().add_instrument(no0.clone()).unwrap();
+            h.cache().borrow_mut().add_instrument(yes1.clone()).unwrap();
+            seed_operation_position(h, &no0, Quantity::from("100.0000"), Decimal::from(50));
+        },
+        position_state,
+    ))
+    .await;
+
+    // Apply an output fill only provisionally, then leave its settlement unresolved.
+    let output_order = harness::limit_order(yes1_id, "O-OUTPUT-PROVISIONAL");
+    h.submit_via_risk(&output_order);
+    assert!(
+        h.pump_until(DEADLINE, |cache| {
+            order_reached(cache, &output_order, OrderStatus::Accepted)
+        })
+        .await,
+        "output order did not reach Accepted",
+    );
+
+    h.mock_state.trade_queries.lock().await.clear();
+    let output_trade = operation_fill_trade(
+        "trade-output-provisional",
+        "513",
+        &condition1,
+        "Yes",
+        DEFAULT_ACCEPTED_ORDER_ID,
+        "MATCHED",
+    );
+    h.mock_state.send_user(output_trade).await;
+    assert!(
+        h.pump_until(DEADLINE, |cache| {
+            order_reached(cache, &output_order, OrderStatus::Filled)
+        })
+        .await,
+        "provisional output trade did not fill",
+    );
+
+    position_state.set_position_balances([100_000_000, 0]).await;
+    position_state
+        .configure_convert_receipt(&[(256, 100_000_000)], &[(513, 99_000_000)], 0)
+        .await;
+
+    let results = Rc::new(RefCell::new(Vec::<PositionOperationResult>::new()));
+    let captured = results.clone();
+    msgbus::subscribe_any(
+        nautilus_common::msgbus::switchboard::get_event_position_operation_topic(strategy_id)
+            .into(),
+        ShareableMessageHandler::from_typed(move |result: &PositionOperationResult| {
+            captured.borrow_mut().push(result.clone());
+        }),
+        None,
+    );
+
+    let operation_id = UUID4::new();
+    let command = SubmitPositionOperation::new(
+        h.trader_id(),
+        Some(h.client_id()),
+        strategy_id,
+        operation_id,
+        PositionOperationType::Convert,
+        vec![no0_id],
+        Some(Quantity::from("100.0000")),
+        UnixNanos::default(),
+    );
+    msgbus::send_trading_command(
+        MessagingSwitchboard::risk_engine_execute(),
+        TradingCommand::SubmitPositionOperation(command),
+    );
+
+    assert!(
+        h.pump_until(DEADLINE, |_| {
+            results.borrow().iter().any(|result| {
+                result.operation_id == operation_id
+                    && result.status == PositionOperationStatus::Rejected
+            })
+        })
+        .await,
+        "the full output scope must reject the operation"
+    );
+
+    let rejected = results
+        .borrow()
+        .iter()
+        .find(|result| {
+            result.operation_id == operation_id
+                && result.status == PositionOperationStatus::Rejected
+        })
+        .cloned()
+        .expect("rejected operation result");
+    assert!(
+        rejected
+            .message
+            .as_deref()
+            .is_some_and(|message| message.contains("unresolved evidence")),
+        "unexpected rejection: {:?}",
+        rejected.message
+    );
+    assert_eq!(position_state.submit_count(), 0);
+    assert!(
+        !h.exec_engine()
+            .borrow()
+            .is_position_operation_barred(&no0_id)
+    );
+    assert!(
+        h.cache()
+            .borrow()
+            .position(&no0_position_id)
+            .is_some_and(|position| position.is_open())
+    );
+}
+
+#[rstest]
+#[tokio::test]
+async fn managed_convert_rejects_open_short_output_before_submit() {
+    let position_state = PositionServerState::default();
+    let condition0 = format!("0x{}{:02x}", "11".repeat(31), 0);
+    let condition1 = format!("0x{}{:02x}", "11".repeat(31), 1);
+    let mut no0 = position_instrument(&condition0, 256, "No");
+    let mut yes1 = position_instrument(&condition1, 513, "Yes");
+
+    if let InstrumentAny::BinaryOption(binary) = &mut no0 {
+        binary.raw_symbol = Symbol::new("256");
+    }
+
+    if let InstrumentAny::BinaryOption(binary) = &mut yes1 {
+        binary.raw_symbol = Symbol::new("513");
+    }
+
+    let (no0_id, yes1_id) = (no0.id(), yes1.id());
+    let input_strategy = StrategyId::from(POSITION_STRATEGY_ID);
+    let other_strategy = StrategyId::from("S-OTHER-001");
+    let no0_position_id =
+        nautilus_model::identifiers::PositionId::from(format!("{no0_id}-{input_strategy}"));
+    let input_yes_position_id =
+        nautilus_model::identifiers::PositionId::from(format!("{yes1_id}-{input_strategy}"));
+    let other_yes_position_id =
+        nautilus_model::identifiers::PositionId::from(format!("{yes1_id}-{other_strategy}"));
+
+    let (mut h, position_state) = Box::pin(harness::Harness::build_with_position_operations(
+        |h| {
+            h.cache().borrow_mut().add_instrument(no0.clone()).unwrap();
+            h.cache().borrow_mut().add_instrument(yes1.clone()).unwrap();
+            seed_operation_position(h, &no0, Quantity::from("100.0000"), Decimal::from(50));
+        },
+        position_state,
+    ))
+    .await;
+
+    // Another strategy buys the output token first.
+    let other_buy_id = "0xotherbuy0000000000000000000000000000000000000000000000000000001";
+    if let Some(response) = h.mock_state.order_response.lock().await.as_mut() {
+        response["orderID"] = json!(other_buy_id);
+    }
+    let other_buy = OrderTestBuilder::new(OrderType::Limit)
+        .trader_id(TraderId::from(harness::TRADER_ID))
+        .strategy_id(other_strategy)
+        .instrument_id(yes1_id)
+        .client_order_id(ClientOrderId::from("O-OTHER-BUY"))
+        .side(OrderSide::Buy)
+        .price(Price::from("0.5000"))
+        .quantity(Quantity::from("100.0000"))
+        .time_in_force(TimeInForce::Gtc)
+        .build();
+    h.submit_via_risk(&other_buy);
+    assert!(
+        h.pump_until(DEADLINE, |cache| {
+            order_reached(cache, &other_buy, OrderStatus::Accepted)
+        })
+        .await,
+        "other strategy buy did not reach Accepted",
+    );
+
+    let mut other_trade = operation_fill_trade(
+        "trade-other-buy",
+        "513",
+        &condition1,
+        "Yes",
+        other_buy_id,
+        "MATCHED",
+    );
+    h.mock_state.send_user(other_trade.clone()).await;
+    assert!(
+        h.pump_until(DEADLINE, |cache| {
+            order_reached(cache, &other_buy, OrderStatus::Filled)
+        })
+        .await,
+        "other strategy buy did not fill",
+    );
+    other_trade["status"] = json!("CONFIRMED");
+    let buy_balance_queries = h.mock_state.balance_queries.lock().await.len();
+    h.mock_state.send_user(other_trade).await;
+    wait_until_async(
+        || async { h.mock_state.balance_queries.lock().await.len() > buy_balance_queries },
+        DEADLINE,
+    )
+    .await;
+
+    let other_position = h
+        .cache()
+        .borrow()
+        .position(&other_yes_position_id)
+        .expect("other strategy long must be applied")
+        .cloned();
+    assert_eq!(other_position.quantity, Quantity::from("100"));
+    assert!(!other_position.is_short());
+
+    // The operation strategy sells the same token using account-level inventory, opening a
+    // strategy short while the account remains long.
+    let sell_id = "0xshortsell000000000000000000000000000000000000000000000000000001";
+    if let Some(response) = h.mock_state.order_response.lock().await.as_mut() {
+        response["orderID"] = json!(sell_id);
+    }
+    let sell = OrderTestBuilder::new(OrderType::Limit)
+        .trader_id(TraderId::from(harness::TRADER_ID))
+        .strategy_id(input_strategy)
+        .instrument_id(yes1_id)
+        .client_order_id(ClientOrderId::from("O-STRATEGY-SHORT"))
+        .side(OrderSide::Sell)
+        .price(Price::from("0.5000"))
+        .quantity(Quantity::from("100.0000"))
+        .time_in_force(TimeInForce::Gtc)
+        .build();
+    h.submit_via_risk(&sell);
+    assert!(
+        h.pump_until(DEADLINE, |cache| {
+            order_reached(cache, &sell, OrderStatus::Accepted)
+        })
+        .await,
+        "strategy sell did not reach Accepted",
+    );
+
+    let mut sell_trade = user_trade("ws_user_trade_full.json", "MATCHED");
+    sell_trade["id"] = json!("trade-strategy-short");
+    sell_trade["asset_id"] = json!("513");
+    sell_trade["market"] = json!(condition1);
+    sell_trade["outcome"] = json!("Yes");
+    sell_trade["side"] = json!("SELL");
+    sell_trade["taker_order_id"] = json!(sell_id);
+    sell_trade["maker_orders"][0]["asset_id"] = json!("513");
+    sell_trade["maker_orders"][0]["matched_amount"] = json!("100.0000");
+    sell_trade["maker_orders"][0]["outcome"] = json!("Yes");
+    sell_trade["maker_orders"][0]["price"] = json!("0.5000");
+    sell_trade["maker_orders"][0]["side"] = json!("BUY");
+    h.mock_state.send_user(sell_trade.clone()).await;
+    assert!(
+        h.pump_until(DEADLINE, |cache| {
+            order_reached(cache, &sell, OrderStatus::Filled)
+        })
+        .await,
+        "strategy sell did not fill",
+    );
+    sell_trade["status"] = json!("CONFIRMED");
+    let sell_balance_queries = h.mock_state.balance_queries.lock().await.len();
+    h.mock_state.send_user(sell_trade).await;
+    wait_until_async(
+        || async { h.mock_state.balance_queries.lock().await.len() > sell_balance_queries },
+        DEADLINE,
+    )
+    .await;
+    assert!(
+        h.pump_until(DEADLINE, |cache| {
+            cache
+                .account(&AccountId::from(harness::ACCOUNT_ID))
+                .is_some_and(|account| {
+                    account.balances()[&Currency::pUSD()].total.as_decimal() == Decimal::from(1_000)
+                })
+        })
+        .await,
+        "the account refresh after the sell must settle"
+    );
+
+    let short = h
+        .cache()
+        .borrow()
+        .position(&input_yes_position_id)
+        .expect("strategy short must be created")
+        .cloned();
+    assert!(short.is_short());
+    assert_eq!(short.quantity, Quantity::from("100"));
+
+    let input_before = h
+        .cache()
+        .borrow()
+        .position(&no0_position_id)
+        .expect("input position must remain")
+        .cloned();
+    let account_before = h
+        .cache()
+        .borrow()
+        .account(&h.account_id())
+        .expect("account must be available")
+        .clone();
+    let (portfolio_net_before, portfolio_pnl_before) = {
+        let mut risk = h.risk_engine().borrow_mut();
+        let portfolio = risk.portfolio_mut();
+        (
+            (
+                portfolio.net_position(&no0_id),
+                portfolio.net_position(&yes1_id),
+            ),
+            (
+                portfolio.realized_pnl(&no0_id),
+                portfolio.realized_pnl(&yes1_id),
+            ),
+        )
+    };
+
+    let results = Rc::new(RefCell::new(Vec::<PositionOperationResult>::new()));
+    let captured = results.clone();
+    msgbus::subscribe_any(
+        nautilus_common::msgbus::switchboard::get_event_position_operation_topic(input_strategy)
+            .into(),
+        ShareableMessageHandler::from_typed(move |result: &PositionOperationResult| {
+            captured.borrow_mut().push(result.clone());
+        }),
+        None,
+    );
+
+    let operation_id = UUID4::new();
+    let command = SubmitPositionOperation::new(
+        h.trader_id(),
+        Some(h.client_id()),
+        input_strategy,
+        operation_id,
+        PositionOperationType::Convert,
+        vec![no0_id],
+        Some(Quantity::from("100.0000")),
+        UnixNanos::default(),
+    );
+    msgbus::send_trading_command(
+        MessagingSwitchboard::risk_engine_execute(),
+        TradingCommand::SubmitPositionOperation(command),
+    );
+
+    assert!(
+        h.pump_until(DEADLINE, |_| {
+            results.borrow().iter().any(|result| {
+                result.operation_id == operation_id
+                    && result.status == PositionOperationStatus::Rejected
+            })
+        })
+        .await,
+        "convert must reject the open short output target before signing"
+    );
+
+    let rejected = results
+        .borrow()
+        .iter()
+        .find(|result| {
+            result.operation_id == operation_id
+                && result.status == PositionOperationStatus::Rejected
+        })
+        .cloned()
+        .expect("rejected operation result");
+    assert!(
+        rejected
+            .message
+            .as_deref()
+            .is_some_and(|message| message.contains("open short position")),
+        "unexpected rejection: {:?}",
+        rejected.message
+    );
+    assert!(!results.borrow().iter().any(|result| {
+        result.operation_id == operation_id
+            && matches!(
+                result.status,
+                PositionOperationStatus::Submitted
+                    | PositionOperationStatus::Confirmed
+                    | PositionOperationStatus::Applied
+            )
+    }));
+    assert_eq!(position_state.submit_count(), 0);
+    assert!(
+        !h.exec_engine()
+            .borrow()
+            .is_position_operation_barred(&no0_id)
+    );
+    assert!(
+        !h.exec_engine()
+            .borrow()
+            .is_position_operation_barred(&yes1_id)
+    );
+
+    let input_after = h
+        .cache()
+        .borrow()
+        .position(&no0_position_id)
+        .expect("input position must remain")
+        .cloned();
+    let short_after = h
+        .cache()
+        .borrow()
+        .position(&input_yes_position_id)
+        .expect("strategy short must remain")
+        .cloned();
+    assert_eq!(input_after, input_before);
+    assert_eq!(short_after, short);
+    assert_eq!(
+        h.cache()
+            .borrow()
+            .account(&h.account_id())
+            .expect("account must remain")
+            .balances(),
+        account_before.balances()
+    );
+    let (portfolio_net_after, portfolio_pnl_after) = {
+        let mut risk = h.risk_engine().borrow_mut();
+        let portfolio = risk.portfolio_mut();
+        (
+            (
+                portfolio.net_position(&no0_id),
+                portfolio.net_position(&yes1_id),
+            ),
+            (
+                portfolio.realized_pnl(&no0_id),
+                portfolio.realized_pnl(&yes1_id),
+            ),
+        )
+    };
+    assert_eq!(portfolio_net_after, portfolio_net_before);
+    assert_eq!(portfolio_pnl_after, portfolio_pnl_before);
+}
+
+#[rstest]
+#[case::recovered_input(false)]
+#[case::recovered_output(true)]
+#[tokio::test]
+async fn managed_convert_resolves_recovered_settlement_in_scope(#[case] recovered_output: bool) {
+    let position_state = PositionServerState::default();
+    let condition0 = format!("0x{}{:02x}", "11".repeat(31), 0);
+    let condition1 = format!("0x{}{:02x}", "11".repeat(31), 1);
+    let mut no0 = position_instrument(&condition0, 256, "No");
+    let mut yes1 = position_instrument(&condition1, 513, "Yes");
+
+    if let InstrumentAny::BinaryOption(binary) = &mut no0 {
+        binary.raw_symbol = Symbol::new("256");
+    }
+
+    if let InstrumentAny::BinaryOption(binary) = &mut yes1 {
+        binary.raw_symbol = Symbol::new("513");
+    }
+
+    let (no0_id, yes1_id) = (no0.id(), yes1.id());
+    let strategy_id = StrategyId::from(POSITION_STRATEGY_ID);
+    let no0_position_id =
+        nautilus_model::identifiers::PositionId::from(format!("{no0_id}-{strategy_id}"));
+    let yes1_position_id =
+        nautilus_model::identifiers::PositionId::from(format!("{yes1_id}-{strategy_id}"));
+    let (recovered_instrument, condition_id, asset_id, outcome) = if recovered_output {
+        (&yes1, condition1.as_str(), "513", "Yes")
+    } else {
+        (&no0, condition0.as_str(), "256", "No")
+    };
+    let venue_order_id = if recovered_output {
+        "0xrecoveredoutput00000000000000000000000000000000000000000000000001"
+    } else {
+        "0xrecoveredinput000000000000000000000000000000000000000000000000001"
+    };
+    let trade_id = if recovered_output {
+        "trade-recovered-output"
+    } else {
+        "trade-recovered-input"
+    };
+
+    let (recovered_seed_order, recovered_order, confirmed_trade) = Box::pin(confirmed_ws_buy_fill(
+        recovered_instrument,
+        condition_id,
+        asset_id,
+        outcome,
+        strategy_id,
+        "O-RECOVERED",
+        venue_order_id,
+        trade_id,
+    ))
+    .await;
+
+    let recovered_seed = recovered_seed_order.clone();
+    let recovered_for_seed = recovered_order.clone();
+    let no0_for_seed = no0.clone();
+    let yes1_for_seed = yes1.clone();
+    let (mut h, position_state) = Box::pin(harness::Harness::build_with_position_operations(
+        move |h| {
+            h.cache().borrow_mut().add_instrument(no0_for_seed).unwrap();
+            h.cache()
+                .borrow_mut()
+                .add_instrument(yes1_for_seed)
+                .unwrap();
+
+            if recovered_output {
+                seed_operation_position(h, &no0, Quantity::from("100.0000"), Decimal::from(50));
+            }
+
+            h.cache()
+                .borrow_mut()
+                .add_instrument_close(InstrumentClose::new(
+                    yes1_id,
+                    Price::from("0"),
+                    InstrumentCloseType::ContractExpired,
+                    UnixNanos::from(5),
+                    UnixNanos::from(5),
+                ))
+                .unwrap();
+            h.cache()
+                .borrow_mut()
+                .add_order(recovered_seed, None, Some(h.client_id()), false)
+                .unwrap();
+            let mut engine = h.exec_engine().borrow_mut();
+
+            for event in recovered_for_seed.events().into_iter().skip(1) {
+                engine.process(event);
+            }
+        },
+        position_state,
+    ))
+    .await;
+
+    assert!(
+        h.mock_state
+            .trade_queries
+            .lock()
+            .await
+            .iter()
+            .all(|query| query.get("id") != Some(&trade_id.to_string())),
+        "cache hydration alone must not request a historical trade"
+    );
+
+    position_state
+        .set_position_balances(if recovered_output {
+            [100_000_000, 100_000_000]
+        } else {
+            [100_000_000, 0]
+        })
+        .await;
+    position_state
+        .configure_convert_receipt(&[(256, 100_000_000)], &[(513, 99_000_000)], 0)
+        .await;
+    h.mock_state.balance_response.lock().await["balance"] = json!("1000000000");
+    serve_rest_trades(&h, &[confirmed_trade]).await;
+    let balance_queries_before = h.mock_state.balance_queries.lock().await.len();
+
+    let results = Rc::new(RefCell::new(Vec::<PositionOperationResult>::new()));
+    let captured = results.clone();
+    msgbus::subscribe_any(
+        nautilus_common::msgbus::switchboard::get_event_position_operation_topic(strategy_id)
+            .into(),
+        ShareableMessageHandler::from_typed(move |result: &PositionOperationResult| {
+            captured.borrow_mut().push(result.clone());
+        }),
+        None,
+    );
+
+    let rejected_id = UUID4::new();
+    msgbus::send_trading_command(
+        MessagingSwitchboard::risk_engine_execute(),
+        TradingCommand::SubmitPositionOperation(SubmitPositionOperation::new(
+            h.trader_id(),
+            Some(h.client_id()),
+            strategy_id,
+            rejected_id,
+            PositionOperationType::Convert,
+            vec![no0_id],
+            Some(Quantity::from("100.0000")),
+            UnixNanos::default(),
+        )),
+    );
+    assert!(
+        h.pump_until(DEADLINE, |_| {
+            results.borrow().iter().any(|result| {
+                result.operation_id == rejected_id
+                    && result.status == PositionOperationStatus::Rejected
+            })
+        })
+        .await,
+        "the operation must reject until the recovered trade is resolved"
+    );
+    let rejected = results
+        .borrow()
+        .iter()
+        .find(|result| {
+            result.operation_id == rejected_id && result.status == PositionOperationStatus::Rejected
+        })
+        .cloned()
+        .expect("rejected operation result");
+    assert!(
+        rejected
+            .message
+            .as_deref()
+            .is_some_and(|message| message.contains("unresolved evidence")),
+        "unexpected rejection: {:?}",
+        rejected.message
+    );
+    assert_eq!(
+        position_state.submit_count(),
+        0,
+        "an unresolved recovered trade must not reach the Relayer"
+    );
+    assert!(
+        !h.exec_engine()
+            .borrow()
+            .is_position_operation_barred(&no0_id)
+    );
+    assert!(
+        !h.exec_engine()
+            .borrow()
+            .is_position_operation_barred(&yes1_id)
+    );
+
+    wait_until_async(
+        || async {
+            h.mock_state
+                .trade_queries
+                .lock()
+                .await
+                .iter()
+                .any(|query| query.get("id") == Some(&trade_id.to_string()))
+        },
+        DEADLINE,
+    )
+    .await;
+    wait_until_async(
+        || async { h.mock_state.balance_queries.lock().await.len() > balance_queries_before },
+        DEADLINE,
+    )
+    .await;
+
+    let recovered_after = h
+        .cache()
+        .borrow()
+        .position(if recovered_output {
+            &yes1_position_id
+        } else {
+            &no0_position_id
+        })
+        .expect("recovered position must remain")
+        .cloned();
+    assert_eq!(recovered_after.quantity, Quantity::from("100"));
+    assert!(!recovered_after.is_closed());
+
+    let applied_id = UUID4::new();
+    msgbus::send_trading_command(
+        MessagingSwitchboard::risk_engine_execute(),
+        TradingCommand::SubmitPositionOperation(SubmitPositionOperation::new(
+            h.trader_id(),
+            Some(h.client_id()),
+            strategy_id,
+            applied_id,
+            PositionOperationType::Convert,
+            vec![no0_id],
+            Some(Quantity::from("100.0000")),
+            UnixNanos::default(),
+        )),
+    );
+
+    let converted = h
+        .pump_until(DEADLINE, |cache| {
+            let input_closed = cache
+                .position(&no0_position_id)
+                .is_some_and(|position| position.is_closed());
+            let output_settled = cache
+                .position(&yes1_position_id)
+                .is_some_and(|position| position.is_closed() && position.is_settled());
+            input_closed && output_settled
+        })
+        .await;
+    assert!(
+        converted,
+        "the recovered conversion must apply after terminal resolution"
+    );
+    assert!(
+        h.pump_until(DEADLINE, |_| {
+            results.borrow().iter().any(|result| {
+                result.operation_id == applied_id
+                    && result.status == PositionOperationStatus::Applied
+            })
+        })
+        .await,
+        "the retried operation must report Applied"
+    );
+
+    assert_eq!(
+        position_state.submit_count(),
+        1,
+        "the retried operation must submit exactly once"
+    );
+    assert!(results.borrow().iter().any(|result| {
+        result.operation_id == applied_id && result.status == PositionOperationStatus::Confirmed
+    }));
+    assert!(!results.borrow().iter().any(|result| {
+        result.operation_id == rejected_id
+            && matches!(
+                result.status,
+                PositionOperationStatus::Submitted
+                    | PositionOperationStatus::Confirmed
+                    | PositionOperationStatus::Applied
+            )
+    }));
 }

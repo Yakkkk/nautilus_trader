@@ -160,17 +160,43 @@ pub fn create_position_reconciliation_venue_order_id(
 /// Replays candidate order history to recover each fill's cumulative quantity before comparing
 /// the complete deterministic ID. A matching UUID format alone does not establish provenance.
 ///
+/// This identifies only fills that remain active on the order. Use
+/// [`inferred_reconciliation_trade_ids_including_voided`] when restoring retained history that
+/// may contain fully voided fills.
+///
 /// # Errors
 ///
 /// Returns an error if candidate order history cannot be replayed.
 pub fn inferred_reconciliation_trade_ids(order: &OrderAny) -> anyhow::Result<Vec<TradeId>> {
+    inferred_reconciliation_trade_ids_impl(order, true)
+}
+
+/// Replays candidate order history to recover inferred fills even after later voids removed their
+/// trade IDs from the order's active set.
+///
+/// Provenance is still established by recomputing the complete deterministic ID, not by the ID
+/// format alone. This is for hydration of retained history; it does not add recovery capability.
+///
+/// # Errors
+///
+/// Returns an error if candidate order history cannot be replayed.
+pub fn inferred_reconciliation_trade_ids_including_voided(
+    order: &OrderAny,
+) -> anyhow::Result<Vec<TradeId>> {
+    inferred_reconciliation_trade_ids_impl(order, false)
+}
+
+fn inferred_reconciliation_trade_ids_impl(
+    order: &OrderAny,
+    active_only: bool,
+) -> anyhow::Result<Vec<TradeId>> {
     let events = order.events();
     let trade_ids = order.trade_ids();
 
     let is_candidate = |fill: &OrderFilled| {
         fill.reconciliation
             && is_inferred_reconciliation_trade_id_format(&fill.trade_id)
-            && trade_ids.contains(&&fill.trade_id)
+            && (!active_only || trade_ids.contains(&&fill.trade_id))
     };
 
     if !events
