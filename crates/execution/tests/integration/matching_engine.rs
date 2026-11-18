@@ -37,7 +37,7 @@ use nautilus_common::{
         BatchCancelOrders, CancelAllOrders, CancelOrder, ModifyOrder, SubmitOrder, TradingCommand,
     },
     msgbus::{
-        self, MessagingSwitchboard, TypedIntoHandler,
+        self, MessagingSwitchboard, TypedHandler, TypedIntoHandler,
         stubs::{TypedIntoMessageSavingHandler, get_typed_into_message_saving_handler},
     },
 };
@@ -72,6 +72,7 @@ use nautilus_model::{
         OrderEmulated, OrderEventAny, OrderEventType, OrderFilled, OrderRejected, OrderReleased,
         account::stubs::margin_account_state,
         order::spec::{OrderEmulatedSpec, OrderFilledSpec, OrderRejectedSpec, OrderReleasedSpec},
+        position::PositionEvent,
     },
     identifiers::{
         AccountId, ClientId, ClientOrderId, ExecAlgorithmId, InstrumentId, PositionId, StrategyId,
@@ -90,7 +91,7 @@ use nautilus_model::{
         Order, OrderAny, OrderCore, OrderTestBuilder,
         stubs::{TestOrderEventStubs, TestOrderStubs},
     },
-    position::Position,
+    position::{Position, PositionConvert, PositionConvertKind},
     stubs::TestDefault,
     types::{Currency, Money, Price, Quantity},
 };
@@ -23975,6 +23976,128 @@ impl FillModel for SyntheticLimitFillModel {
     ) -> anyhow::Result<Option<OrderBook>> {
         Ok(Some(self.book.clone()))
     }
+}
+
+#[rstest]
+fn test_convert_inventory_can_be_sold_by_normal_cash_market_order(account_id: AccountId) {
+    let instrument = InstrumentAny::BinaryOption(binary_option());
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    cache
+        .borrow_mut()
+        .add_instrument(instrument.clone())
+        .unwrap();
+    cache
+        .borrow_mut()
+        .add_account(CashAccount::default().into())
+        .unwrap();
+    let mut order = OrderTestBuilder::new(OrderType::Market)
+        .instrument_id(instrument.id())
+        .side(OrderSide::Sell)
+        .quantity(Quantity::from("100.00"))
+        .build();
+    order
+        .apply(TestOrderEventStubs::submitted(&order, account_id))
+        .unwrap();
+    let operation_id = UUID4::new();
+    let position_id = PositionId::new(format!("{}-{}", instrument.id(), order.strategy_id()));
+    let opening = PositionConvert {
+        operation_id,
+        trader_id: order.trader_id(),
+        strategy_id: order.strategy_id(),
+        instrument_id: instrument.id(),
+        position_id,
+        account_id,
+        cycle_id: operation_id,
+        kind: PositionConvertKind::Open {
+            previous_cycle_id: None,
+        },
+        quantity: order.quantity(),
+        cost: dec!(50),
+        realized_pnl: dec!(0),
+        ts_event: UnixNanos::from(1),
+        ts_init: UnixNanos::from(1),
+    };
+    cache
+        .borrow_mut()
+        .add_order(order.clone(), None, None, false)
+        .unwrap();
+    let clock = Rc::new(RefCell::new(VirtualClock::new()));
+    clock.borrow_mut().set_time(UnixNanos::from(2));
+    let mut execution = ExecutionEngine::new(clock.clone(), cache.clone(), None);
+    execution.register_oms_type(order.strategy_id(), OmsType::Netting);
+    let mut matching = OrderMatchingEngine::new(
+        instrument.clone(),
+        1,
+        FillModelHandle::default(),
+        FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into(),
+        BookType::L1_MBP,
+        OmsType::Netting,
+        AccountType::Cash,
+        clock,
+        cache.clone(),
+        Default::default(),
+    );
+    let pending = Rc::new(RefCell::new(Vec::new()));
+    let events = pending.clone();
+    matching.set_event_handler(Rc::new(move |event| events.borrow_mut().push(event)));
+    let position_events = Rc::new(RefCell::new(Vec::new()));
+    let handler = TypedHandler::from({
+        let position_events = position_events.clone();
+        move |event: &PositionEvent| position_events.borrow_mut().push(event.clone())
+    });
+    msgbus::subscribe_position_events("events.position.*".into(), handler.clone(), None);
+
+    execution
+        .apply_position_convert(&instrument, opening)
+        .unwrap();
+    let duplicate = execution
+        .apply_position_convert(&instrument, opening)
+        .unwrap();
+    matching.process_quote_tick(&QuoteTick::new(
+        instrument.id(),
+        Price::from("0.700"),
+        Price::from("0.710"),
+        Quantity::from("100.00"),
+        Quantity::from("100.00"),
+        UnixNanos::from(2),
+        UnixNanos::from(2),
+    ));
+    matching.process_order(&mut order, account_id);
+
+    for event in pending.borrow_mut().drain(..) {
+        execution.process(&event);
+    }
+    msgbus::unsubscribe_position_events("events.position.*".into(), &handler);
+
+    let cache = cache.borrow();
+    let position = cache.position(&position_id).unwrap();
+    let cached_order = cache.order(&order.client_order_id()).unwrap();
+    assert!(duplicate.is_none());
+    assert_eq!(cached_order.status(), OrderStatus::Filled);
+    assert_eq!(cached_order.filled_qty(), opening.quantity);
+    assert_eq!(position.opening_order_id, None);
+    assert_eq!(position.opening_operation_id, Some(operation_id));
+    assert_eq!(position.closing_order_id, Some(order.client_order_id()));
+    assert!(position.is_closed());
+    assert_eq!(position.cost_open, dec!(0));
+    assert_eq!(position.realized_pnl, Some(Money::from("20.00 USDC")));
+    assert_eq!(position.events.len(), 1);
+    assert_eq!(position.events[0].client_order_id, order.client_order_id());
+    let events = position_events.borrow();
+    let [
+        PositionEvent::PositionOpened(opened),
+        PositionEvent::PositionClosed(closed),
+    ] = events.as_slice()
+    else {
+        panic!("expected an opening and a closing notification, found {events:?}");
+    };
+    assert_eq!(opened.convert, Some(opening));
+    assert_eq!(opened.last_px, None);
+    assert_eq!(closed.opening_operation_id, Some(operation_id));
+    assert_eq!(closed.last_qty, opening.quantity);
+    assert_eq!(closed.last_px, Some(Price::from("0.700")));
+    assert_eq!(closed.realized_pnl, Some(Money::from("20.00 USDC")));
+    assert_eq!(closed.convert, None);
 }
 
 #[allow(

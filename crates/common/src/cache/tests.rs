@@ -52,7 +52,7 @@ use nautilus_model::{
             OrderCanceledSpec, OrderEmulatedSpec, OrderFilledSpec, OrderReleasedSpec,
             OrderUpdatedSpec,
         },
-        position::snapshot::PositionSnapshot,
+        position::{PositionEvent, snapshot::PositionSnapshot},
     },
     identifiers::{
         AccountId, ActorId, ClientId, ClientOrderId, ExecAlgorithmId, InstrumentId, OrderListId,
@@ -68,7 +68,7 @@ use nautilus_model::{
         builder::OrderTestBuilder,
         stubs::{TestOrderEventStubs, TestOrdersGenerator},
     },
-    position::{Position, PositionReplayEvent},
+    position::{Position, PositionConvert, PositionConvertKind, PositionReplayEvent},
     stubs::TestDefault,
     types::{
         AccountBalance, Currency, MarginBalance, Money, Price, Quantity,
@@ -13129,6 +13129,320 @@ fn test_position_snapshots_round_trip(mut cache: Cache) {
 }
 
 #[rstest]
+fn test_convert_position_cache_archives_and_guards_cycles(mut cache: Cache) {
+    let instrument = InstrumentAny::BinaryOption(binary_option());
+    cache.add_instrument(instrument.clone()).unwrap();
+    let operation_id = UUID4::new();
+    let opening = PositionConvert {
+        operation_id,
+        trader_id: TraderId::from("TRADER-001"),
+        strategy_id: StrategyId::from("STRATEGY-001"),
+        instrument_id: instrument.id(),
+        position_id: PositionId::new(format!("{}-STRATEGY-001", instrument.id())),
+        account_id: AccountId::from("POLYMARKET-001"),
+        cycle_id: operation_id,
+        kind: PositionConvertKind::Open {
+            previous_cycle_id: None,
+        },
+        quantity: Quantity::from("100.00"),
+        cost: dec!(50),
+        realized_pnl: dec!(0),
+        ts_event: UnixNanos::from(100),
+        ts_init: UnixNanos::from(101),
+    };
+    let closing = PositionConvert {
+        operation_id: UUID4::new(),
+        kind: PositionConvertKind::Decrease,
+        realized_pnl: dec!(10),
+        ..opening
+    };
+    let second_cycle = UUID4::new();
+    let reopening = PositionConvert {
+        operation_id: second_cycle,
+        cycle_id: second_cycle,
+        kind: PositionConvertKind::Open {
+            previous_cycle_id: Some(opening.cycle_id),
+        },
+        cost: dec!(30),
+        ..opening
+    };
+
+    let opened = cache.apply_position_convert(&instrument, opening).unwrap();
+    assert!(matches!(opened, Some(PositionEvent::PositionOpened(_))));
+    assert_eq!(
+        cache.position_open_ids(
+            Some(&opening.instrument_id.venue),
+            Some(&opening.instrument_id),
+            Some(&opening.strategy_id),
+            Some(&opening.account_id),
+        ),
+        AHashSet::from([opening.position_id]),
+    );
+    assert_eq!(cache.oms_type(&opening.position_id), Some(OmsType::Netting));
+    assert!(
+        cache
+            .index
+            .position_orders
+            .get(&opening.position_id)
+            .is_none_or(|order_ids| order_ids.is_empty())
+    );
+
+    let closed = cache.apply_position_convert(&instrument, closing).unwrap();
+    assert!(matches!(closed, Some(PositionEvent::PositionClosed(_))));
+    assert!(!cache.is_position_open(&opening.position_id));
+    assert!(cache.is_position_closed(&opening.position_id));
+
+    let reopened = cache
+        .apply_position_convert(&instrument, reopening)
+        .unwrap();
+    assert!(matches!(reopened, Some(PositionEvent::PositionOpened(_))));
+    assert!(cache.is_position_open(&opening.position_id));
+    assert!(!cache.is_position_closed(&opening.position_id));
+    let snapshots = cache.position_snapshots(Some(&opening.position_id), None);
+    assert_eq!(snapshots.len(), 1);
+    assert_eq!(snapshots[0].cycle_id, Some(opening.cycle_id));
+    assert_eq!(snapshots[0].opening_order_id, None);
+    assert_eq!(
+        snapshots[0].opening_operation_id,
+        Some(opening.operation_id)
+    );
+    assert!(snapshots[0].is_closed());
+    assert_eq!(snapshots[0].realized_pnl, Some(Money::from("10.00 USDC")));
+
+    assert!(
+        cache
+            .apply_position_convert(&instrument, opening)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        cache
+            .apply_position_convert(&instrument, closing)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        cache
+            .apply_position_convert(
+                &instrument,
+                PositionConvert {
+                    cost: dec!(45),
+                    ..closing
+                }
+            )
+            .is_err()
+    );
+    let stale = PositionConvert {
+        operation_id: UUID4::new(),
+        ..closing
+    };
+    assert!(cache.apply_position_convert(&instrument, stale).is_err());
+    let current = cache.position(&opening.position_id).unwrap();
+    assert_eq!(current.cycle_id, Some(second_cycle));
+    assert_eq!(current.opening_operation_id, Some(second_cycle));
+    assert_eq!(current.quantity, reopening.quantity);
+    assert_eq!(current.cost_open, reopening.cost);
+    assert_eq!(current.replay_events.len(), 3);
+    assert!(current.events.is_empty());
+    assert_eq!(
+        cache
+            .position_snapshots(Some(&opening.position_id), None)
+            .len(),
+        1
+    );
+}
+
+#[rstest]
+fn test_convert_archive_settlement_preserves_cycles_without_retained_replay(mut cache: Cache) {
+    let instrument = InstrumentAny::BinaryOption(binary_option());
+    let mut opening_fill = OrderFilledSpec::builder()
+        .instrument_id(instrument.id())
+        .position_id(PositionId::from("P-ARCHIVE"))
+        .currency(instrument.quote_currency())
+        .last_qty(Quantity::from("10.00"))
+        .last_px(Price::from("0.300"))
+        .build();
+    let position_id = PositionId::new(format!("{}-{}", instrument.id(), opening_fill.strategy_id));
+    opening_fill.position_id = Some(position_id);
+    let closing_fill = OrderFilled {
+        event_id: UUID4::new(),
+        trade_id: TradeId::from("T-CLOSE-ARCHIVE"),
+        order_side: OrderSide::Sell,
+        last_px: Price::from("0.500"),
+        ..opening_fill.clone()
+    };
+    let mut archived = Position::new(&instrument, opening_fill);
+    archived.try_apply(&closing_fill).unwrap();
+    cache.snapshot_position(&archived).unwrap();
+
+    let operation_id = UUID4::new();
+    let change = PositionConvert {
+        operation_id,
+        trader_id: archived.trader_id,
+        strategy_id: archived.strategy_id,
+        instrument_id: instrument.id(),
+        account_id: archived.account_id,
+        position_id,
+        cycle_id: operation_id,
+        kind: PositionConvertKind::Open {
+            previous_cycle_id: None,
+        },
+        quantity: Quantity::from("100.00"),
+        cost: dec!(50),
+        realized_pnl: dec!(0),
+        ts_event: UnixNanos::from(100),
+        ts_init: UnixNanos::from(101),
+    };
+    cache.apply_position_convert(&instrument, change).unwrap();
+    cache
+        .apply_position_convert(
+            &instrument,
+            PositionConvert {
+                operation_id: UUID4::new(),
+                kind: PositionConvertKind::Decrease,
+                realized_pnl: dec!(10),
+                ..change
+            },
+        )
+        .unwrap();
+    let new_cycle = UUID4::new();
+    cache
+        .apply_position_convert(
+            &instrument,
+            PositionConvert {
+                operation_id: new_cycle,
+                cycle_id: new_cycle,
+                kind: PositionConvertKind::Open {
+                    previous_cycle_id: Some(change.cycle_id),
+                },
+                ..change
+            },
+        )
+        .unwrap();
+    let current = cache.position_owned(&position_id).unwrap();
+
+    cache.settle_position_snapshots(&current, Some(Money::from("7.00 USDC")));
+    cache.settle_position_snapshots(&current, Some(Money::from("8.00 USDC")));
+
+    let snapshots = cache.position_snapshots(Some(&position_id), None);
+    assert_eq!(snapshots.len(), 2);
+    assert_eq!(snapshots[0].current_cycle_id(), archived.current_cycle_id());
+    assert_eq!(snapshots[0].realized_pnl, Some(Money::from("2.00 USDC")));
+    assert_eq!(snapshots[1].realized_pnl, Some(Money::from("8.00 USDC")));
+}
+
+#[rstest]
+fn test_convert_cannot_open_after_formal_instrument_close(mut cache: Cache) {
+    let instrument = InstrumentAny::BinaryOption(binary_option());
+    cache.add_instrument(instrument.clone()).unwrap();
+    cache
+        .add_instrument_close(InstrumentClose::new(
+            instrument.id(),
+            Price::from("1.000"),
+            InstrumentCloseType::ContractExpired,
+            UnixNanos::from(200),
+            UnixNanos::from(201),
+        ))
+        .unwrap();
+    let operation_id = UUID4::new();
+    let change = PositionConvert {
+        operation_id,
+        trader_id: TraderId::from("TRADER-001"),
+        strategy_id: StrategyId::from("STRATEGY-001"),
+        instrument_id: instrument.id(),
+        account_id: AccountId::from("POLYMARKET-001"),
+        position_id: PositionId::new(format!("{}-STRATEGY-001", instrument.id())),
+        cycle_id: operation_id,
+        kind: PositionConvertKind::Open {
+            previous_cycle_id: None,
+        },
+        quantity: Quantity::from("1.00"),
+        cost: dec!(0.50),
+        realized_pnl: dec!(0),
+        ts_event: UnixNanos::from(202),
+        ts_init: UnixNanos::from(203),
+    };
+
+    let result = cache.apply_position_convert(&instrument, change);
+
+    assert!(result.is_err());
+    assert!(!cache.position_exists(&change.position_id));
+}
+
+#[rstest]
+fn test_convert_rejects_noncanonical_new_position_without_index_side_effects(mut cache: Cache) {
+    let instrument = InstrumentAny::BinaryOption(binary_option());
+    cache.add_instrument(instrument.clone()).unwrap();
+    let operation_id = UUID4::new();
+    let change = PositionConvert {
+        operation_id,
+        trader_id: TraderId::from("TRADER-001"),
+        strategy_id: StrategyId::from("STRATEGY-001"),
+        instrument_id: instrument.id(),
+        position_id: PositionId::from("P-CONVERT"),
+        account_id: AccountId::from("POLYMARKET-001"),
+        cycle_id: operation_id,
+        kind: PositionConvertKind::Open {
+            previous_cycle_id: None,
+        },
+        quantity: Quantity::from("1.00"),
+        cost: dec!(0.50),
+        realized_pnl: dec!(0),
+        ts_event: UnixNanos::from(202),
+        ts_init: UnixNanos::from(203),
+    };
+
+    let result = cache.apply_position_convert(&instrument, change);
+
+    assert!(result.is_err());
+    assert!(!cache.position_exists(&change.position_id));
+    assert!(cache.oms_type(&change.position_id).is_none());
+    assert!(
+        cache
+            .position_ids(
+                Some(&change.instrument_id.venue),
+                Some(&change.instrument_id),
+                Some(&change.strategy_id),
+                Some(&change.account_id),
+            )
+            .is_empty()
+    );
+    assert!(
+        cache
+            .position_open_ids(
+                Some(&change.instrument_id.venue),
+                Some(&change.instrument_id),
+                Some(&change.strategy_id),
+                Some(&change.account_id),
+            )
+            .is_empty()
+    );
+    assert!(
+        cache
+            .position_snapshots(Some(&change.position_id), None)
+            .is_empty()
+    );
+    assert_eq!(cache.position_snapshot_count(&change.position_id), 0);
+    assert_eq!(cache.position_snapshot_revision(&change.position_id), 0);
+    assert!(
+        cache
+            .index
+            .position_orders
+            .get(&change.position_id)
+            .is_none()
+    );
+    assert!(!cache.index.positions.contains(&change.position_id));
+    assert!(
+        cache
+            .index
+            .position_strategy
+            .get(&change.position_id)
+            .is_none()
+    );
+    assert!(cache.index.position_oms.get(&change.position_id).is_none());
+}
+
+#[rstest]
 fn test_position_snapshot_blobs_exclude_replay_state(mut cache: Cache) {
     let mut position = snapshot_test_position();
     let position_id = position.id;
@@ -14717,7 +15031,7 @@ fn test_add_position_commits_memory_when_database_index_fails(audusd_sim: Curren
     drop(cached);
     // The opening-order relationship in both directions.
     assert_eq!(
-        cache.position_id(&position.opening_order_id),
+        cache.position_id(&position.opening_order_id.unwrap()),
         Some(&position_id),
     );
     assert!(
@@ -14726,7 +15040,7 @@ fn test_add_position_commits_memory_when_database_index_fails(audusd_sim: Curren
             .position_orders
             .get(&position_id)
             .unwrap()
-            .contains(&position.opening_order_id)
+            .contains(&position.opening_order_id.unwrap())
     );
     assert_eq!(
         cache.index.position_strategy.get(&position_id),

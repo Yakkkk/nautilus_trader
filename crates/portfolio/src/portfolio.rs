@@ -94,6 +94,7 @@ struct PortfolioState {
 struct LastSnapshotFrame {
     realized_pnl: Money,
     fill_ids: AHashSet<UUID4>,
+    cycle_id: Option<UUID4>,
 }
 
 impl LastSnapshotFrame {
@@ -101,12 +102,34 @@ impl LastSnapshotFrame {
         Self {
             realized_pnl,
             fill_ids: snapshot.events.iter().map(|fill| fill.event_id).collect(),
+            cycle_id: snapshot.cycle_id,
         }
     }
 
     fn duplicates_closed_cycle(&self, position: &Position) -> bool {
         if position.is_open() || position.realized_pnl != Some(self.realized_pnl) {
             return false;
+        }
+
+        let overlaps_surviving_fills = || {
+            !position.events.is_empty()
+                && position
+                    .events
+                    .iter()
+                    .any(|fill| self.fill_ids.contains(&fill.event_id))
+        };
+
+        match (self.cycle_id, position.cycle_id) {
+            // A recorded cycle ID identifies a real archived cycle. A fill-void rebuild can
+            // replace the derived opening event, so corroborate a changed cycle ID with the
+            // surviving fills before treating it as a different cycle.
+            (Some(frame_cycle), Some(position_cycle)) => {
+                return frame_cycle == position_cycle || overlaps_surviving_fills();
+            }
+            // A cycleless frame is either legacy data or an aggregate settled frame. It cannot
+            // identify the current cycle; only matching surviving fills can corroborate it.
+            (None, Some(_)) => return overlaps_surviving_fills(),
+            _ => {}
         }
 
         if position.events.is_empty() {

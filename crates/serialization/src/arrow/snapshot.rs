@@ -78,7 +78,7 @@ const POSITION_SNAPSHOT_FIELDS: &[JsonFieldSpec] = &[
     JsonFieldSpec::utf8("instrument_id", false),
     JsonFieldSpec::utf8("position_id", false),
     JsonFieldSpec::utf8("account_id", false),
-    JsonFieldSpec::utf8("opening_order_id", false),
+    JsonFieldSpec::utf8("opening_order_id", true),
     JsonFieldSpec::utf8("closing_order_id", true),
     JsonFieldSpec::utf8("entry", false),
     JsonFieldSpec::utf8("side", false),
@@ -100,6 +100,8 @@ const POSITION_SNAPSHOT_FIELDS: &[JsonFieldSpec] = &[
     JsonFieldSpec::timestamp("ts_init", false),
     JsonFieldSpec::timestamp("ts_last", false),
     JsonFieldSpec::utf8_json("replay_state", true),
+    // Appended so older batches remain readable; only the new optional field may be absent.
+    JsonFieldSpec::utf8("opening_operation_id", true).legacy_optional(),
 ];
 
 fn instrument_metadata(type_name: &'static str, instrument_id: &str) -> HashMap<String, String> {
@@ -279,7 +281,8 @@ mod tests {
             instrument_id: InstrumentId::from("EURUSD.SIM"),
             position_id: PositionId::from("P-001"),
             account_id: AccountId::from("SIM-001"),
-            opening_order_id: ClientOrderId::from("O-1"),
+            opening_order_id: Some(ClientOrderId::from("O-1")),
+            opening_operation_id: None,
             closing_order_id: Some(ClientOrderId::from("O-2")),
             entry: OrderSide::Buy,
             side: PositionSide::Long,

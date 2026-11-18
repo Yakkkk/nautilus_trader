@@ -27,10 +27,10 @@ use nautilus_common::{
 use nautilus_core::{DurationNanos, UUID4, UnixNanos, approx_eq, datetime::NANOSECONDS_IN_DAY};
 use nautilus_model::{
     accounts::{Account, AccountAny},
-    data::{Bar, BarType, MarkPriceUpdate, QuoteTick},
+    data::{Bar, BarType, InstrumentClose, MarkPriceUpdate, QuoteTick},
     enums::{
-        AccountType, LiquiditySide, OmsType, OrderSide, OrderType, PositionAdjustmentType,
-        PositionSide, TrailingOffsetType,
+        AccountType, InstrumentCloseType, LiquiditySide, OmsType, OrderSide, OrderType,
+        PositionAdjustmentType, PositionSide, TrailingOffsetType,
     },
     events::{
         AccountState, OrderAccepted, OrderEventAny, OrderFilled, OrderPendingCancel,
@@ -62,7 +62,7 @@ use nautilus_model::{
         },
     },
     orders::{Order, OrderAny, OrderTestBuilder, stubs::TestOrderEventStubs},
-    position::Position,
+    position::{Position, PositionConvert, PositionConvertKind},
     stubs::TestDefault,
     types::{
         AccountBalance, Currency, MarginBalance, Money, Price, Quantity,
@@ -487,12 +487,14 @@ fn get_open_position(position: &Position) -> PositionOpened {
         position_id: position.id,
         account_id: position.account_id,
         opening_order_id: position.opening_order_id,
+        opening_operation_id: position.opening_operation_id,
+        convert: None,
         entry: position.entry,
         side: position.side,
         signed_qty: position.signed_qty,
         quantity: position.quantity,
         last_qty: position.quantity,
-        last_px: Price::from_decimal_dp(position.avg_px_open, 0).unwrap(),
+        last_px: Some(Price::from_decimal_dp(position.avg_px_open, 0).unwrap()),
         currency: position.settlement_currency,
         avg_px_open: position.avg_px_open,
         realized_pnl: position.realized_pnl,
@@ -510,6 +512,8 @@ fn get_closed_position(position: &Position) -> PositionClosed {
         position_id: position.id,
         account_id: position.account_id,
         opening_order_id: position.opening_order_id,
+        opening_operation_id: position.opening_operation_id,
+        convert: None,
         closing_order_id: None,
         entry: position.entry,
         side: PositionSide::Flat,
@@ -517,7 +521,7 @@ fn get_closed_position(position: &Position) -> PositionClosed {
         quantity: Quantity::from("0"),
         peak_quantity: position.quantity,
         last_qty: position.quantity,
-        last_px: Price::from_decimal_dp(position.avg_px_open, 0).unwrap(),
+        last_px: Some(Price::from_decimal_dp(position.avg_px_open, 0).unwrap()),
         currency: position.settlement_currency,
         avg_px_open: position.avg_px_open,
         avg_px_close: Some(position.avg_px_open),
@@ -541,12 +545,14 @@ fn get_changed_position(position: &Position) -> PositionChanged {
         position_id: position.id,
         account_id: position.account_id,
         opening_order_id: position.opening_order_id,
+        opening_operation_id: position.opening_operation_id,
+        convert: None,
         entry: position.entry,
         side: position.side,
         signed_qty: position.signed_qty,
         quantity: position.quantity,
         last_qty: position.quantity,
-        last_px: Price::from_decimal_dp(position.avg_px_open, 0).unwrap(),
+        last_px: Some(Price::from_decimal_dp(position.avg_px_open, 0).unwrap()),
         currency: position.settlement_currency,
         avg_px_open: position.avg_px_open,
         ts_event: 0.into(),
@@ -569,12 +575,14 @@ fn get_close_position(position: &Position) -> PositionClosed {
         position_id: position.id,
         account_id: position.account_id,
         opening_order_id: position.opening_order_id,
+        opening_operation_id: position.opening_operation_id,
+        convert: None,
         entry: position.entry,
         side: position.side,
         signed_qty: position.signed_qty,
         quantity: position.quantity,
         last_qty: position.quantity,
-        last_px: Price::from_decimal_dp(position.avg_px_open, 0).unwrap(),
+        last_px: Some(Price::from_decimal_dp(position.avg_px_open, 0).unwrap()),
         currency: position.settlement_currency,
         avg_px_open: position.avg_px_open,
         ts_event: 0.into(),
@@ -13462,6 +13470,193 @@ fn test_unrealized_pnl_values_negative_price_instrument_at_non_positive_quote(
     assert!(!snapshot.is_stale);
     assert!(snapshot.unpriced_instruments.is_empty());
     assert!(portfolio.missing_price_instruments(&venue, None).is_empty());
+}
+
+#[rstest]
+fn test_unrealized_pnl_for_convert_position_uses_market_quote(mut portfolio: Portfolio) {
+    let instrument = InstrumentAny::BinaryOption(binary_option());
+    let instrument_id = instrument.id();
+    let account_id = AccountId::from("POLYMARKET-001");
+    let currency = instrument.cost_currency();
+    let operation_id = UUID4::new();
+    let strategy_id = StrategyId::from("STRATEGY-001");
+    portfolio.update_account(&AccountState::new(
+        account_id,
+        AccountType::Cash,
+        vec![AccountBalance::new(
+            Money::from("1000.00 USDC"),
+            Money::zero(currency),
+            Money::from("1000.00 USDC"),
+        )],
+        vec![],
+        true,
+        UUID4::new(),
+        UnixNanos::from(1),
+        UnixNanos::from(1),
+        Some(currency),
+    ));
+    let event = {
+        let mut cache = portfolio.cache().borrow_mut();
+        cache.add_instrument(instrument.clone()).unwrap();
+        cache
+            .apply_position_convert(
+                &instrument,
+                PositionConvert {
+                    operation_id,
+                    trader_id: TraderId::from("TRADER-001"),
+                    strategy_id,
+                    instrument_id,
+                    position_id: PositionId::new(format!("{instrument_id}-{strategy_id}")),
+                    account_id,
+                    cycle_id: operation_id,
+                    kind: PositionConvertKind::Open {
+                        previous_cycle_id: None,
+                    },
+                    quantity: Quantity::from("100.00"),
+                    cost: dec!(50),
+                    realized_pnl: Decimal::ZERO,
+                    ts_event: UnixNanos::from(2),
+                    ts_init: UnixNanos::from(2),
+                },
+            )
+            .unwrap()
+            .unwrap()
+    };
+    portfolio.update_position(&event);
+    let before_quote = portfolio.unrealized_pnl(&instrument_id);
+    let quote = QuoteTick::new(
+        instrument_id,
+        Price::from("0.700"),
+        Price::from("0.710"),
+        Quantity::from("100.00"),
+        Quantity::from("100.00"),
+        UnixNanos::from(3),
+        UnixNanos::from(3),
+    );
+    portfolio.cache().borrow_mut().add_quote(quote).unwrap();
+    portfolio.update_quote_tick(&quote);
+
+    assert_eq!(before_quote, None);
+    assert_eq!(
+        portfolio.unrealized_pnl(&instrument_id),
+        Some(Money::from("20.00 USDC"))
+    );
+}
+
+#[rstest]
+fn test_realized_pnl_counts_clob_and_fillless_convert_cycles(
+    mut portfolio: Portfolio,
+    binary_option: BinaryOption,
+) {
+    let instrument = InstrumentAny::BinaryOption(binary_option);
+    let instrument_id = instrument.id();
+    let account_id = AccountId::from("POLYMARKET-001");
+    let currency = instrument.cost_currency();
+    portfolio.update_account(&AccountState::new(
+        account_id,
+        AccountType::Cash,
+        vec![AccountBalance::new(
+            Money::from("1000.00 USDC"),
+            Money::zero(currency),
+            Money::from("1000.00 USDC"),
+        )],
+        vec![],
+        true,
+        UUID4::new(),
+        UnixNanos::from(1),
+        UnixNanos::from(1),
+        Some(currency),
+    ));
+    portfolio
+        .cache()
+        .borrow_mut()
+        .add_instrument(instrument.clone())
+        .unwrap();
+
+    let mut buy = make_fill_for_account(
+        &instrument,
+        account_id,
+        OrderSide::Buy,
+        Quantity::from("100.00"),
+        Price::from("0.500"),
+        PositionId::from("P-CLOB"),
+    );
+    let strategy_id = buy.strategy_id;
+    let position_id = PositionId::new(format!("{instrument_id}-{strategy_id}"));
+    buy.position_id = Some(position_id);
+    buy.event_id = UUID4::new();
+    buy.commission = None;
+    buy.ts_event = UnixNanos::from(2);
+    buy.ts_init = UnixNanos::from(2);
+    let mut position = Position::new(&instrument, buy.clone());
+    let mut sell = make_fill_for_account(
+        &instrument,
+        account_id,
+        OrderSide::Sell,
+        Quantity::from("100.00"),
+        Price::from("0.700"),
+        PositionId::from("P-CLOB"),
+    );
+    sell.position_id = Some(position_id);
+    sell.event_id = UUID4::new();
+    sell.commission = None;
+    sell.ts_event = UnixNanos::from(3);
+    sell.ts_init = UnixNanos::from(3);
+    position.try_apply(&sell).unwrap();
+
+    assert!(position.is_closed());
+    assert_eq!(position.realized_pnl, Some(Money::from("20.00 USDC")));
+    portfolio
+        .cache()
+        .borrow_mut()
+        .add_position(&position, OmsType::Netting)
+        .unwrap();
+
+    let operation_id = UUID4::new();
+    let opening = PositionConvert {
+        operation_id,
+        trader_id: buy.trader_id,
+        strategy_id,
+        instrument_id,
+        position_id,
+        account_id,
+        cycle_id: operation_id,
+        kind: PositionConvertKind::Open {
+            previous_cycle_id: Some(position.current_cycle_id().unwrap()),
+        },
+        quantity: Quantity::from("100.00"),
+        cost: dec!(50),
+        realized_pnl: Decimal::ZERO,
+        ts_event: UnixNanos::from(4),
+        ts_init: UnixNanos::from(4),
+    };
+    let event = portfolio
+        .cache()
+        .borrow_mut()
+        .apply_position_convert(&instrument, opening)
+        .unwrap()
+        .unwrap();
+    portfolio.update_position(&event);
+
+    let close = InstrumentClose::new(
+        instrument_id,
+        Price::from("0.700"),
+        InstrumentCloseType::ContractExpired,
+        UnixNanos::from(5),
+        UnixNanos::from(5),
+    );
+    {
+        let mut cache = portfolio.cache().borrow_mut();
+        cache.add_instrument_close(close).unwrap();
+        cache
+            .update_position_from_instrument_close(position_id, close)
+            .unwrap();
+    }
+
+    assert_eq!(
+        portfolio.realized_pnl(&instrument_id),
+        Some(Money::from("40.00 USDC"))
+    );
 }
 
 #[rstest]

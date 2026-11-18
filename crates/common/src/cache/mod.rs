@@ -91,10 +91,10 @@ use nautilus_model::{
         option_chain::OptionGreeks,
     },
     enums::{
-        AggregationSource, ContingencyType, InstrumentClass, OmsType, OrderSide, PositionSide,
-        PriceType,
+        AggregationSource, ContingencyType, InstrumentClass, InstrumentCloseType, OmsType,
+        OrderSide, PositionSide, PriceType,
     },
-    events::{AccountState, OrderEventAny, OrderFilled, PositionAdjusted},
+    events::{AccountState, OrderEventAny, OrderFilled, PositionAdjusted, position::PositionEvent},
     identifiers::{
         AccountId, ActorId, ClientId, ClientOrderId, ExecAlgorithmId, InstrumentId, OrderListId,
         PositionId, StrategyId, Venue, VenueOrderId,
@@ -105,7 +105,7 @@ use nautilus_model::{
         own::{OwnOrderBook, should_handle_own_book_order},
     },
     orders::{Order, OrderAny, OrderError, OrderList},
-    position::{Position, PositionReplayEvent},
+    position::{Position, PositionConvert, PositionConvertKind, PositionReplayEvent},
     types::{
         Currency, ERROR_PRICE, Money, Price, Quantity,
         fixed::{FIXED_PRECISION, MAX_FLOAT_PRECISION, check_fixed_precision},
@@ -3927,6 +3927,13 @@ impl Cache {
     ) -> anyhow::Result<()> {
         let oms_type = resolve_position_oms(&position, oms_type);
 
+        if index_order && position.opening_order_id.is_none() {
+            anyhow::bail!(
+                "Cannot index an opening order for position {}: the position has no opening order",
+                position.id,
+            );
+        }
+
         // Validate and serialize the OMS entry up front: both are construction failures, and
         // committing the position before they run would leave the cache mutated by one.
         // The key embeds the position ID, which embeds the instrument ID and venue
@@ -3949,7 +3956,11 @@ impl Cache {
         // transfer and the swap share one borrow, so a failure above cannot strip the prior.
         let position_cell = if let Some(position_cell) = self.positions.get(&position_id).cloned() {
             let mut prior = position_cell.borrow_mut();
-            if carry_replay_state {
+            let prior_has_convert_state = prior
+                .replay_events
+                .iter()
+                .any(|event| matches!(event, PositionReplayEvent::Converted(_)));
+            if carry_replay_state || prior_has_convert_state {
                 position.transfer_replay_state_from(&mut prior);
             }
             *prior = position;
@@ -3968,6 +3979,8 @@ impl Cache {
         self.index.strategy_orders.entry(strategy_id).or_default();
 
         if index_order {
+            let opening_order_id =
+                opening_order_id.expect("opening order was checked before adding the position");
             self.index_position_id_in_memory(
                 &position_id,
                 &instrument_id.venue,
@@ -4001,6 +4014,8 @@ impl Cache {
         self.general.insert(key.clone(), value.clone());
 
         if index_order {
+            let opening_order_id =
+                opening_order_id.expect("opening order was checked before adding the position");
             self.persist_position_id(&position_id, &opening_order_id)?;
         }
 
@@ -4388,6 +4403,154 @@ impl Cache {
         }
 
         Ok(())
+    }
+
+    /// Applies one Convert change to a NETTING position and returns its lifecycle notification.
+    ///
+    /// Returns `None` for a repeated change matching the recorded contents.
+    /// New positions are cached as NETTING using the supplied `position_id`; callers should pass
+    /// the canonical `{instrument_id}-{strategy_id}` ID for NETTING fill routing.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the position, target cycle, or accounting values are invalid.
+    pub fn apply_position_convert(
+        &mut self,
+        instrument: &InstrumentAny,
+        change: PositionConvert,
+    ) -> anyhow::Result<Option<PositionEvent>> {
+        anyhow::ensure!(
+            instrument.id() == change.instrument_id,
+            "instrument {} does not match Convert change instrument {}",
+            instrument.id(),
+            change.instrument_id,
+        );
+        let formal_instrument_close = self
+            .instrument_close(&change.instrument_id)
+            .is_some_and(|close| close.close_type == InstrumentCloseType::ContractExpired);
+
+        let Some(position_cell) = self.positions.get(&change.position_id).cloned() else {
+            let PositionConvertKind::Open { previous_cycle_id } = change.kind else {
+                anyhow::bail!(
+                    "Cannot apply Convert change {} to missing position {}",
+                    change.operation_id,
+                    change.position_id,
+                );
+            };
+            anyhow::ensure!(
+                previous_cycle_id.is_none(),
+                "Convert opening {} names an unrecorded prior cycle for position {}",
+                change.operation_id,
+                change.position_id,
+            );
+            anyhow::ensure!(
+                is_canonical_netting_position_id(
+                    change.position_id,
+                    change.instrument_id,
+                    change.strategy_id,
+                ),
+                "Cannot create Convert position {}: expected canonical NETTING position ID {}-{}",
+                change.position_id,
+                change.instrument_id,
+                change.strategy_id,
+            );
+            anyhow::ensure!(
+                !formal_instrument_close,
+                "Cannot open Convert position {} after its instrument formally expired",
+                change.position_id,
+            );
+
+            let position = Position::new_from_convert(instrument, change)?;
+            self.add_position_without_order(&position, OmsType::Netting)?;
+
+            return Ok(Some(PositionEvent::from_convert(&position, change)));
+        };
+
+        let prior = position_cell.borrow().clone();
+        anyhow::ensure!(
+            prior.trader_id == change.trader_id
+                && prior.strategy_id == change.strategy_id
+                && prior.instrument_id == change.instrument_id
+                && prior.account_id == change.account_id,
+            "Convert change {} does not match position {} identity",
+            change.operation_id,
+            prior.id,
+        );
+        let oms_type = self.oms_type(&prior.id);
+        anyhow::ensure!(
+            oms_type == Some(OmsType::Netting),
+            "Cannot apply Convert change {} to position {} with OMS type {:?}; only NETTING is supported",
+            change.operation_id,
+            prior.id,
+            oms_type,
+        );
+
+        if prior.has_convert_change(&change)? {
+            return Ok(None);
+        }
+        anyhow::ensure!(
+            !prior.is_inverse,
+            "Convert accounting does not support inverse positions"
+        );
+        anyhow::ensure!(
+            !formal_instrument_close,
+            "Cannot apply unrecorded Convert change {} to position {} after its instrument formally expired",
+            change.operation_id,
+            prior.id,
+        );
+
+        if let PositionConvertKind::Open { previous_cycle_id } = change.kind {
+            anyhow::ensure!(
+                prior.is_closed(),
+                "Cannot open Convert cycle {} for position {} which is not closed",
+                change.operation_id,
+                prior.id,
+            );
+            anyhow::ensure!(
+                !position_has_formal_close(&prior),
+                "Cannot reopen position {} after a formal instrument close",
+                prior.id,
+            );
+
+            let Some(current_cycle) = prior.current_cycle_id() else {
+                anyhow::bail!(
+                    "Cannot open Convert cycle {} for position {} with no recorded prior cycle",
+                    change.operation_id,
+                    prior.id,
+                );
+            };
+            anyhow::ensure!(
+                previous_cycle_id == Some(current_cycle),
+                "Convert opening {} targets a stale or unrecorded prior cycle for position {}",
+                change.operation_id,
+                prior.id,
+            );
+
+            let position = Position::new_from_convert(instrument, change)?;
+            self.snapshot_position(&prior)?;
+            self.replace_position(&position, OmsType::Netting, false, true)?;
+
+            return Ok(Some(PositionEvent::from_convert(&position, change)));
+        }
+
+        let event = {
+            let mut position = position_cell.borrow_mut();
+            position.apply_convert(change)?
+        };
+        let Some(event) = event else {
+            return Ok(None);
+        };
+
+        self.refresh_position_indexes(&position_cell.borrow());
+
+        if let Some(database) = &mut self.database {
+            handle_persistence_result(
+                format_args!("persist Convert position {}", prior.id),
+                database.update_position(&position_cell.borrow()),
+            )?;
+        }
+
+        Ok(Some(event))
     }
 
     /// Updates a cached position by applying an order fill in place.
@@ -8012,14 +8175,33 @@ fn position_oms_key(position_id: PositionId) -> String {
     format!("{POSITION_OMS_KEY_PREFIX}{position_id}")
 }
 
+fn is_canonical_netting_position_id(
+    position_id: PositionId,
+    instrument_id: InstrumentId,
+    strategy_id: StrategyId,
+) -> bool {
+    position_id.as_str() == format!("{instrument_id}-{strategy_id}")
+}
+
 fn resolve_position_oms(position: &Position, oms_type: OmsType) -> OmsType {
     if oms_type == OmsType::Unspecified
-        && position.id.as_str() == format!("{}-{}", position.instrument_id, position.strategy_id)
+        && is_canonical_netting_position_id(
+            position.id,
+            position.instrument_id,
+            position.strategy_id,
+        )
     {
         OmsType::Netting
     } else {
         oms_type
     }
+}
+
+fn position_has_formal_close(position: &Position) -> bool {
+    position
+        .replay_events
+        .iter()
+        .any(|event| matches!(event, PositionReplayEvent::InstrumentClosed(_)))
 }
 
 /// Inserts `bar` into the newest-first bars deque for a `bar_type`.

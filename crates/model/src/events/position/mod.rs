@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     events::{PositionAdjusted, PositionChanged, PositionClosed, PositionOpened},
     identifiers::{AccountId, InstrumentId},
+    position::{Position, PositionConvert, PositionConvertKind},
 };
 pub mod adjusted;
 pub mod changed;
@@ -34,6 +35,25 @@ pub enum PositionEvent {
 }
 
 impl PositionEvent {
+    /// Builds the lifecycle notification for an applied Convert change.
+    #[must_use]
+    pub fn from_convert(position: &Position, change: PositionConvert) -> Self {
+        match change.kind {
+            PositionConvertKind::Open { .. } => {
+                Self::PositionOpened(PositionOpened::from_convert(position, change))
+            }
+            PositionConvertKind::Increase => {
+                Self::PositionChanged(PositionChanged::from_convert(position, change))
+            }
+            PositionConvertKind::Decrease if position.is_closed() => {
+                Self::PositionClosed(PositionClosed::from_convert(position, change))
+            }
+            PositionConvertKind::Decrease => {
+                Self::PositionChanged(PositionChanged::from_convert(position, change))
+            }
+        }
+    }
+
     #[must_use]
     pub fn instrument_id(&self) -> InstrumentId {
         match self {
@@ -76,13 +96,15 @@ mod tests {
             instrument_id: InstrumentId::from("EURUSD.SIM"),
             position_id: PositionId::from("P-001"),
             account_id: AccountId::from("SIM-001"),
-            opening_order_id: ClientOrderId::from("O-19700101-000000-001-001-1"),
+            opening_order_id: Some(ClientOrderId::from("O-19700101-000000-001-001-1")),
+            opening_operation_id: None,
+            convert: None,
             entry: OrderSide::Buy,
             side: PositionSide::Long,
             signed_qty: dec!(100.0),
             quantity: Quantity::from("100"),
             last_qty: Quantity::from("100"),
-            last_px: Price::from("1.0500"),
+            last_px: Some(Price::from("1.0500")),
             currency: Currency::USD(),
             avg_px_open: dec!(1.0500),
             realized_pnl: Some(Money::new(-2.0, Currency::USD())),
@@ -99,14 +121,16 @@ mod tests {
             instrument_id: InstrumentId::from("EURUSD.SIM"),
             position_id: PositionId::from("P-001"),
             account_id: AccountId::from("SIM-001"),
-            opening_order_id: ClientOrderId::from("O-19700101-000000-001-001-1"),
+            opening_order_id: Some(ClientOrderId::from("O-19700101-000000-001-001-1")),
+            opening_operation_id: None,
+            convert: None,
             entry: OrderSide::Buy,
             side: PositionSide::Long,
             signed_qty: dec!(150.0),
             quantity: Quantity::from("150"),
             peak_quantity: Quantity::from("150"),
             last_qty: Quantity::from("50"),
-            last_px: Price::from("1.0550"),
+            last_px: Some(Price::from("1.0550")),
             currency: Currency::USD(),
             avg_px_open: dec!(1.0525),
             avg_px_close: None,
@@ -127,7 +151,9 @@ mod tests {
             instrument_id: InstrumentId::from("EURUSD.SIM"),
             position_id: PositionId::from("P-001"),
             account_id: AccountId::from("SIM-001"),
-            opening_order_id: ClientOrderId::from("O-19700101-000000-001-001-1"),
+            opening_order_id: Some(ClientOrderId::from("O-19700101-000000-001-001-1")),
+            opening_operation_id: None,
+            convert: None,
             closing_order_id: Some(ClientOrderId::from("O-19700101-000000-001-001-2")),
             entry: OrderSide::Buy,
             side: PositionSide::Flat,
@@ -135,7 +161,7 @@ mod tests {
             quantity: Quantity::from("0"),
             peak_quantity: Quantity::from("150"),
             last_qty: Quantity::from("150"),
-            last_px: Price::from("1.0600"),
+            last_px: Some(Price::from("1.0600")),
             currency: Currency::USD(),
             avg_px_open: dec!(1.0525),
             avg_px_close: Some(dec!(1.0600)),

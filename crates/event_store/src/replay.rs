@@ -40,13 +40,13 @@ use nautilus_model::{
     enums::{OmsType, OrderSide, PositionSide},
     events::{
         AccountState, OrderEventAny, OrderFillVoided, OrderFilled, OrderInitialized,
-        PositionAdjusted, PositionChanged, PositionClosed, PositionOpened,
+        PositionAdjusted, PositionChanged, PositionClosed, PositionOpened, position::PositionEvent,
     },
-    identifiers::{ClientId, InstrumentId, PositionId},
+    identifiers::{AccountId, ClientId, InstrumentId, PositionId, StrategyId, TraderId},
     orders::{Order, OrderAny},
-    position::{Position, PositionReplayEvent},
+    position::{Position, PositionConvert, PositionConvertKind, PositionReplayEvent},
     types::{
-        Money, Quantity,
+        Money, Price, Quantity,
         quantity::{QUANTITY_RAW_MAX, QuantityRaw},
     },
 };
@@ -684,10 +684,10 @@ impl CacheReplayContext {
                     && fill.strategy_id == opened.strategy_id
                     && fill.instrument_id == opened.instrument_id
                     && fill.account_id == opened.account_id
-                    && fill.client_order_id == opened.opening_order_id
+                    && opened.opening_order_id == Some(fill.client_order_id)
                     && fill.order_side == opened.entry
                     && fill.last_qty == opened.last_qty
-                    && fill.last_px == opened.last_px
+                    && opened.last_px == Some(fill.last_px)
                     && fill.currency == opened.currency)
                     .then_some(index)
             })
@@ -1608,6 +1608,8 @@ fn apply_fill_to_position(
     }
 
     if let Some(mut position) = cache.position_owned(&position_id) {
+        let reopening = position.is_closed();
+
         // Mirror live `Position::apply_fill`: a duplicate inside an open episode is
         // the idempotent replay no-op; historical duplicates on a Flat position are
         // ignored inside `apply` itself from the carried replay history.
@@ -1618,8 +1620,28 @@ fn apply_fill_to_position(
             return Ok(true);
         }
 
+        // Mirror the live reopen path without losing the closed cycle's PnL. A closed
+        // position's replay history makes any repeated trade id a historical duplicate.
+        if position.is_closed() {
+            if position.has_replay_trade_id(fill.trade_id) {
+                return Ok(true);
+            }
+
+            if !position_cycle_is_archived(cache, &position) {
+                let mut next = position.clone();
+                apply_result(entry, next.try_apply(fill))?;
+                apply_result(entry, cache.snapshot_position(&position))?;
+                apply_result(entry, cache.update_position(&next))?;
+                index_reopened_position_order(cache, entry, &next, orderless_leg_fill)?;
+                return Ok(true);
+            }
+        }
+
         apply_result(entry, position.try_apply(fill))?;
         apply_result(entry, cache.update_position(&position))?;
+        if reopening {
+            index_reopened_position_order(cache, entry, &position, orderless_leg_fill)?;
+        }
         return Ok(true);
     }
 
@@ -1643,6 +1665,45 @@ fn apply_fill_to_position(
         apply_result(entry, cache.add_position(&position, OmsType::Unspecified))?;
     }
     Ok(true)
+}
+
+fn position_cycle_is_archived(cache: &Cache, position: &Position) -> bool {
+    let Some(cycle_id) = position.current_cycle_id() else {
+        return false;
+    };
+
+    cache
+        .position_snapshots(Some(&position.id), None)
+        .iter()
+        .any(|snapshot| snapshot.current_cycle_id() == Some(cycle_id))
+}
+
+fn index_reopened_position_order(
+    cache: &mut Cache,
+    entry: &EventStoreEntry,
+    position: &Position,
+    orderless_leg_fill: bool,
+) -> Result<(), CacheReplayError> {
+    if orderless_leg_fill {
+        return Ok(());
+    }
+
+    let Some(opening_order_id) = position.opening_order_id else {
+        return Err(apply_error(
+            entry,
+            format!("reopened position {} has no opening order", position.id),
+        ));
+    };
+
+    apply_result(
+        entry,
+        cache.add_position_id(
+            &position.id,
+            &position.instrument_id.venue,
+            &opening_order_id,
+            &position.strategy_id,
+        ),
+    )
 }
 
 fn is_orderless_leg_fill(cache: &Cache, fill: &OrderFilled) -> bool {
@@ -1695,10 +1756,20 @@ fn apply_fill_void_to_order_and_positions(
     };
 
     apply_result(entry, cache.update_order(&event))?;
-    for position in corrected_positions {
-        apply_result(entry, cache.update_position(&position))?;
+    for corrected in corrected_positions {
+        apply_result(entry, cache.update_position(&corrected.position))?;
+
+        if corrected.settle_convert_archives {
+            cache.settle_position_snapshots(&corrected.position, corrected.closed_cycles_pnl);
+        }
     }
     Ok(())
+}
+
+struct CorrectedFillVoidPosition {
+    position: Position,
+    settle_convert_archives: bool,
+    closed_cycles_pnl: Option<Money>,
 }
 
 fn prepare_fill_void_positions(
@@ -1706,7 +1777,7 @@ fn prepare_fill_void_positions(
     entry: &EventStoreEntry,
     fill_voided: &OrderFillVoided,
     source_event_id: UUID4,
-) -> Result<Vec<Position>, CacheReplayError> {
+) -> Result<Vec<CorrectedFillVoidPosition>, CacheReplayError> {
     let fragments = collect_fill_void_fragments(cache, entry, fill_voided, source_event_id)?;
     let allocations = allocate_fill_void_fragments(entry, fill_voided, &fragments)?;
     let mut corrected_positions = Vec::new();
@@ -1736,11 +1807,65 @@ fn prepare_fill_void_positions(
         if previous == Some((voided_qty, commission_voided)) {
             continue;
         }
-        apply_result(
+        let prior = position.clone();
+        let precision = voided_qty
+            .precision
+            .max(previous.map_or(0, |(qty, _)| qty.precision))
+            .max(
+                position
+                    .events
+                    .iter()
+                    .filter(|fill| {
+                        fill.client_order_id == fill_voided.client_order_id
+                            && fill.trade_id == fill_voided.trade_id
+                    })
+                    .map(|fill| fill.last_qty.precision)
+                    .max()
+                    .unwrap_or(0),
+            );
+        let prior_qty_raw = previous.map_or(Ok(0), |(qty, _)| {
+            quantity_raw_at_precision(entry, qty, precision)
+        })?;
+        let current_cycle_qty_raw = position
+            .events
+            .iter()
+            .filter(|fill| {
+                fill.client_order_id == fill_voided.client_order_id
+                    && fill.trade_id == fill_voided.trade_id
+            })
+            .try_fold(prior_qty_raw, |total, fill| {
+                total
+                    .checked_add(quantity_raw_at_precision(entry, fill.last_qty, precision)?)
+                    .ok_or_else(|| apply_error(entry, "position current cycle quantity overflow"))
+            })?;
+        let voided_qty_raw = quantity_raw_at_precision(entry, voided_qty, precision)?;
+
+        let closed_cycles_pnl = apply_result(
             entry,
             position.apply_fill_void(fill_voided.clone(), voided_qty, commission_voided),
         )?;
-        corrected_positions.push(position);
+
+        // Event-store reopen replay always retains the prior replay journal, so the
+        // live judgment's carry-replay condition is always true here. Only settle
+        // Convert archives; CLOB-only replay keeps its existing archival behavior.
+        let absorbed_prior_cycles = voided_qty_raw > current_cycle_qty_raw
+            || position.events.first().is_some_and(|opening| {
+                !prior
+                    .events
+                    .iter()
+                    .any(|fill| fill.event_id == opening.event_id)
+            });
+        let settle_convert_archives = absorbed_prior_cycles
+            && position
+                .replay_events
+                .iter()
+                .any(|event| matches!(event, PositionReplayEvent::Converted(_)));
+
+        corrected_positions.push(CorrectedFillVoidPosition {
+            position,
+            settle_convert_archives,
+            closed_cycles_pnl,
+        });
     }
     Ok(corrected_positions)
 }
@@ -1920,11 +2045,225 @@ fn quantity_raw_at_precision(
         .ok_or_else(|| apply_error(entry, "voided quantity scale alignment overflow"))
 }
 
+#[derive(Clone, Copy)]
+enum ConvertLifecycle<'a> {
+    Opened(&'a PositionOpened),
+    Changed(&'a PositionChanged),
+    Closed(&'a PositionClosed),
+}
+
+impl ConvertLifecycle<'_> {
+    fn change(self) -> Option<PositionConvert> {
+        match self {
+            Self::Opened(opened) => opened.convert,
+            Self::Changed(changed) => changed.convert,
+            Self::Closed(closed) => closed.convert,
+        }
+    }
+
+    fn matches_kind(self, change: &PositionConvert) -> bool {
+        matches!(
+            (self, change.kind),
+            (Self::Opened(_), PositionConvertKind::Open { .. })
+                | (
+                    Self::Changed(_),
+                    PositionConvertKind::Increase | PositionConvertKind::Decrease
+                )
+                | (Self::Closed(_), PositionConvertKind::Decrease)
+        )
+    }
+
+    fn identity(self) -> (TraderId, StrategyId, InstrumentId, PositionId, AccountId) {
+        match self {
+            Self::Opened(opened) => (
+                opened.trader_id,
+                opened.strategy_id,
+                opened.instrument_id,
+                opened.position_id,
+                opened.account_id,
+            ),
+            Self::Changed(changed) => (
+                changed.trader_id,
+                changed.strategy_id,
+                changed.instrument_id,
+                changed.position_id,
+                changed.account_id,
+            ),
+            Self::Closed(closed) => (
+                closed.trader_id,
+                closed.strategy_id,
+                closed.instrument_id,
+                closed.position_id,
+                closed.account_id,
+            ),
+        }
+    }
+
+    fn last_qty(self) -> Quantity {
+        match self {
+            Self::Opened(opened) => opened.last_qty,
+            Self::Changed(changed) => changed.last_qty,
+            Self::Closed(closed) => closed.last_qty,
+        }
+    }
+
+    fn last_px(self) -> Option<Price> {
+        match self {
+            Self::Opened(opened) => opened.last_px,
+            Self::Changed(changed) => changed.last_px,
+            Self::Closed(closed) => closed.last_px,
+        }
+    }
+
+    fn ts_event(self) -> UnixNanos {
+        match self {
+            Self::Opened(opened) => opened.ts_event,
+            Self::Changed(changed) => changed.ts_event,
+            Self::Closed(closed) => closed.ts_event,
+        }
+    }
+
+    /// Checks the notification envelope against the nested typed change before replay
+    /// stages or mutates any position.
+    fn validate_envelope(
+        self,
+        entry: &EventStoreEntry,
+        change: &PositionConvert,
+    ) -> Result<(), CacheReplayError> {
+        let expected_identity = (
+            change.trader_id,
+            change.strategy_id,
+            change.instrument_id,
+            change.position_id,
+            change.account_id,
+        );
+
+        if self.change() != Some(*change)
+            || !self.matches_kind(change)
+            || self.identity() != expected_identity
+            || self.last_qty() != change.quantity
+            || self.last_px().is_some()
+            || self.ts_event() != change.ts_event
+        {
+            return Err(apply_error(
+                entry,
+                format!(
+                    "Convert lifecycle envelope does not match change {} for position {}",
+                    change.operation_id, change.position_id,
+                ),
+            ));
+        }
+
+        Ok(())
+    }
+
+    /// Checks the complete notification projection against a staged position before commit.
+    fn validate_projection(
+        self,
+        entry: &EventStoreEntry,
+        staged: &Position,
+        change: PositionConvert,
+    ) -> Result<(), CacheReplayError> {
+        let expected = PositionEvent::from_convert(staged, change);
+        let matches = match (expected, self) {
+            (PositionEvent::PositionOpened(mut expected), Self::Opened(actual)) => {
+                expected.event_id = actual.event_id;
+                expected.ts_init = actual.ts_init;
+                expected.eq(actual)
+            }
+            (PositionEvent::PositionChanged(mut expected), Self::Changed(actual)) => {
+                expected.event_id = actual.event_id;
+                expected.ts_init = actual.ts_init;
+                expected.eq(actual)
+            }
+            (PositionEvent::PositionClosed(mut expected), Self::Closed(actual)) => {
+                expected.event_id = actual.event_id;
+                expected.ts_init = actual.ts_init;
+                expected.eq(actual)
+            }
+            _ => false,
+        };
+
+        if !matches {
+            return Err(apply_error(
+                entry,
+                format!(
+                    "Convert change {} for position {} does not match the lifecycle notification",
+                    change.operation_id, change.position_id,
+                ),
+            ));
+        }
+
+        Ok(())
+    }
+}
+
+/// Replays a captured Convert lifecycle through the typed change and Cache.
+///
+/// The envelope and staged projection are validated before any cache mutation. A missing
+/// instrument or position is reported as an ignored entry, matching the fill bootstrap path.
+fn apply_convert_lifecycle(
+    cache: &mut Cache,
+    entry: &EventStoreEntry,
+    notification: ConvertLifecycle<'_>,
+) -> Result<bool, CacheReplayError> {
+    let Some(change) = notification.change() else {
+        return Err(apply_error(
+            entry,
+            "Convert lifecycle notification has no Convert change",
+        ));
+    };
+    notification.validate_envelope(entry, &change)?;
+
+    let Some(instrument) = cache.instrument(&change.instrument_id).cloned() else {
+        log::warn!(
+            "Replay seq {} skipped Convert change {} for position {}: instrument {} not in cache",
+            entry.seq,
+            change.operation_id,
+            change.position_id,
+            change.instrument_id,
+        );
+        return Ok(false);
+    };
+
+    let prior = cache.position_owned(&change.position_id);
+    if let Some(position) = prior.as_ref()
+        && apply_result(entry, position.has_convert_change(&change))?
+    {
+        return Ok(true);
+    }
+
+    let staged = match change.kind {
+        PositionConvertKind::Open { .. } => {
+            apply_result(entry, Position::new_from_convert(&instrument, change))?
+        }
+        PositionConvertKind::Increase | PositionConvertKind::Decrease => {
+            let Some(mut position) = prior else {
+                warn_position_skip(entry, change.position_id);
+                return Ok(false);
+            };
+
+            match apply_result(entry, position.apply_convert(change))? {
+                Some(_) => position,
+                None => return Ok(true),
+            }
+        }
+    };
+
+    notification.validate_projection(entry, &staged, change)?;
+    apply_result(entry, cache.apply_position_convert(&instrument, change))?;
+    Ok(true)
+}
+
 fn apply_position_opened(
     cache: &mut Cache,
     entry: &EventStoreEntry,
     opened: &PositionOpened,
 ) -> Result<bool, CacheReplayError> {
+    if opened.convert.is_some() {
+        return apply_convert_lifecycle(cache, entry, ConvertLifecycle::Opened(opened));
+    }
+
     let Some(mut position) = cache.position_owned(&opened.position_id) else {
         warn_position_skip(entry, opened.position_id);
         return Ok(false);
@@ -1937,6 +2276,7 @@ fn apply_position_opened(
     position.id = opened.position_id;
     position.account_id = opened.account_id;
     position.opening_order_id = opened.opening_order_id;
+    position.opening_operation_id = opened.opening_operation_id;
     position.closing_order_id = None;
     position.ts_opened = opened.ts_event;
     position.ts_last = opened.ts_event;
@@ -1991,6 +2331,10 @@ fn apply_position_changed(
     entry: &EventStoreEntry,
     changed: &PositionChanged,
 ) -> Result<bool, CacheReplayError> {
+    if changed.convert.is_some() {
+        return apply_convert_lifecycle(cache, entry, ConvertLifecycle::Changed(changed));
+    }
+
     let Some(mut position) = cache.position_owned(&changed.position_id) else {
         warn_position_skip(entry, changed.position_id);
         return Ok(false);
@@ -2038,6 +2382,7 @@ fn apply_position_changed(
     position.id = changed.position_id;
     position.account_id = changed.account_id;
     position.opening_order_id = changed.opening_order_id;
+    position.opening_operation_id = changed.opening_operation_id;
     position.ts_opened = changed.ts_opened;
     position.ts_last = changed.ts_event;
     position.ts_closed = None;
@@ -2051,6 +2396,10 @@ fn apply_position_closed(
     entry: &EventStoreEntry,
     closed: &PositionClosed,
 ) -> Result<bool, CacheReplayError> {
+    if closed.convert.is_some() {
+        return apply_convert_lifecycle(cache, entry, ConvertLifecycle::Closed(closed));
+    }
+
     let Some(mut position) = cache.position_owned(&closed.position_id) else {
         warn_position_skip(entry, closed.position_id);
         return Ok(false);
@@ -2098,6 +2447,7 @@ fn apply_position_closed(
     position.id = closed.position_id;
     position.account_id = closed.account_id;
     position.opening_order_id = closed.opening_order_id;
+    position.opening_operation_id = closed.opening_operation_id;
     position.closing_order_id = closed.closing_order_id;
     position.ts_opened = closed.ts_opened;
     position.ts_last = closed.ts_event;
@@ -2232,7 +2582,7 @@ mod tests {
         },
         identifiers::{
             AccountId, ClientId, ClientOrderId, InstrumentId, OrderListId, PositionId, StrategyId,
-            TradeId, VenueOrderId,
+            TradeId, TraderId, VenueOrderId,
         },
         instruments::{
             Instrument, InstrumentAny,
@@ -2882,6 +3232,15 @@ mod tests {
                 PAYLOAD_TYPE_POSITION_CHANGED,
                 PAYLOAD_TYPE_POSITION_CLOSED,
                 PAYLOAD_TYPE_POSITION_ADJUSTED,
+            ],
+        ),
+        cache_mutation(
+            "apply_position_convert",
+            CacheMutationRecoveryClass::EventStoreCapturedAndReplayed,
+            &[
+                PAYLOAD_TYPE_POSITION_OPENED,
+                PAYLOAD_TYPE_POSITION_CHANGED,
+                PAYLOAD_TYPE_POSITION_CLOSED,
             ],
         ),
         cache_mutation(
@@ -4627,6 +4986,150 @@ mod tests {
     }
 
     #[rstest]
+    fn clob_flip_to_long_then_convert_replays_with_shared_cycle_identity() {
+        let instrument = InstrumentAny::BinaryOption(binary_option());
+        let strategy_id = StrategyId::from("S-CONVERT-FLIP");
+        let account_id = AccountId::from("POLYMARKET-001");
+        let position_id = canonical_position_id(&instrument, strategy_id);
+
+        let short_opening = OrderFilledSpec::builder()
+            .strategy_id(strategy_id)
+            .instrument_id(instrument.id())
+            .account_id(account_id)
+            .client_order_id(ClientOrderId::from("O-SHORT-OPEN"))
+            .venue_order_id(VenueOrderId::from("V-SHORT-OPEN"))
+            .trade_id(TradeId::from("T-SHORT-OPEN"))
+            .order_side(OrderSide::Sell)
+            .last_qty(Quantity::from("2.00"))
+            .last_px(Price::from("1.00000"))
+            .position_id(position_id)
+            .build();
+        let short_position = Position::new(&instrument, short_opening);
+        let seed_short = short_position.clone();
+
+        let flip_fill = OrderFilledSpec::builder()
+            .strategy_id(strategy_id)
+            .instrument_id(instrument.id())
+            .account_id(account_id)
+            .client_order_id(ClientOrderId::from("O-FLIP-BUY"))
+            .venue_order_id(VenueOrderId::from("V-FLIP-BUY"))
+            .trade_id(TradeId::from("T-FLIP-BUY"))
+            .order_side(OrderSide::Buy)
+            .last_qty(Quantity::from("3.00"))
+            .last_px(Price::from("1.10000"))
+            .currency(instrument.quote_currency())
+            .position_id(position_id)
+            .build();
+        let opening_event_id = UUID4::new();
+        let (closing_fragment, opening_fragment) = flip_fill
+            .split_for_position_flip(short_position.quantity, Some(position_id), opening_event_id)
+            .unwrap();
+
+        let mut closed_short = short_position;
+        closed_short.try_apply(&closing_fragment).unwrap();
+        let closed_event = PositionClosed::create(
+            &closed_short,
+            &closing_fragment,
+            UUID4::new(),
+            closing_fragment.ts_init,
+        );
+        let mut converted_long = Position::new(&instrument, opening_fragment.clone());
+        assert_eq!(converted_long.current_cycle_id(), Some(opening_event_id));
+        let opened_event = PositionOpened::create(
+            &converted_long,
+            &opening_fragment,
+            opening_event_id,
+            opening_fragment.ts_init,
+        );
+
+        let increase = PositionConvert {
+            operation_id: UUID4::new(),
+            trader_id: converted_long.trader_id,
+            strategy_id,
+            instrument_id: instrument.id(),
+            position_id,
+            account_id,
+            cycle_id: opening_event_id,
+            kind: PositionConvertKind::Increase,
+            quantity: Quantity::from("2.00"),
+            cost: 2.into(),
+            realized_pnl: 0.into(),
+            ts_event: UnixNanos::from(10),
+            ts_init: UnixNanos::from(10),
+        };
+        let increased = converted_long
+            .apply_convert(increase)
+            .unwrap()
+            .expect("increase notification");
+        let decrease = PositionConvert {
+            operation_id: UUID4::new(),
+            kind: PositionConvertKind::Decrease,
+            quantity: converted_long.quantity,
+            cost: converted_long.cost_open,
+            realized_pnl: 3.into(),
+            ts_event: UnixNanos::from(20),
+            ts_init: UnixNanos::from(20),
+            ..increase
+        };
+        let decreased = converted_long
+            .apply_convert(decrease)
+            .unwrap()
+            .expect("decrease notification");
+
+        let mut entries: Vec<_> = filled_order_events(&flip_fill)
+            .iter()
+            .enumerate()
+            .map(|(index, event)| append_order_event(index as u64 + 1, event))
+            .collect();
+        entries.push(append_position_event(
+            5,
+            &PositionEvent::PositionClosed(closed_event),
+        ));
+        entries.push(append_position_event(
+            6,
+            &PositionEvent::PositionOpened(opened_event),
+        ));
+        entries.push(append_position_event(7, &increased));
+        entries.push(append_position_event(8, &decreased));
+        let reader = reader_with_entries("run-flip-convert-cycle", &entries);
+        let mut cache = Cache::default();
+        cache.add_instrument(instrument).unwrap();
+        cache
+            .add_position_without_order(&seed_short, OmsType::Netting)
+            .unwrap();
+
+        let report = replay_cache_snapshot_tail(&mut cache, &reader).unwrap();
+        let replayed = cache.position_owned(&position_id).unwrap();
+
+        assert_eq!(report.applied_entries, 8);
+        assert_eq!(report.ignored_entries, 0);
+        assert_eq!(replayed.current_cycle_id(), Some(opening_event_id));
+        assert!(replayed.is_closed());
+        assert_eq!(replayed.quantity, Quantity::zero(replayed.size_precision));
+        assert_eq!(
+            replayed.realized_pnl,
+            Some(Money::from_str_exact("3.00 USDC").unwrap())
+        );
+        assert_eq!(replayed.events.len(), 1);
+        assert_eq!(replayed.events[0].event_id, opening_event_id);
+        assert!(replayed.replay_events.iter().any(|event| {
+            matches!(
+                event,
+                PositionReplayEvent::Filled(fill)
+                    if fill.event_id == opening_event_id
+                        && fill.causation_id == Some(flip_fill.event_id)
+            )
+        }));
+        assert!(replayed.replay_events.iter().any(
+            |event| matches!(event, PositionReplayEvent::Converted(change) if *change == increase)
+        ));
+        assert!(replayed.replay_events.iter().any(
+            |event| matches!(event, PositionReplayEvent::Converted(change) if *change == decrease)
+        ));
+        assert!(cache.check_integrity());
+    }
+
+    #[rstest]
     #[case::matching_quantity("2", true, "9.47", "5.53 USD")]
     #[case::changed_quantity("1", false, "12", "3 USD")]
     fn price_restatement_replay_preserves_journal_accounting(
@@ -4756,6 +5259,10 @@ mod tests {
         ]
     }
 
+    fn canonical_position_id(instrument: &InstrumentAny, strategy_id: StrategyId) -> PositionId {
+        PositionId::new(format!("{}-{}", instrument.id(), strategy_id))
+    }
+
     #[rstest]
     fn orderless_netting_reopen_replay_does_not_treat_closed_position_as_flip() {
         let instrument = InstrumentAny::CurrencyPair(audusd_sim());
@@ -4824,7 +5331,7 @@ mod tests {
         assert_eq!(position.side, PositionSide::Short);
         assert_eq!(position.entry, OrderSide::Sell);
         assert_eq!(position.quantity, Quantity::from(1));
-        assert_eq!(position.opening_order_id, client_order_id);
+        assert_eq!(position.opening_order_id, Some(client_order_id));
         assert_eq!(position.closing_order_id, None);
         assert_eq!(position.event_count(), 1);
         assert_eq!(position.trade_ids(), vec![reopening_fill.trade_id]);
@@ -5667,6 +6174,452 @@ mod tests {
             matches!(error, CacheReplayError::Apply { message, .. } if message.contains("accounting differs from journal"))
         );
         assert_eq!(rmp_serde::to_vec_named(&restored).unwrap(), before);
+    }
+
+    #[rstest]
+    fn convert_position_lifecycle_replays_through_typed_cache_state() {
+        let instrument = InstrumentAny::BinaryOption(binary_option());
+        let operation_id = UUID4::new();
+        let strategy_id = StrategyId::from("STRATEGY-001");
+        let opening = PositionConvert {
+            operation_id,
+            trader_id: TraderId::from("TRADER-001"),
+            strategy_id,
+            instrument_id: instrument.id(),
+            position_id: canonical_position_id(&instrument, strategy_id),
+            account_id: AccountId::from("POLYMARKET-001"),
+            cycle_id: operation_id,
+            kind: PositionConvertKind::Open {
+                previous_cycle_id: None,
+            },
+            quantity: Quantity::from("100.00"),
+            cost: 50.into(),
+            realized_pnl: 0.into(),
+            ts_event: UnixNanos::from(1),
+            ts_init: UnixNanos::from(2),
+        };
+        let increase = PositionConvert {
+            operation_id: UUID4::new(),
+            kind: PositionConvertKind::Increase,
+            quantity: Quantity::from("20.00"),
+            cost: 10.into(),
+            ts_event: UnixNanos::from(3),
+            ts_init: UnixNanos::from(4),
+            ..opening
+        };
+        let closing = PositionConvert {
+            operation_id: UUID4::new(),
+            kind: PositionConvertKind::Decrease,
+            quantity: Quantity::from("120.00"),
+            cost: 60.into(),
+            realized_pnl: 5.into(),
+            ts_event: UnixNanos::from(5),
+            ts_init: UnixNanos::from(6),
+            ..increase
+        };
+
+        let mut position = Position::new_from_convert(&instrument, opening).unwrap();
+        let opened = PositionEvent::from_convert(&position, opening);
+        let changed = position.apply_convert(increase).unwrap().unwrap();
+        let closed = position.apply_convert(closing).unwrap().unwrap();
+
+        let mut cache = Cache::default();
+        cache.add_instrument(instrument).unwrap();
+        let entries = [
+            append_position_event(1, &opened),
+            append_position_event(2, &changed),
+            append_position_event(3, &closed),
+        ];
+        let reader = reader_with_entries("run-convert-lifecycle", &entries);
+        let report = replay_cache_snapshot_tail(&mut cache, &reader).unwrap();
+
+        assert_eq!(report.applied_entries, 3);
+        assert_eq!(report.ignored_entries, 0);
+        let replayed = cache.position_owned(&opening.position_id).unwrap();
+        assert_eq!(
+            replayed.realized_pnl,
+            Some(Money::from_str_exact("5.00 USDC").unwrap())
+        );
+        assert!(replayed.events.is_empty());
+        assert!(
+            replayed
+                .replay_events
+                .iter()
+                .all(|event| matches!(event, PositionReplayEvent::Converted(_)))
+        );
+        assert_eq!(replayed.replay_events.len(), 3);
+        assert!(cache.is_position_closed(&opening.position_id));
+    }
+
+    #[rstest]
+    fn convert_lifecycle_replay_rejects_mismatched_envelope_without_mutation() {
+        let instrument = InstrumentAny::BinaryOption(binary_option());
+        let operation_id = UUID4::new();
+        let strategy_id = StrategyId::from("STRATEGY-001");
+        let change = PositionConvert {
+            operation_id,
+            trader_id: TraderId::from("TRADER-001"),
+            strategy_id,
+            instrument_id: instrument.id(),
+            position_id: canonical_position_id(&instrument, strategy_id),
+            account_id: AccountId::from("POLYMARKET-001"),
+            cycle_id: operation_id,
+            kind: PositionConvertKind::Open {
+                previous_cycle_id: None,
+            },
+            quantity: Quantity::from("100.00"),
+            cost: 50.into(),
+            realized_pnl: 0.into(),
+            ts_event: UnixNanos::from(1),
+            ts_init: UnixNanos::from(2),
+        };
+        let position = Position::new_from_convert(&instrument, change).unwrap();
+        let PositionEvent::PositionOpened(mut opened) =
+            PositionEvent::from_convert(&position, change)
+        else {
+            panic!("expected an opening notification");
+        };
+        opened.position_id = PositionId::from("P-OTHER");
+
+        let mut cache = Cache::default();
+        cache.add_instrument(instrument).unwrap();
+        let entry = append_position_event(1, &PositionEvent::PositionOpened(opened)).entry;
+
+        let error = apply_cache_replay_entry(&mut cache, &entry).unwrap_err();
+        assert!(matches!(
+            error,
+            CacheReplayError::Apply { message, .. }
+                if message.contains("envelope does not match")
+        ));
+        assert!(cache.position(&change.position_id).is_none());
+        assert!(cache.position(&PositionId::from("P-OTHER")).is_none());
+    }
+
+    #[rstest]
+    fn convert_lifecycle_replay_rejects_mismatched_projection_without_mutation() {
+        let instrument = InstrumentAny::BinaryOption(binary_option());
+        let operation_id = UUID4::new();
+        let strategy_id = StrategyId::from("STRATEGY-001");
+        let change = PositionConvert {
+            operation_id,
+            trader_id: TraderId::from("TRADER-001"),
+            strategy_id,
+            instrument_id: instrument.id(),
+            position_id: canonical_position_id(&instrument, strategy_id),
+            account_id: AccountId::from("POLYMARKET-001"),
+            cycle_id: operation_id,
+            kind: PositionConvertKind::Open {
+                previous_cycle_id: None,
+            },
+            quantity: Quantity::from("100.00"),
+            cost: 50.into(),
+            realized_pnl: 0.into(),
+            ts_event: UnixNanos::from(1),
+            ts_init: UnixNanos::from(2),
+        };
+        let position = Position::new_from_convert(&instrument, change).unwrap();
+        let PositionEvent::PositionOpened(mut opened) =
+            PositionEvent::from_convert(&position, change)
+        else {
+            panic!("expected an opening notification");
+        };
+        opened.quantity = Quantity::from("99.00");
+
+        let mut cache = Cache::default();
+        cache.add_instrument(instrument).unwrap();
+        let entry = append_position_event(1, &PositionEvent::PositionOpened(opened)).entry;
+
+        let error = apply_cache_replay_entry(&mut cache, &entry).unwrap_err();
+        assert!(matches!(
+            error,
+            CacheReplayError::Apply { message, .. }
+                if message.contains("does not match the lifecycle notification")
+        ));
+        assert!(cache.position(&change.position_id).is_none());
+    }
+
+    #[rstest]
+    fn convert_close_then_real_fill_reopen_archives_closed_cycle() {
+        let instrument = InstrumentAny::BinaryOption(binary_option());
+        let strategy_id = StrategyId::from("S-CONVERT-REOPEN");
+        let account_id = AccountId::from("POLYMARKET-001");
+        let position_id = canonical_position_id(&instrument, strategy_id);
+        let operation_id = UUID4::new();
+        let opening = PositionConvert {
+            operation_id,
+            trader_id: TraderId::from("TRADER-001"),
+            strategy_id,
+            instrument_id: instrument.id(),
+            position_id,
+            account_id,
+            cycle_id: operation_id,
+            kind: PositionConvertKind::Open {
+                previous_cycle_id: None,
+            },
+            quantity: Quantity::from("100.00"),
+            cost: 50.into(),
+            realized_pnl: 0.into(),
+            ts_event: UnixNanos::from(1),
+            ts_init: UnixNanos::from(1),
+        };
+        let mut live = Position::new_from_convert(&instrument, opening).unwrap();
+        let opened = PositionEvent::from_convert(&live, opening);
+        let closing = PositionConvert {
+            operation_id: UUID4::new(),
+            kind: PositionConvertKind::Decrease,
+            quantity: Quantity::from("100.00"),
+            cost: 50.into(),
+            realized_pnl: 10.into(),
+            ts_event: UnixNanos::from(2),
+            ts_init: UnixNanos::from(2),
+            ..opening
+        };
+        let closed = live.apply_convert(closing).unwrap().unwrap();
+
+        let reopening_fill = OrderFilledSpec::builder()
+            .strategy_id(strategy_id)
+            .instrument_id(instrument.id())
+            .account_id(account_id)
+            .client_order_id(ClientOrderId::from("O-CONVERT-REOPEN"))
+            .venue_order_id(VenueOrderId::from("V-CONVERT-REOPEN"))
+            .trade_id(TradeId::from("T-CONVERT-REOPEN"))
+            .order_side(OrderSide::Buy)
+            .last_qty(Quantity::from("5.00"))
+            .last_px(Price::from("0.60000"))
+            .currency(instrument.quote_currency())
+            .position_id(position_id)
+            .build();
+        let order_entries = filled_order_events(&reopening_fill)
+            .iter()
+            .enumerate()
+            .map(|(index, event)| append_order_event(index as u64 + 3, event))
+            .collect::<Vec<_>>();
+        let entries = [
+            append_position_event(1, &opened),
+            append_position_event(2, &closed),
+            order_entries[0].clone(),
+            order_entries[1].clone(),
+            order_entries[2].clone(),
+            order_entries[3].clone(),
+        ];
+        let reader = reader_with_entries("run-convert-real-reopen", &entries);
+        let mut cache = Cache::default();
+        cache.add_instrument(instrument.clone()).unwrap();
+
+        let report = replay_cache_snapshot_tail(&mut cache, &reader).unwrap();
+        let replayed = cache.position_owned(&position_id).unwrap();
+        let snapshots = cache.position_snapshots(Some(&position_id), None);
+
+        assert_eq!(report.applied_entries, 6);
+        assert_eq!(report.ignored_entries, 0);
+        assert!(replayed.is_open());
+        assert_eq!(
+            replayed.realized_pnl,
+            Some(Money::zero(instrument.quote_currency()))
+        );
+        assert_eq!(replayed.current_cycle_id(), Some(reopening_fill.event_id));
+        assert_eq!(replayed.quantity, Quantity::from("5.00"));
+        assert_eq!(
+            replayed.opening_order_id,
+            Some(reopening_fill.client_order_id)
+        );
+        assert_eq!(
+            cache.position_id(&reopening_fill.client_order_id),
+            Some(&position_id),
+        );
+        assert_eq!(replayed.opening_operation_id, None);
+        assert_eq!(snapshots.len(), 1);
+        assert!(snapshots[0].is_closed());
+        assert_eq!(snapshots[0].current_cycle_id(), Some(operation_id));
+        assert_eq!(
+            snapshots[0].realized_pnl,
+            Some(Money::from_str_exact("10.00 USDC").unwrap())
+        );
+
+        let before = cache.position_snapshots(Some(&position_id), None).len();
+        let entry = order_entries[3].entry.clone();
+        assert!(apply_fill_to_position(&mut cache, &entry, &reopening_fill, false).unwrap());
+        assert_eq!(
+            cache.position_snapshots(Some(&position_id), None).len(),
+            before
+        );
+    }
+
+    #[rstest]
+    fn convert_close_real_reopen_reuses_existing_archive() {
+        let instrument = InstrumentAny::BinaryOption(binary_option());
+        let strategy_id = StrategyId::from("S-CONVERT-ARCHIVED");
+        let account_id = AccountId::from("POLYMARKET-001");
+        let position_id = canonical_position_id(&instrument, strategy_id);
+        let operation_id = UUID4::new();
+        let opening = PositionConvert {
+            operation_id,
+            trader_id: TraderId::from("TRADER-001"),
+            strategy_id,
+            instrument_id: instrument.id(),
+            position_id,
+            account_id,
+            cycle_id: operation_id,
+            kind: PositionConvertKind::Open {
+                previous_cycle_id: None,
+            },
+            quantity: Quantity::from("100.00"),
+            cost: 50.into(),
+            realized_pnl: 0.into(),
+            ts_event: UnixNanos::from(1),
+            ts_init: UnixNanos::from(1),
+        };
+        let mut closed = Position::new_from_convert(&instrument, opening).unwrap();
+        let closing = PositionConvert {
+            operation_id: UUID4::new(),
+            kind: PositionConvertKind::Decrease,
+            realized_pnl: 10.into(),
+            ts_event: UnixNanos::from(2),
+            ts_init: UnixNanos::from(2),
+            ..opening
+        };
+        closed.apply_convert(closing).unwrap();
+
+        let reopening_fill = OrderFilledSpec::builder()
+            .strategy_id(strategy_id)
+            .instrument_id(instrument.id())
+            .account_id(account_id)
+            .client_order_id(ClientOrderId::from("O-CONVERT-ARCHIVED-REOPEN"))
+            .venue_order_id(VenueOrderId::from("V-CONVERT-ARCHIVED-REOPEN"))
+            .trade_id(TradeId::from("T-CONVERT-ARCHIVED-REOPEN"))
+            .order_side(OrderSide::Buy)
+            .last_qty(Quantity::from("5.00"))
+            .last_px(Price::from("0.60000"))
+            .currency(instrument.quote_currency())
+            .position_id(position_id)
+            .build();
+        let entry = append_order_event(1, &OrderEventAny::Filled(reopening_fill.clone())).entry;
+
+        let mut cache = Cache::default();
+        cache.add_instrument(instrument).unwrap();
+        cache
+            .add_position_without_order(&closed, OmsType::Netting)
+            .unwrap();
+        cache.snapshot_position(&closed).unwrap();
+
+        assert!(apply_fill_to_position(&mut cache, &entry, &reopening_fill, false).unwrap());
+        let replayed = cache.position_owned(&position_id).unwrap();
+        assert_eq!(replayed.current_cycle_id(), Some(reopening_fill.event_id));
+        assert_eq!(replayed.quantity, Quantity::from("5.00"));
+        assert_eq!(
+            cache.position_id(&reopening_fill.client_order_id),
+            Some(&position_id),
+        );
+        assert_eq!(cache.position_snapshots(Some(&position_id), None).len(), 1);
+    }
+
+    #[rstest]
+    fn convert_replay_voids_archived_sale_before_settlement() {
+        let instrument = InstrumentAny::BinaryOption(binary_option());
+        let strategy_id = StrategyId::from("S-CONVERT-VOID");
+        let position_id = canonical_position_id(&instrument, strategy_id);
+        let sale = OrderFilledSpec::builder()
+            .strategy_id(strategy_id)
+            .instrument_id(instrument.id())
+            .account_id(AccountId::from("POLYMARKET-001"))
+            .client_order_id(ClientOrderId::from("O-CONVERT-VOID-SELL"))
+            .venue_order_id(VenueOrderId::from("V-CONVERT-VOID-SELL"))
+            .trade_id(TradeId::from("T-CONVERT-VOID-SELL"))
+            .position_id(position_id)
+            .order_side(OrderSide::Sell)
+            .last_qty(Quantity::from("100.00"))
+            .last_px(Price::from("0.700"))
+            .currency(instrument.quote_currency())
+            .ts_event(UnixNanos::from(2))
+            .build();
+        let reopening = OrderFilled {
+            client_order_id: ClientOrderId::from("O-CONVERT-VOID-BUY"),
+            venue_order_id: VenueOrderId::from("V-CONVERT-VOID-BUY"),
+            trade_id: TradeId::from("T-CONVERT-VOID-BUY"),
+            order_side: OrderSide::Buy,
+            last_qty: Quantity::from("5.00"),
+            last_px: Price::from("0.600"),
+            event_id: UUID4::new(),
+            ts_event: UnixNanos::from(3),
+            ..sale.clone()
+        };
+        let operation_id = UUID4::new();
+        let opening = PositionConvert {
+            operation_id,
+            trader_id: sale.trader_id,
+            strategy_id,
+            instrument_id: instrument.id(),
+            account_id: sale.account_id,
+            position_id,
+            cycle_id: operation_id,
+            kind: PositionConvertKind::Open {
+                previous_cycle_id: None,
+            },
+            quantity: sale.last_qty,
+            cost: 50.into(),
+            realized_pnl: 0.into(),
+            ts_event: UnixNanos::from(1),
+            ts_init: UnixNanos::from(1),
+        };
+        let opened = Position::new_from_convert(&instrument, opening).unwrap();
+        let mut entries = vec![append_position_event(
+            1,
+            &PositionEvent::from_convert(&opened, opening),
+        )];
+
+        for fill in [&sale, &reopening] {
+            for event in filled_order_events(fill) {
+                entries.push(append_order_event(entries.len() as u64 + 1, &event));
+            }
+        }
+        let void = OrderFillVoidedSpec::builder()
+            .trader_id(sale.trader_id)
+            .strategy_id(strategy_id)
+            .instrument_id(instrument.id())
+            .client_order_id(sale.client_order_id)
+            .venue_order_id(sale.venue_order_id)
+            .account_id(sale.account_id)
+            .trade_id(sale.trade_id)
+            .position_id(position_id)
+            .voided_qty(Quantity::from("10.00"))
+            .order_side(sale.order_side)
+            .order_type(sale.order_type)
+            .last_px(sale.last_px)
+            .currency(sale.currency)
+            .liquidity_side(sale.liquidity_side)
+            .is_reopened(true)
+            .ts_event(UnixNanos::from(4))
+            .build();
+        entries.push(append_order_event(10, &OrderEventAny::FillVoided(void)));
+        let close = InstrumentClose::new(
+            instrument.id(),
+            Price::from("1.000"),
+            InstrumentCloseType::ContractExpired,
+            UnixNanos::from(5),
+            UnixNanos::from(5),
+        );
+        entries.push(append_payload(
+            11,
+            PAYLOAD_TYPE_INSTRUMENT_CLOSE,
+            encode_instrument_close(&close).unwrap().payload,
+        ));
+
+        let reader = reader_with_entries("run-convert-archived-void", &entries);
+        let mut cache = Cache::default();
+        cache.add_instrument(instrument).unwrap();
+
+        let report = replay_cache_snapshot_tail(&mut cache, &reader).unwrap();
+        let position = cache.position_owned(&position_id).unwrap();
+
+        assert_eq!(report.applied_entries, entries.len());
+        assert!(position.is_settled());
+        assert_eq!(position.current_cycle_id(), Some(operation_id));
+        assert_eq!(position.realized_pnl, Some(Money::from("25.00 USDC")));
+        assert!(
+            cache
+                .position_snapshots(Some(&position_id), None)
+                .is_empty()
+        );
     }
 
     #[rstest]

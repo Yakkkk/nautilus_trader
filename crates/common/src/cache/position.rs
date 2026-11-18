@@ -32,7 +32,7 @@ use bytes::Bytes;
 use nautilus_core::{UUID4, UnixNanos};
 use nautilus_model::{
     identifiers::{AccountId, InstrumentId, PositionId},
-    position::Position,
+    position::{Position, PositionConvertKind, PositionReplayEvent},
     types::Money,
 };
 
@@ -208,11 +208,9 @@ impl Cache {
     /// in `position.replay_events`.
     ///
     /// Requires `closed_cycles_pnl` to account for every frame held, since this removes all of
-    /// them. The position's replay log must therefore span every archived cycle for the ID. Any
-    /// future retention cap on the log has to preserve that at trim time, either by folding the
-    /// trimmed cycles' realized PnL into a baseline the rebuild adds to its banked total, or by
-    /// purging the frames those cycles produced in the same operation. Settling cannot detect the
-    /// shortfall, because frames carry no cycle identity to match against the retained log.
+    /// them for fill-only positions. Convert positions retain replay from their first Convert
+    /// onward and may have earlier archives that the rebuild does not cover. Those frames are
+    /// kept separately from the rebuilt total.
     ///
     /// Known limitation, shared with [`Self::purge_position`]: frame indices restart from zero,
     /// so a later cycle can overwrite bytes an event store anchor already recorded, failing its
@@ -223,13 +221,50 @@ impl Cache {
         position: &Position,
         closed_cycles_pnl: Option<Money>,
     ) {
-        self.position_snapshots.remove(&position.id);
+        if position
+            .replay_events
+            .iter()
+            .any(|event| matches!(event, PositionReplayEvent::Converted(_)))
+        {
+            let replayed_ids: AHashSet<_> = position
+                .replay_events
+                .iter()
+                .filter_map(|event| match event {
+                    PositionReplayEvent::Filled(fill) => Some(fill.event_id),
+                    PositionReplayEvent::Converted(change)
+                        if matches!(change.kind, PositionConvertKind::Open { .. }) =>
+                    {
+                        Some(change.cycle_id)
+                    }
+                    _ => None,
+                })
+                .collect();
+
+            if let Some(frames) = self.position_snapshots.get_mut(&position.id) {
+                frames.retain(|frame| {
+                    let position = &frame.position;
+                    let is_settled_aggregate = position.cycle_id.is_none()
+                        && position.opening_operation_id.is_none()
+                        && position.events.is_empty();
+                    !is_settled_aggregate
+                        && position
+                            .current_cycle_id()
+                            .is_none_or(|cycle_id| !replayed_ids.contains(&cycle_id))
+                });
+            }
+        } else {
+            self.position_snapshots.remove(&position.id);
+        }
         self.bump_position_snapshot_revision(position.id);
 
         if let Some(closed_cycles_pnl) = closed_cycles_pnl {
             let (_, mut settled) = self.build_position_snapshot(position);
             settled.realized_pnl = Some(closed_cycles_pnl);
             settled.events.clear();
+            // The settled frame aggregates earlier cycles, using the current state only as a
+            // template. Clear cycle identity so consumers do not mistake it for the current cycle.
+            settled.cycle_id = None;
+            settled.opening_operation_id = None;
             self.store_position_snapshot(position.id, settled, None);
         }
     }

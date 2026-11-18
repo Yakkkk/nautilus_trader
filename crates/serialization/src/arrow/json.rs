@@ -53,6 +53,11 @@ pub struct JsonFieldSpec {
     pub name: &'static str,
     pub encoding: JsonFieldEncoding,
     pub nullable: bool,
+    /// Allows decoding batches written before this optional column existed.
+    ///
+    /// Only applies to nullable fields whose target type treats a missing value as `None`.
+    /// Pre-existing required columns must not use this.
+    pub legacy_optional: bool,
 }
 
 impl JsonFieldSpec {
@@ -62,6 +67,7 @@ impl JsonFieldSpec {
             name,
             encoding: JsonFieldEncoding::Utf8,
             nullable,
+            legacy_optional: false,
         }
     }
 
@@ -71,6 +77,7 @@ impl JsonFieldSpec {
             name,
             encoding: JsonFieldEncoding::Utf8Json,
             nullable,
+            legacy_optional: false,
         }
     }
 
@@ -80,6 +87,7 @@ impl JsonFieldSpec {
             name,
             encoding: JsonFieldEncoding::EnumDictionary,
             nullable,
+            legacy_optional: false,
         }
     }
 
@@ -89,6 +97,7 @@ impl JsonFieldSpec {
             name,
             encoding: JsonFieldEncoding::UInt64,
             nullable,
+            legacy_optional: false,
         }
     }
 
@@ -98,6 +107,7 @@ impl JsonFieldSpec {
             name,
             encoding: JsonFieldEncoding::Timestamp,
             nullable,
+            legacy_optional: false,
         }
     }
 
@@ -107,6 +117,7 @@ impl JsonFieldSpec {
             name,
             encoding: JsonFieldEncoding::Float64,
             nullable,
+            legacy_optional: false,
         }
     }
 
@@ -116,7 +127,15 @@ impl JsonFieldSpec {
             name,
             encoding: JsonFieldEncoding::Boolean,
             nullable,
+            legacy_optional: false,
         }
+    }
+
+    /// Marks this nullable column as absent from batches written before it was introduced.
+    #[must_use]
+    pub const fn legacy_optional(mut self) -> Self {
+        self.legacy_optional = true;
+        self
     }
 
     fn field(self) -> Field {
@@ -290,15 +309,17 @@ pub fn decode_batch_with_metadata_fields<T: DeserializeOwned>(
     }
 
     let schema = record_batch.schema();
-    let columns: Result<Vec<_>, EncodingError> = fields
-        .iter()
-        .enumerate()
-        .map(|(expected_index, field)| {
-            let index = column_index(&schema, field.name, expected_index)?;
-            decode_column_ref(record_batch.columns(), *field, index)
-        })
-        .collect();
-    let columns = columns?;
+    let mut columns = Vec::with_capacity(fields.len());
+
+    for (expected_index, field) in fields.iter().enumerate() {
+        match column_index(&schema, field.name, expected_index) {
+            Ok(index) => {
+                columns.push(decode_column_ref(record_batch.columns(), *field, index)?);
+            }
+            Err(EncodingError::MissingColumn(..)) if field.legacy_optional => {}
+            Err(e) => return Err(e),
+        }
+    }
 
     let metadata_values = metadata_fields
         .iter()
@@ -828,6 +849,41 @@ mod tests {
 
         assert!(matches!(error, EncodingError::ParseError("left", message)
             if message == "duplicate column name"));
+    }
+
+    #[derive(Debug, PartialEq, Serialize, Deserialize)]
+    struct OptionalRecord {
+        left: u64,
+        legacy: Option<u64>,
+    }
+
+    #[rstest]
+    fn decode_batch_allows_only_marked_legacy_optional_columns() {
+        let fields = [
+            JsonFieldSpec::u64("left", false),
+            JsonFieldSpec::u64("legacy", true).legacy_optional(),
+        ];
+        let rows = [OptionalRecord {
+            left: 11,
+            legacy: Some(29),
+        }];
+        let metadata = HashMap::new();
+        let batch = encode_batch("OptionalRecord", &metadata, &rows, &fields).unwrap();
+        let without_legacy = batch.project(&[0]).unwrap();
+        let decoded =
+            decode_batch::<OptionalRecord>(&metadata, &without_legacy, &fields, None).unwrap();
+        assert_eq!(
+            decoded,
+            vec![OptionalRecord {
+                left: 11,
+                legacy: None,
+            }]
+        );
+
+        let without_required = batch.project(&[1]).unwrap();
+        let error = decode_batch::<OptionalRecord>(&metadata, &without_required, &fields, None)
+            .unwrap_err();
+        assert!(matches!(error, EncodingError::MissingColumn("left", 0)));
     }
 
     #[rstest]
