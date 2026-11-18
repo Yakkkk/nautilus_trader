@@ -134,6 +134,7 @@ pub mod instruments;
 pub mod macros;
 pub mod orderbook;
 pub mod orders;
+pub mod polymarket_convert;
 pub mod position;
 pub mod reports;
 pub mod types;
