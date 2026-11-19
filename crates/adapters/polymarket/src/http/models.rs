@@ -518,6 +518,9 @@ pub struct GammaEvent {
     pub tags: Option<Vec<GammaTag>>,
     /// Whether event uses neg-risk.
     pub neg_risk: Option<bool>,
+    /// Whether event uses augmented neg-risk.
+    #[serde(default)]
+    pub neg_risk_augmented: Option<bool>,
     /// Neg-risk market ID.
     #[serde(rename = "negRiskMarketID")]
     pub neg_risk_market_id: Option<String>,

@@ -1,0 +1,82 @@
+{
+  "id": "1380662",
+  "slug": "bitcoin-dominance-on-november-20-2026",
+  "negRisk": true,
+  "negRiskAugmented": false,
+  "enableNegRisk": true,
+  "negRiskMarketID": "0x8edfc143edd965db22917d4bda4d2a59a45f738d6908f2e28aa13f88e7b7d000",
+  "markets": [
+    {
+      "id": "7018410",
+      "conditionId": "0xf7657f5be69466b1b2f2b259a4b0d76449b5c907a4115cef6789242e5080c307",
+      "questionID": "0x8edfc143edd965db22917d4bda4d2a59a45f738d6908f2e28aa13f88e7b7d000",
+      "negRiskMarketID": "0x8edfc143edd965db22917d4bda4d2a59a45f738d6908f2e28aa13f88e7b7d000",
+      "negRisk": true,
+      "groupItemThreshold": "0",
+      "clobTokenIds": "[\"63426522789581859596415111082762646577033541410034925963131950240209613593753\", \"72225031139955881851677301228075306964851013474382879053808728270922904642800\"]",
+      "outcomes": "[\"Yes\", \"No\"]",
+      "question": "Will Bitcoin dominance be less than 58.00% on November 20?",
+      "version": "v1"
+    },
+    {
+      "id": "7018416",
+      "conditionId": "0x92a7080ff0725f754ebd8914cec4efa9ef25043782655d58cb8682e3a9fd95f2",
+      "questionID": "0x8edfc143edd965db22917d4bda4d2a59a45f738d6908f2e28aa13f88e7b7d001",
+      "negRiskMarketID": "0x8edfc143edd965db22917d4bda4d2a59a45f738d6908f2e28aa13f88e7b7d000",
+      "negRisk": true,
+      "groupItemThreshold": "1",
+      "clobTokenIds": "[\"97860778315546735131857631301071320214042651761317611651104485570020276636379\", \"32511994694000320259147907437041982451551286813073028835672942257629812676680\"]",
+      "outcomes": "[\"Yes\", \"No\"]",
+      "question": "Will Bitcoin dominance be between 58.00% and 59.00% on November 20?",
+      "version": "v1"
+    },
+    {
+      "id": "7018423",
+      "conditionId": "0xb46bd9729dd571dfd9d7c15dc81be9327713659e1f19d8f05a51174b8ae17efb",
+      "questionID": "0x8edfc143edd965db22917d4bda4d2a59a45f738d6908f2e28aa13f88e7b7d002",
+      "negRiskMarketID": "0x8edfc143edd965db22917d4bda4d2a59a45f738d6908f2e28aa13f88e7b7d000",
+      "negRisk": true,
+      "groupItemThreshold": "2",
+      "clobTokenIds": "[\"109239558728873005848908316997426497902223207957179174714427776974806862652383\", \"14297222924838724269911901408770871050856024372514089087388301455538357996836\"]",
+      "outcomes": "[\"Yes\", \"No\"]",
+      "question": "Will Bitcoin dominance be between 59.00% and 60.00% on November 20?",
+      "version": "v1"
+    },
+    {
+      "id": "7018430",
+      "conditionId": "0x156951d081572ad1d715037430a06ae8cf9b5a0a4f7318065b23e5a901545537",
+      "questionID": "0x8edfc143edd965db22917d4bda4d2a59a45f738d6908f2e28aa13f88e7b7d003",
+      "negRiskMarketID": "0x8edfc143edd965db22917d4bda4d2a59a45f738d6908f2e28aa13f88e7b7d000",
+      "negRisk": true,
+      "groupItemThreshold": "3",
+      "clobTokenIds": "[\"16439100934468439967686205816035382100456312496821710421526080987190610078859\", \"92869655448035058796618945517446135555932817419742309078771415528020363758458\"]",
+      "outcomes": "[\"Yes\", \"No\"]",
+      "question": "Will Bitcoin dominance be between 60.00% and 61.00% on November 20?",
+      "version": "v1"
+    },
+    {
+      "id": "7018437",
+      "conditionId": "0x58221febe16d2e83061b37aafd836cb50165c5aaf1c9558cef7bdc0023801e49",
+      "questionID": "0x8edfc143edd965db22917d4bda4d2a59a45f738d6908f2e28aa13f88e7b7d004",
+      "negRiskMarketID": "0x8edfc143edd965db22917d4bda4d2a59a45f738d6908f2e28aa13f88e7b7d000",
+      "negRisk": true,
+      "groupItemThreshold": "4",
+      "clobTokenIds": "[\"22120591574991875835097042688203861853341674949269406336860525328931968523398\", \"1424478502663682004050162939411163915018447700028485457713324686568292989699\"]",
+      "outcomes": "[\"Yes\", \"No\"]",
+      "question": "Will Bitcoin dominance be between 61.00% and 62.00% on November 20?",
+      "version": "v1"
+    },
+    {
+      "id": "7018443",
+      "conditionId": "0xf84f7dcbf45858ad90be3de68c75eabfeebae70e75deb37097c9b0911547de41",
+      "questionID": "0x8edfc143edd965db22917d4bda4d2a59a45f738d6908f2e28aa13f88e7b7d005",
+      "negRiskMarketID": "0x8edfc143edd965db22917d4bda4d2a59a45f738d6908f2e28aa13f88e7b7d000",
+      "negRisk": true,
+      "groupItemThreshold": "5",
+      "clobTokenIds": "[\"95664265784058171340185311117841211140832366716223808808903514571848066643532\", \"89454030952646159298241048735547392789104725020253157481931417902343507514565\"]",
+      "outcomes": "[\"Yes\", \"No\"]",
+      "question": "Will Bitcoin dominance be greater than 62.00% on November 20?",
+      "version": "v1"
+    }
+  ]
+}

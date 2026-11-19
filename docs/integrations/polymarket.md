@@ -1679,6 +1679,18 @@ responses can contain terminal outcomes unknown during the historical period, so
 resolution metadata. Decode these strings with `json.loads` as above. The instrument uses the selected
 Gamma outcome ID and label; CLOB metadata must match that pair.
 
+### Negative-risk conversion mapping
+
+Rust callers can use `nautilus_polymarket::convert::build_neg_risk_event` to validate a non-augmented
+CTF negative-risk event. Supply an instrument loaded through event discovery, all of the event's loaded
+YES and NO definitions, and the question count, fee, and outcome token IDs read from the Polygon
+Neg Risk Adapter at the same block. The Gamma parent identifies the event but cannot prove the complete
+chain condition count. The builder rejects missing or conflicting data without fetching additional markets.
+
+`CtfNegRiskEvent::convert_scope` returns the selected NO instruments and the complementary YES instruments
+in chain index order, including instruments without positions. The mapping does not submit a conversion or
+change positions or cash balances.
+
 ## Numeric precision
 
 Financial wire values are decoded directly as decimals. Values outside the supported decimal or

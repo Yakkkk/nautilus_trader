@@ -16,7 +16,7 @@
 //! Integration tests for the Polymarket HTTP client using a mock server.
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     net::SocketAddr,
     path::PathBuf,
     sync::{
@@ -27,6 +27,7 @@ use std::{
 };
 
 use ahash::AHashMap;
+use alloy_primitives::{B256, U256};
 use axum::{
     Router,
     body::Bytes,
@@ -38,9 +39,10 @@ use axum::{
 use nautilus_common::{
     config::ConfigError, providers::InstrumentProvider, testing::wait_until_async,
 };
+use nautilus_core::Params;
 use nautilus_model::{
-    identifiers::InstrumentId,
-    instruments::{Instrument, InstrumentAny},
+    identifiers::{InstrumentId, Symbol},
+    instruments::{Instrument, InstrumentAny, equity::Equity},
 };
 use nautilus_network::{http::HttpClient, retry::RetryConfig};
 use nautilus_polymarket::{
@@ -49,6 +51,7 @@ use nautilus_polymarket::{
         enums::{PolymarketOrderType, PolymarketSignatureType, PolymarketTradeStatus},
     },
     config::{PolymarketInstrumentProviderConfig, PolymarketUpDownEventSlugConfig},
+    convert::{CtfNegRiskMarketMetadata, build_neg_risk_event},
     filters::{
         EventParamsFilter, EventSlugFilter, GammaQueryFilter, InstrumentFilter, MarketSlugFilter,
         PredicateFilter, SearchFilter, TagFilter,
@@ -80,6 +83,9 @@ use ustr::Ustr;
 // base64url of b"test_secret_key_32bytes_pad12345"
 const TEST_API_SECRET_B64: &str = "dGVzdF9zZWNyZXRfa2V5XzMyYnl0ZXNfcGFkMTIzNDU=";
 const TEST_ADDRESS: &str = "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266";
+const CONVERT_EVENT_SLUG: &str = "bitcoin-dominance-on-november-20-2026";
+const CONVERT_MARKET_ID: &str =
+    "0x8edfc143edd965db22917d4bda4d2a59a45f738d6908f2e28aa13f88e7b7d000";
 
 type QueryPairs = Vec<(String, String)>;
 type QueryPairLog = Arc<tokio::sync::Mutex<Vec<QueryPairs>>>;
@@ -2395,6 +2401,407 @@ async fn test_load_all_with_event_slug_filter() {
     // 2 markets × 2 outcomes = 4 instruments
     assert_eq!(provider.store().count(), 4);
     assert!(provider.store().is_initialized());
+}
+
+fn convert_event_fixture() -> Value {
+    from_str(include_str!(
+        "../../test_data/gamma_event_ctf_neg_risk.json"
+    ))
+    .unwrap()
+}
+
+fn convert_token_ids(market: &Value) -> [String; 2] {
+    from_str(market["clobTokenIds"].as_str().unwrap()).unwrap()
+}
+
+fn convert_instrument_id(market: &Value, token_index: usize) -> InstrumentId {
+    let condition_id = market["conditionId"].as_str().unwrap();
+    let token_id = &convert_token_ids(market)[token_index];
+    InstrumentId::from(format!("{condition_id}-{token_id}.POLYMARKET"))
+}
+
+fn convert_chain_tokens() -> Vec<[U256; 2]> {
+    convert_event_fixture()["markets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|market| convert_token_ids(market).map(|id| U256::from_str_radix(&id, 10).unwrap()))
+        .collect()
+}
+
+fn convert_chain_metadata(token_ids: &[[U256; 2]]) -> CtfNegRiskMarketMetadata<'_> {
+    CtfNegRiskMarketMetadata {
+        market_id: CONVERT_MARKET_ID.parse().unwrap(),
+        question_count: 6,
+        fee_bps: 0,
+        token_ids,
+    }
+}
+
+fn convert_foreign_question_pair() -> (String, String) {
+    let events: Value = from_str(include_str!("../../test_data/gamma_event.json")).unwrap();
+    let market = &events[0]["markets"][0];
+    (
+        market["questionID"].as_str().unwrap().to_string(),
+        market["conditionId"].as_str().unwrap().to_string(),
+    )
+}
+
+fn dedup_instruments_by_id(instruments: Vec<InstrumentAny>) -> Vec<InstrumentAny> {
+    let mut seen = HashSet::with_capacity(instruments.len());
+    instruments
+        .into_iter()
+        .filter(|instrument| seen.insert(instrument.id()))
+        .collect()
+}
+
+async fn convert_event_client(event: Value) -> PolymarketGammaHttpClient {
+    let state = TestServerState::default();
+    state
+        .gamma_event_slug_responses
+        .lock()
+        .await
+        .insert(CONVERT_EVENT_SLUG.to_string(), json!([event]));
+    create_gamma_domain_client(&start_mock_server(state).await)
+}
+
+#[rstest]
+#[case::gamma_order(false, false)]
+#[case::reversed_display_order(true, false)]
+#[case::reordered_outcomes(false, true)]
+#[tokio::test]
+async fn test_convert_event_matches_polygon_ctf_sample(
+    #[case] reverse_display_order: bool,
+    #[case] reverse_outcome_order: bool,
+) {
+    let mut event = convert_event_fixture();
+    let expected_markets = event["markets"].as_array().unwrap().clone();
+    if reverse_display_order {
+        let markets = event["markets"].as_array_mut().unwrap();
+        markets.reverse();
+        for market in markets {
+            market["groupItemThreshold"] = json!("0");
+        }
+    }
+
+    if reverse_outcome_order {
+        for market in event["markets"].as_array_mut().unwrap() {
+            let [yes, no] = convert_token_ids(market);
+            market["clobTokenIds"] = json!(json!([no, yes]).to_string());
+            market["outcomes"] = json!(r#"["No", "Yes"]"#);
+        }
+    }
+
+    let client = convert_event_client(event).await;
+    let instruments = client
+        .request_instruments_by_event_slugs(vec![CONVERT_EVENT_SLUG.to_string()])
+        .await
+        .unwrap();
+    let chain_tokens = convert_chain_tokens();
+    let metadata = convert_chain_metadata(&chain_tokens);
+    let yes = expected_markets
+        .iter()
+        .map(|market| convert_instrument_id(market, 0))
+        .collect::<Vec<_>>();
+    let no = expected_markets
+        .iter()
+        .map(|market| convert_instrument_id(market, 1))
+        .collect::<Vec<_>>();
+
+    let mapping = build_neg_risk_event(no[1], &instruments, &metadata).unwrap();
+
+    assert_eq!(mapping.market_id(), *metadata.market_id);
+    assert_eq!(mapping.fee_bps(), 0);
+    assert_eq!(mapping.conditions().len(), 6);
+    for (index, condition) in mapping.conditions().iter().enumerate() {
+        let condition_id: B256 = expected_markets[index]["conditionId"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(usize::from(condition.index), index);
+        assert_eq!(condition.condition_id, *condition_id);
+        assert_eq!(condition.yes.token_id, chain_tokens[index][0].to_be_bytes());
+        assert_eq!(condition.no.token_id, chain_tokens[index][1].to_be_bytes());
+        assert_eq!(condition.yes.instrument_id, yes[index]);
+        assert_eq!(condition.no.instrument_id, no[index]);
+    }
+
+    let single = mapping.convert_scope(&[no[2]]).unwrap();
+    assert_eq!(single.inputs, [no[2]]);
+    assert_eq!(single.outputs, [yes[0], yes[1], yes[3], yes[4], yes[5]]);
+
+    let pair = mapping.convert_scope(&[no[4], no[1]]).unwrap();
+    assert_eq!(pair.inputs, [no[1], no[4]]);
+    assert_eq!(pair.outputs, [yes[0], yes[2], yes[3], yes[5]]);
+
+    let all = mapping.convert_scope(&no).unwrap();
+    assert_eq!(all.inputs, no);
+    assert!(all.outputs.is_empty());
+
+    let foreign = InstrumentId::from("other-event-no.POLYMARKET");
+    for input in [vec![no[1], no[1]], vec![yes[0]], vec![no[1], foreign]] {
+        let message = mapping.convert_scope(&input).unwrap_err().to_string();
+        let input_id = input.last().unwrap().to_string();
+        assert!(message.contains(&input_id), "{message}");
+    }
+    assert!(mapping.convert_scope(&[]).is_err());
+}
+
+#[rstest]
+#[case::filtered("filter")]
+#[case::market_cap("cap")]
+#[case::market_metadata_only("load_ids")]
+#[case::truncated_parent("parent")]
+#[tokio::test]
+async fn test_convert_event_rejects_partial_discovery(#[case] mode: &str) {
+    let mut event = convert_event_fixture();
+    let markets = event["markets"].as_array().unwrap();
+    let market = markets[0].clone();
+    let anchor = convert_instrument_id(&market, 1);
+    let missing_yes = convert_instrument_id(&markets[5], 0);
+
+    let instruments = match mode {
+        "filter" => {
+            let client = convert_event_client(event).await;
+            let filter = EventSlugFilter::from_slugs(vec![CONVERT_EVENT_SLUG.to_string()]);
+            let predicate = PredicateFilter::new("exclude one YES", move |instrument| {
+                instrument.id() != missing_yes
+            });
+            let mut provider = PolymarketInstrumentProvider::with_filters(
+                client,
+                None,
+                vec![Arc::new(filter), Arc::new(predicate)],
+            )
+            .unwrap();
+            provider.load_all(None).await.unwrap();
+            provider.store().list_all().into_iter().cloned().collect()
+        }
+        "cap" => {
+            let client = convert_event_client(event).await;
+            client
+                .request_instruments_by_event_query(
+                    CONVERT_EVENT_SLUG,
+                    GetGammaMarketsParams {
+                        max_markets: Some(5),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap()
+        }
+        "load_ids" => {
+            let state = TestServerState::default();
+            event["markets"] = json!([]);
+            let mut market = market;
+            market["events"] = json!([event]);
+            *state.gamma_response.lock().await = Some(json!([market]));
+            let client = create_gamma_domain_client(&start_mock_server(state.clone()).await);
+            let mut provider = PolymarketInstrumentProvider::new(client, None).unwrap();
+            provider.load_ids(&[anchor], None).await.unwrap();
+            assert_eq!(state.gamma_markets_query_log.lock().await.len(), 1);
+            provider.store().list_all().into_iter().cloned().collect()
+        }
+        "parent" => {
+            event["markets"].as_array_mut().unwrap().truncate(5);
+            let client = convert_event_client(event).await;
+            client
+                .request_instruments_by_event_slugs(vec![CONVERT_EVENT_SLUG.to_string()])
+                .await
+                .unwrap()
+        }
+        _ => unreachable!(),
+    };
+
+    let expected_count = match mode {
+        "filter" => 11,
+        "cap" | "parent" => 10,
+        "load_ids" => 2,
+        _ => unreachable!(),
+    };
+    assert_eq!(instruments.len(), expected_count);
+
+    let chain_tokens = convert_chain_tokens();
+    let message =
+        build_neg_risk_event(anchor, &instruments, &convert_chain_metadata(&chain_tokens))
+            .unwrap_err()
+            .to_string();
+
+    match mode {
+        "filter" | "cap" => assert!(message.contains(&missing_yes.to_string()), "{message}"),
+        "load_ids" => assert!(message.contains("parent"), "{message}"),
+        "parent" => assert!(message.contains(CONVERT_MARKET_ID), "{message}"),
+        _ => unreachable!(),
+    }
+}
+
+#[rstest]
+#[case::repeated_condition("duplicate")]
+#[case::token_collision("token")]
+#[case::foreign_question("event")]
+#[case::wrong_outcome_token("outcome")]
+#[case::wrong_condition_id("condition")]
+#[case::augmented("augmented")]
+#[tokio::test]
+async fn test_convert_event_rejects_inconsistent_parent_data(#[case] mode: &str) {
+    let mut event = convert_event_fixture();
+    let anchor = convert_instrument_id(&event["markets"][0], 1);
+    let affected = event["markets"][5]["conditionId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let foreign = (mode == "event").then(convert_foreign_question_pair);
+
+    match mode {
+        "duplicate" => event["markets"][5] = event["markets"][4].clone(),
+        "token" => {
+            event["markets"][5]["clobTokenIds"] = event["markets"][4]["clobTokenIds"].clone();
+        }
+        "event" => {
+            let (question_id, condition_id) = foreign.as_ref().unwrap();
+            event["markets"][5]["questionID"] = json!(question_id);
+            event["markets"][5]["conditionId"] = json!(condition_id);
+        }
+        "outcome" => event["markets"][5]["outcomes"] = json!(r#"["No", "Yes"]"#),
+        "condition" => {
+            event["markets"][5]["conditionId"] =
+                json!("0xe39adea057926dc197fe30a441f57a340b2a232d5a687010f78bba9b6e02620f");
+        }
+        "augmented" => event["negRiskAugmented"] = json!(true),
+        _ => unreachable!(),
+    }
+
+    let client = convert_event_client(event).await;
+    let instruments = client
+        .request_instruments_by_event_slugs(vec![CONVERT_EVENT_SLUG.to_string()])
+        .await
+        .unwrap();
+    let instruments = if mode == "duplicate" {
+        let instruments = dedup_instruments_by_id(instruments);
+        assert_eq!(instruments.len(), 10, "duplicate market should dedup to 10");
+        instruments
+    } else {
+        instruments
+    };
+    let chain_tokens = convert_chain_tokens();
+    let message =
+        build_neg_risk_event(anchor, &instruments, &convert_chain_metadata(&chain_tokens))
+            .unwrap_err()
+            .to_string();
+
+    match mode {
+        "duplicate" => {
+            assert!(
+                message.contains("duplicate negative-risk condition index"),
+                "{message}"
+            );
+            assert!(!message.contains("duplicate loaded"), "{message}");
+        }
+        "token" | "outcome" => assert!(message.contains(&affected), "{message}"),
+        "event" => {
+            let (question_id, condition_id) = foreign.as_ref().unwrap();
+            assert!(message.contains("belongs to chain market"), "{message}");
+            assert!(message.contains(condition_id.as_str()), "{message}");
+            assert!(message.contains(question_id.as_str()), "{message}");
+            assert!(message.contains(CONVERT_MARKET_ID), "{message}");
+            assert!(
+                !message.contains("does not match the condition ID"),
+                "{message}"
+            );
+        }
+        _ => assert!(message.to_lowercase().contains(mode), "{message}"),
+    }
+}
+
+#[rstest]
+#[case::unsupported_loaded_protocol("version")]
+#[case::conflicting_loaded_parent("event")]
+#[case::foreign_token_alias("alias")]
+#[case::duplicate_with_incorrect_raw_symbol("duplicate")]
+#[case::same_id_different_variant("variant")]
+#[tokio::test]
+async fn test_convert_event_rejects_conflicting_loaded_definitions(#[case] mode: &str) {
+    let event = convert_event_fixture();
+    let anchor = convert_instrument_id(&event["markets"][0], 1);
+    let affected_id = convert_instrument_id(&event["markets"][5], 0);
+    let client = convert_event_client(event).await;
+    let mut instruments = client
+        .request_instruments_by_event_slugs(vec![CONVERT_EVENT_SLUG.to_string()])
+        .await
+        .unwrap();
+    let affected_index = instruments
+        .iter()
+        .position(|instrument| instrument.id() == affected_id)
+        .unwrap();
+    let mut alias_id = None;
+
+    if mode == "variant" {
+        let variant = {
+            let InstrumentAny::BinaryOption(binary) = &instruments[affected_index] else {
+                unreachable!();
+            };
+            Equity::builder()
+                .instrument_id(binary.id)
+                .raw_symbol(binary.raw_symbol)
+                .currency(binary.currency)
+                .price_precision(binary.price_precision)
+                .price_increment(binary.price_increment)
+                .ts_event(binary.ts_event)
+                .ts_init(binary.ts_init)
+                .build()
+                .unwrap()
+        };
+        instruments.push(InstrumentAny::Equity(variant));
+    } else if mode == "alias" || mode == "duplicate" {
+        let mut alias = instruments[affected_index].clone();
+        let InstrumentAny::BinaryOption(binary) = &mut alias else {
+            unreachable!();
+        };
+
+        if mode == "alias" {
+            let token_alias = format!("0{}", binary.raw_symbol);
+            binary.raw_symbol = Symbol::new(&token_alias);
+            binary.id = InstrumentId::from(format!(
+                "0xe39adea057926dc197fe30a441f57a340b2a232d5a687010f78bba9b6e02620f-{token_alias}.POLYMARKET"
+            ));
+            let mut info = binary.info.as_ref().unwrap().to_shared_map();
+            info.insert("token_id".into(), Arc::new(json!(token_alias)));
+            binary.info = Some(Params::from_shared(info));
+            alias_id = Some(binary.id);
+        } else {
+            binary.raw_symbol = Symbol::new("42");
+        }
+
+        instruments.push(alias);
+    } else {
+        let InstrumentAny::BinaryOption(binary) = &mut instruments[affected_index] else {
+            unreachable!();
+        };
+
+        match mode {
+            "version" => {
+                let mut info = binary.info.as_ref().unwrap().to_shared_map();
+                info.insert("market_version".into(), Arc::new(json!("v2")));
+                binary.info = Some(Params::from_shared(info));
+            }
+            "event" => binary.event_id = Some(Ustr::from("another-event")),
+            _ => unreachable!(),
+        }
+    }
+
+    let chain_tokens = convert_chain_tokens();
+    let message =
+        build_neg_risk_event(anchor, &instruments, &convert_chain_metadata(&chain_tokens))
+            .unwrap_err()
+            .to_string();
+    assert!(message.contains(&affected_id.to_string()), "{message}");
+    if let Some(alias_id) = alias_id {
+        assert!(message.contains(&alias_id.to_string()), "{message}");
+    }
+
+    if mode == "variant" {
+        assert!(message.contains("not a binary option"), "{message}");
+    }
 }
 
 #[rstest]
