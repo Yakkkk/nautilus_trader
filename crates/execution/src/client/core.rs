@@ -17,10 +17,10 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use nautilus_common::cache::{Cache, CacheView};
+use nautilus_common::cache::{Cache, CacheView, ConvertScopeCheck};
 use nautilus_model::{
     enums::{AccountType, OmsType},
-    identifiers::{AccountId, ClientId, ClientOrderId, TraderId, Venue},
+    identifiers::{AccountId, ClientId, ClientOrderId, InstrumentId, TraderId, Venue},
     orders::{OrderAny, OrderList},
     types::Currency,
 };
@@ -102,6 +102,27 @@ impl ExecutionClientCore {
     /// Returns a read-only borrow of the cache.
     pub fn cache(&self) -> std::cell::Ref<'_, Cache> {
         self.cache.borrow()
+    }
+
+    /// Prepares a position-report request against the account's fixed Convert scope.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if an affected Convert scope remains unresolved for the account.
+    pub fn prepare_convert_position_report(
+        &self,
+        instrument_id: Option<InstrumentId>,
+    ) -> anyhow::Result<ConvertScopeCheck> {
+        self.cache
+            .borrow()
+            .prepare_convert_position_report(self.account_id, instrument_id)
+    }
+
+    /// Returns whether the observed Convert scope is unchanged.
+    pub fn convert_position_report_is_current(&self, check: &ConvertScopeCheck) -> bool {
+        self.cache
+            .borrow()
+            .convert_position_report_is_current(check)
     }
 
     /// Returns the order for the given `client_order_id` from the cache.

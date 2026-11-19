@@ -28,12 +28,13 @@ use nautilus_common::{
     messages::{
         ExecutionEvent, ExecutionReport, SystemEvent,
         execution::{
-            BatchCancelOrders, CancelAllOrders, CancelOrder, GenerateFillReports,
+            BatchCancelOrders, CancelAllOrders, CancelOrder, ConvertExecutionStatus,
+            ConvertOperationRecord, ConvertTokenAmount, ConvertTransaction, GenerateFillReports,
             GenerateFillReportsBuilder, GenerateOrderStatusReport,
             GenerateOrderStatusReportBuilder, GenerateOrderStatusReports,
             GenerateOrderStatusReportsBuilder, GeneratePositionStatusReports,
             GeneratePositionStatusReportsBuilder, ModifyOrder, QueryAccount, QueryOrder,
-            SubmitOrder, SubmitOrderList, TradingCommand,
+            SubmitConvert, SubmitOrder, SubmitOrderList, TradingCommand,
         },
         system::SocketState,
     },
@@ -191,6 +192,303 @@ async fn finish_report_task<T>(task: ExecutionReportTask<T>) -> anyhow::Result<T
 
     assert_ne!(worker.await.unwrap(), core_thread);
     (task.finish)()
+}
+
+fn pending_convert(account_id: AccountId, output: InstrumentId) -> ConvertOperationRecord {
+    let input = InstrumentId::from(OTHER_INSTRUMENT_ID);
+    let mut record = ConvertOperationRecord::new(&SubmitConvert {
+        operation_id: UUID4::new(),
+        trader_id: TraderId::from("TESTER-001"),
+        strategy_id: StrategyId::from("CONVERT-001"),
+        account_id,
+        client_id: *POLYMARKET_CLIENT_ID,
+        inputs: vec![ConvertTokenAmount {
+            instrument_id: input,
+            quantity: dec!(25),
+        }],
+        ts_init: UnixNanos::from(1),
+    });
+    record.affected_instruments = vec![input, output];
+    record.dispatched = true;
+    record.status = Some(ConvertExecutionStatus::Unknown);
+    record
+}
+
+async fn convert_balance_fixture() -> (TestServerState, InstrumentId) {
+    let state = TestServerState::default();
+    *state.orders_response_override.lock().await = Some(json!({
+        "data": [],
+        "next_cursor": "LTE=",
+    }));
+    *state.positions_response_override.lock().await = Some(json!([{
+        "token_id": TEST_TOKEN_ID, "condition_id": TEST_CONDITION_ID,
+        "current_size": "25.0000", "avg_price": "0.5000",
+    }]));
+    let output =
+        InstrumentId::from(format!("{TEST_CONDITION_ID}-{TEST_TOKEN_ID}.POLYMARKET").as_str());
+    (state, output)
+}
+
+fn convert_output_alias() -> InstrumentId {
+    InstrumentId::from(format!(
+        "{}-{TEST_TOKEN_ID}.POLYMARKET",
+        TEST_CONDITION_ID.to_ascii_uppercase(),
+    ))
+}
+
+#[rstest]
+#[tokio::test]
+async fn convert_defers_position_reports_but_keeps_order_and_fill_reports(
+    #[values(ReportMode::Inline, ReportMode::Worker)] mode: ReportMode,
+) {
+    let (state, output) = convert_balance_fixture().await;
+    let mut order = load_json("http_open_order.json");
+    order["size_matched"] = json!("0.0000");
+    *state.single_order_response.lock().await = Some(order);
+    *state.trades_response_override.lock().await =
+        Some(json!({"data": [load_json("http_trade_report.json")], "next_cursor": "LTE="}));
+    let addr = start_mock_server(state).await;
+    let (mut client, _rx, cache) = create_test_execution_client(addr);
+    add_instrument_to_cache_with_size_precision(&cache, output, 4);
+    client.on_instrument(cache.borrow().instrument(&output).unwrap().clone());
+    let position_command = |instrument_id| {
+        GeneratePositionStatusReportsBuilder::default()
+            .ts_init(UnixNanos::from(1))
+            .instrument_id(instrument_id)
+            .build()
+            .unwrap()
+    };
+    let targeted = position_command(Some(output));
+    let alternate_spelling = position_command(Some(convert_output_alias()));
+    let baseline = mode
+        .position_status_reports(&client, &targeted)
+        .await
+        .unwrap();
+    let alias_baseline = mode
+        .position_status_reports(&client, &alternate_spelling)
+        .await
+        .unwrap();
+    assert_eq!(baseline.len(), 1);
+    assert_eq!(baseline[0].instrument_id, output);
+    assert_eq!(baseline[0].quantity, Quantity::from("25.000000"));
+    assert_eq!(alias_baseline.len(), 1);
+    assert_eq!(alias_baseline[0].instrument_id, output);
+
+    let record = pending_convert(client.account_id(), output);
+    cache.borrow_mut().add_convert_operation(&record).unwrap();
+    assert!(
+        mode.position_status_reports(&client, &targeted)
+            .await
+            .is_err()
+    );
+    assert!(
+        mode.position_status_reports(&client, &alternate_spelling)
+            .await
+            .is_err()
+    );
+    assert!(client.generate_mass_status(None).await.is_err());
+
+    let unrelated = position_command(Some(InstrumentId::from(
+        "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-2.POLYMARKET",
+    )));
+    assert!(
+        mode.position_status_reports(&client, &unrelated)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    let order_command = GenerateOrderStatusReportBuilder::default()
+        .ts_init(UnixNanos::from(1))
+        .instrument_id(Some(output))
+        .venue_order_id(Some(VenueOrderId::from(DEFAULT_ACCEPTED_ORDER_ID)))
+        .build()
+        .unwrap();
+    let fill_command = GenerateFillReportsBuilder::default()
+        .ts_init(UnixNanos::from(1))
+        .instrument_id(Some(output))
+        .build()
+        .unwrap();
+    let order = mode
+        .order_status_report(&client, &order_command)
+        .await
+        .unwrap()
+        .unwrap();
+    let fills = mode.fill_reports(&client, fill_command).await.unwrap();
+    assert_eq!(order.instrument_id, output);
+    assert_eq!(fills.len(), 1);
+    assert_eq!(fills[0].instrument_id, output);
+}
+
+#[rstest]
+#[tokio::test]
+async fn convert_defers_position_alias_before_execution_lookup_registration(
+    #[values(ReportMode::Inline, ReportMode::Worker)] mode: ReportMode,
+) {
+    let state = TestServerState::default();
+    let addr = start_mock_server(state).await;
+    let (client, _events, cache) = create_test_execution_client(addr);
+    let output = InstrumentId::from(format!("{TEST_CONDITION_ID}-{TEST_TOKEN_ID}.POLYMARKET"));
+    add_instrument_to_cache_with_size_precision(&cache, output, 4);
+    let command = GeneratePositionStatusReportsBuilder::default()
+        .ts_init(UnixNanos::from(1))
+        .instrument_id(Some(convert_output_alias()))
+        .build()
+        .unwrap();
+    let baseline = mode
+        .position_status_reports(&client, &command)
+        .await
+        .unwrap();
+    assert!(baseline.is_empty());
+
+    let record = pending_convert(client.account_id(), output);
+    cache.borrow_mut().add_convert_operation(&record).unwrap();
+    let result = mode.position_status_reports(&client, &command).await;
+    assert!(result.is_err());
+}
+
+#[rstest]
+#[tokio::test]
+async fn convert_invalidates_http_report_when_scope_starts_and_ends_during_request(
+    #[values(Some(ReportMode::Inline), Some(ReportMode::Worker), None)] mode: Option<ReportMode>,
+) {
+    let (state, output) = convert_balance_fixture().await;
+    state.positions_request_gate.enable();
+    let addr = start_mock_server(state.clone()).await;
+    let (mut client, _rx, cache) = create_test_execution_client(addr);
+    add_instrument_to_cache_with_size_precision(&cache, output, 4);
+    client.on_instrument(cache.borrow().instrument(&output).unwrap().clone());
+    let command = GeneratePositionStatusReportsBuilder::default()
+        .ts_init(UnixNanos::from(1))
+        .instrument_id(Some(convert_output_alias()))
+        .build()
+        .unwrap();
+    let mut record = pending_convert(client.account_id(), output);
+
+    let (result, ()) = tokio::join!(
+        async {
+            match mode {
+                Some(mode) => mode
+                    .position_status_reports(&client, &command)
+                    .await
+                    .map(drop),
+                None => client.generate_mass_status(None).await.map(drop),
+            }
+        },
+        async {
+            wait_until_async(
+                || async { state.positions_request_gate.started() == 1 },
+                Duration::from_secs(5),
+            )
+            .await;
+            cache.borrow_mut().add_convert_operation(&record).unwrap();
+            record.status = Some(ConvertExecutionStatus::Rejected);
+            cache.borrow_mut().add_convert_operation(&record).unwrap();
+            state.positions_request_gate.release();
+        },
+    );
+
+    assert!(result.is_err());
+}
+
+#[rstest]
+#[tokio::test]
+async fn convert_scope_does_not_block_clob_submission_for_the_same_instrument() {
+    let (state, output) = convert_balance_fixture().await;
+    state.configure_default_order_success().await;
+    state
+        .order_response_uses_request_hash
+        .store(true, Ordering::Release);
+    let addr = start_mock_server(state.clone()).await;
+    let (mut client, mut events, cache) = create_test_execution_client(addr);
+    client.start().unwrap();
+    add_instrument_to_cache_with_size_precision(&cache, output, 4);
+    client.on_instrument(cache.borrow().instrument(&output).unwrap().clone());
+    let record = pending_convert(client.account_id(), output);
+    cache.borrow_mut().add_convert_operation(&record).unwrap();
+
+    let order = make_limit_order_at_price_and_quantity(
+        "O-DURING-CONVERT",
+        output,
+        OrderSide::Buy,
+        false,
+        false,
+        false,
+        TimeInForce::Gtc,
+        Price::from("0.5000"),
+        Quantity::from("10.0000"),
+    );
+    cache
+        .borrow_mut()
+        .add_order(order.clone(), None, None, false)
+        .unwrap();
+
+    client
+        .submit_order(make_submit_cmd(&order, output))
+        .unwrap();
+    let submitted = assert_order_event(recv_execution_event(&mut events).await, "Submitted");
+    let accepted = assert_order_event(recv_execution_event(&mut events).await, "Accepted");
+    assert_eq!(submitted.client_order_id(), order.client_order_id());
+    assert_eq!(accepted.client_order_id(), order.client_order_id());
+    assert_eq!(*state.order_post_count.lock().await, 1);
+    assert!(
+        cache
+            .borrow()
+            .convert_scope_is_active(output, client.account_id())
+    );
+}
+
+#[rstest]
+#[tokio::test]
+async fn convert_retains_historical_gap_only_after_unheld_output_formally_expires() {
+    let (state, output) = convert_balance_fixture().await;
+    let addr = start_mock_server(state).await;
+    let (mut client, _rx, cache) = create_test_execution_client(addr);
+    add_instrument_to_cache_with_size_precision(&cache, output, 4);
+    client.on_instrument(cache.borrow().instrument(&output).unwrap().clone());
+    let mut record = pending_convert(client.account_id(), output);
+    record.unapplied_instruments = vec![output];
+    record.transaction = Some(ConvertTransaction {
+        wallet: TEST_SIGNER_ADDRESS.to_string(),
+        relayer_transaction_id: None,
+        transaction_hash: None,
+        nonce: Some("17".to_string()),
+        call_summary: None,
+    });
+    cache.borrow_mut().add_convert_operation(&record).unwrap();
+    let close = |instrument_id, close_type| {
+        cache
+            .borrow_mut()
+            .add_instrument_close(InstrumentClose::new(
+                instrument_id,
+                Price::from("1.0000"),
+                close_type,
+                UnixNanos::from(2),
+                UnixNanos::from(2),
+            ))
+            .unwrap();
+    };
+    close(
+        record.inputs[0].instrument_id,
+        InstrumentCloseType::ContractExpired,
+    );
+    close(output, InstrumentCloseType::EndOfSession);
+    assert!(client.generate_mass_status(None).await.is_err());
+
+    close(output, InstrumentCloseType::ContractExpired);
+    let mass_status = client.generate_mass_status(None).await.unwrap().unwrap();
+    let retained = cache
+        .borrow()
+        .load_convert_operation(record.operation_id)
+        .unwrap()
+        .unwrap();
+    assert!(mass_status.position_reports().is_empty());
+    assert!(retained.historical_gap);
+    assert!(!retained.applied);
+    assert_eq!(retained.status, Some(ConvertExecutionStatus::Unknown));
+    assert_eq!(retained.transaction, record.transaction);
+    assert_eq!(retained.unapplied_instruments, vec![output]);
+    assert!(retained.reason.unwrap().contains("historical gap"));
 }
 
 #[derive(Clone, Copy, Debug)]

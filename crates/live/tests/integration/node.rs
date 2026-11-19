@@ -44,8 +44,9 @@ use nautilus_common::{
     messages::{
         ExecutionEvent,
         execution::{
+            ConvertExecutionStatus, ConvertOperationRecord, ConvertTokenAmount,
             GenerateFillReports, GenerateOrderStatusReport, GenerateOrderStatusReports,
-            GeneratePositionStatusReports, QueryOrder, TradingCommand,
+            GeneratePositionStatusReports, QueryOrder, SubmitConvert, TradingCommand,
         },
         system::{QueueStateChanged, ShutdownSystem},
     },
@@ -64,7 +65,11 @@ use nautilus_live::{
 };
 use nautilus_model::{
     accounts::AccountAny,
-    enums::{LiquiditySide, OmsType, OrderSide, OrderStatus, OrderType, PositionSide, TimeInForce},
+    data::InstrumentClose,
+    enums::{
+        InstrumentCloseType, LiquiditySide, OmsType, OrderSide, OrderStatus, OrderType,
+        PositionSide, TimeInForce,
+    },
     events::OrderEventAny,
     identifiers::{
         AccountId, ActorId, ClientId, ClientOrderId, ExecAlgorithmId, InstrumentId, PositionId,
@@ -664,6 +669,26 @@ pub(crate) mod serial_tests {
             .unwrap();
 
         (node, state)
+    }
+
+    fn startup_convert_record(output: InstrumentId) -> ConvertOperationRecord {
+        let input = InstrumentId::from("CONVERT-INPUT.PERSPECTIVE");
+        let mut record = ConvertOperationRecord::new(&SubmitConvert {
+            operation_id: UUID4::new(),
+            trader_id: TraderId::from("TESTER-001"),
+            strategy_id: StrategyId::from("CONVERT-001"),
+            account_id: AccountId::from("STARTUP-MASS-STATUS-001"),
+            client_id: ClientId::from(StartupMassStatusExecutionClient::CLIENT_ID),
+            inputs: vec![ConvertTokenAmount {
+                instrument_id: input,
+                quantity: dec!(25),
+            }],
+            ts_init: UnixNanos::from(1),
+        });
+        record.affected_instruments = vec![input, output];
+        record.dispatched = true;
+        record.status = Some(ConvertExecutionStatus::Unknown);
+        record
     }
 
     #[rstest]
@@ -3298,6 +3323,148 @@ pub(crate) mod serial_tests {
         );
         assert_eq!(state.instrument_updates.load(Ordering::Relaxed), 1);
         assert!(state.mass_status_requested.load(Ordering::Relaxed));
+        node.stop().await.unwrap();
+        node.dispose();
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_startup_mass_status_fails_for_unresolved_convert_scope() {
+        let config = LiveNodeConfig {
+            exec_engine: LiveExecutionEngineConfig {
+                reconciliation: true,
+                ..Default::default()
+            },
+            delay_post_stop: Duration::ZERO,
+            timeout_disconnection: Duration::from_millis(50),
+            ..Default::default()
+        };
+
+        let (mut node, state) = live_node_with_startup_mass_status_client(
+            "ActiveConvertStartup",
+            config,
+            StartupMassStatusBehavior::Available,
+        );
+        let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt());
+        let output = instrument.id();
+        node.kernel()
+            .cache()
+            .borrow_mut()
+            .add_instrument(instrument)
+            .unwrap();
+        let record = startup_convert_record(output);
+        node.kernel()
+            .cache()
+            .borrow_mut()
+            .add_convert_operation(&record)
+            .unwrap();
+        *state.mass_status.lock() = Some(ExecutionMassStatus::new(
+            ClientId::from(StartupMassStatusExecutionClient::CLIENT_ID),
+            AccountId::from("STARTUP-MASS-STATUS-001"),
+            output.venue,
+            UnixNanos::from(1),
+            None,
+        ));
+
+        let err = node.start().await.expect_err("startup should defer");
+        assert!(
+            err.to_string()
+                .contains("Unresolved positions during startup reconciliation"),
+            "unexpected error: {err:#}"
+        );
+        assert_eq!(node.state(), NodeState::Stopped);
+        node.dispose();
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_startup_mass_status_progresses_after_complete_historical_gap() {
+        let config = LiveNodeConfig {
+            exec_engine: LiveExecutionEngineConfig {
+                reconciliation: true,
+                ..Default::default()
+            },
+            delay_post_stop: Duration::ZERO,
+            timeout_disconnection: Duration::from_millis(50),
+            ..Default::default()
+        };
+
+        let (mut node, state) = live_node_with_startup_mass_status_client(
+            "SettledConvertStartup",
+            config,
+            StartupMassStatusBehavior::Available,
+        );
+        let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt());
+        let output = instrument.id();
+        node.kernel()
+            .cache()
+            .borrow_mut()
+            .add_instrument(instrument)
+            .unwrap();
+        let record = startup_convert_record(output);
+        node.kernel()
+            .cache()
+            .borrow_mut()
+            .add_convert_operation(&record)
+            .unwrap();
+
+        for instrument_id in &record.affected_instruments {
+            node.kernel()
+                .cache()
+                .borrow_mut()
+                .add_instrument_close(InstrumentClose::new(
+                    *instrument_id,
+                    Price::from("0.000"),
+                    InstrumentCloseType::ContractExpired,
+                    UnixNanos::from(2),
+                    UnixNanos::from(2),
+                ))
+                .unwrap();
+        }
+        let retained = node
+            .kernel()
+            .cache()
+            .borrow()
+            .load_convert_operation(record.operation_id)
+            .unwrap()
+            .unwrap();
+        assert!(retained.historical_gap);
+
+        let mut mass_status = ExecutionMassStatus::new(
+            ClientId::from(StartupMassStatusExecutionClient::CLIENT_ID),
+            AccountId::from("STARTUP-MASS-STATUS-001"),
+            output.venue,
+            UnixNanos::from(1),
+            None,
+        );
+        mass_status.add_position_reports(vec![PositionStatusReport::new(
+            AccountId::from("STARTUP-MASS-STATUS-001"),
+            output,
+            PositionSide::Long,
+            Quantity::from("25"),
+            UnixNanos::from(1),
+            UnixNanos::from(1),
+            None,
+            None,
+            Some(dec!(0.50)),
+        )]);
+        *state.mass_status.lock() = Some(mass_status);
+
+        node.start().await.unwrap();
+        assert_eq!(node.state(), NodeState::Running);
+        assert!(
+            node.kernel()
+                .cache()
+                .borrow()
+                .positions_open(
+                    None,
+                    Some(&output),
+                    None,
+                    Some(&AccountId::from("STARTUP-MASS-STATUS-001")),
+                    None,
+                )
+                .is_empty()
+        );
         node.stop().await.unwrap();
         node.dispose();
     }

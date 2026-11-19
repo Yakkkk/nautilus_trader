@@ -100,6 +100,10 @@ use crate::{
         arm_shutdown_on_error, disarm_shutdown_on_error, init_logging,
         take_shutdown_on_error_trigger,
     },
+    messages::execution::{
+        ConvertExecutionStatus, ConvertOperationRecord, ConvertTokenAmount, ConvertTransaction,
+        SubmitConvert,
+    },
     signal::Signal,
 };
 
@@ -119,6 +123,26 @@ fn build_order_canceled(
         .maybe_venue_order_id(venue_order_id)
         .maybe_account_id(account_id)
         .build()
+}
+
+fn convert_scope_record(account_id: AccountId, output: InstrumentId) -> ConvertOperationRecord {
+    let input = InstrumentId::from("INPUT.POLYMARKET");
+    let mut record = ConvertOperationRecord::new(&SubmitConvert {
+        operation_id: UUID4::new(),
+        trader_id: TraderId::from("TESTER-001"),
+        strategy_id: StrategyId::from("CONVERT-001"),
+        account_id,
+        client_id: ClientId::from("POLYMARKET"),
+        inputs: vec![ConvertTokenAmount {
+            instrument_id: input,
+            quantity: dec!(25),
+        }],
+        ts_init: UnixNanos::from(1),
+    });
+    record.affected_instruments = vec![input, output];
+    record.dispatched = true;
+    record.status = Some(ConvertExecutionStatus::Unknown);
+    record
 }
 
 #[expect(clippy::too_many_arguments)]
@@ -18088,4 +18112,161 @@ fn test_custom_data_reads_are_available_through_cache_facades() {
     assert_eq!(missing, None);
     assert_eq!(api.custom_data(data_type), None);
     assert_eq!(api.custom_data_history(data_type), Vec::<CustomData>::new());
+}
+
+#[rstest]
+fn test_convert_scope_tracks_overlap_generations_and_account_isolation() {
+    let mut cache = Cache::default();
+    let output = InstrumentId::from("OUTPUT.POLYMARKET");
+    let account_id = AccountId::from("POLYMARKET-001");
+    let mut first = convert_scope_record(account_id, output);
+
+    cache.add_convert_operation(&first).unwrap();
+    assert!(cache.convert_scope_is_active(output, account_id));
+    let first_account_generation = cache.convert_scope_account_generation(account_id);
+    let first_instrument_generation = cache.convert_scope_instrument_generation(output, account_id);
+    let first_transition_generation = cache.convert_scope_generation();
+    assert!(first_account_generation > 0);
+    assert!(first_instrument_generation > 0);
+    assert_eq!(first_account_generation, first_transition_generation);
+
+    cache.add_convert_operation(&first).unwrap();
+    assert_eq!(
+        cache.convert_scope_generation(),
+        first_transition_generation
+    );
+    assert_eq!(
+        cache.convert_scope_account_generation(account_id),
+        first_account_generation
+    );
+    assert_eq!(
+        cache.convert_scope_instrument_generation(output, account_id),
+        first_instrument_generation
+    );
+
+    let mut second = convert_scope_record(account_id, output);
+    cache.add_convert_operation(&second).unwrap();
+    let second_account_generation = cache.convert_scope_account_generation(account_id);
+    let second_instrument_generation =
+        cache.convert_scope_instrument_generation(output, account_id);
+    assert!(second_account_generation > first_account_generation);
+    assert!(second_instrument_generation > first_instrument_generation);
+
+    first.status = Some(ConvertExecutionStatus::Rejected);
+    cache.add_convert_operation(&first).unwrap();
+    assert!(cache.convert_scope_is_active(output, account_id));
+    let after_first_release_generation = cache.convert_scope_account_generation(account_id);
+    assert!(after_first_release_generation > second_account_generation);
+
+    second.status = Some(ConvertExecutionStatus::Rejected);
+    cache.add_convert_operation(&second).unwrap();
+    assert!(!cache.convert_scope_is_active(output, account_id));
+    assert!(cache.convert_scope_account_generation(account_id) > after_first_release_generation);
+    assert!(
+        cache
+            .prepare_convert_position_report(account_id, Some(output))
+            .is_ok()
+    );
+
+    let other_account = AccountId::from("POLYMARKET-002");
+    let other = convert_scope_record(other_account, output);
+    cache.add_convert_operation(&other).unwrap();
+    assert!(cache.convert_scope_account_generation(other_account) > 0);
+    assert!(
+        cache
+            .prepare_convert_position_report(account_id, Some(output))
+            .is_ok()
+    );
+    assert!(
+        cache
+            .prepare_convert_position_report(other_account, Some(output))
+            .is_err()
+    );
+}
+
+#[rstest]
+fn test_convert_scope_rejects_identity_changes_and_reopening() {
+    let mut cache = Cache::default();
+    let output = InstrumentId::from("OUTPUT.POLYMARKET");
+    let account_id = AccountId::from("POLYMARKET-001");
+    let mut record = convert_scope_record(account_id, output);
+
+    cache.add_convert_operation(&record).unwrap();
+    let account_generation = cache.convert_scope_account_generation(account_id);
+    let instrument_generation = cache.convert_scope_instrument_generation(output, account_id);
+
+    let mut narrowed = record.clone();
+    narrowed.affected_instruments.truncate(1);
+    assert!(cache.add_convert_operation(&narrowed).is_err());
+    assert_eq!(
+        cache.convert_scope_account_generation(account_id),
+        account_generation
+    );
+    assert_eq!(
+        cache.convert_scope_instrument_generation(output, account_id),
+        instrument_generation
+    );
+
+    let mut moved = record.clone();
+    moved.account_id = AccountId::from("POLYMARKET-002");
+    assert!(cache.add_convert_operation(&moved).is_err());
+
+    record.status = Some(ConvertExecutionStatus::Rejected);
+    cache.add_convert_operation(&record).unwrap();
+    assert!(!cache.convert_scope_is_active(output, account_id));
+
+    let mut reopened = record.clone();
+    reopened.status = Some(ConvertExecutionStatus::Unknown);
+    reopened.reason = None;
+    assert!(cache.add_convert_operation(&reopened).is_err());
+    assert!(!cache.convert_scope_is_active(output, account_id));
+}
+
+#[rstest]
+fn test_restore_convert_scope_classifies_preloaded_contract_expiration() {
+    let mut cache = Cache::default();
+    let output = InstrumentId::from("OUTPUT.POLYMARKET");
+    let account_id = AccountId::from("POLYMARKET-001");
+    let record = convert_scope_record(account_id, output);
+
+    for instrument_id in &record.affected_instruments {
+        cache
+            .add_instrument_close(InstrumentClose::new(
+                *instrument_id,
+                Price::from("0.000"),
+                InstrumentCloseType::ContractExpired,
+                UnixNanos::from(2),
+                UnixNanos::from(2),
+            ))
+            .unwrap();
+    }
+
+    cache.restore_convert_operation_scope(&record).unwrap();
+    let retained = cache
+        .load_convert_operation(record.operation_id)
+        .unwrap()
+        .unwrap();
+    assert!(retained.historical_gap);
+    assert!(!retained.applied);
+    assert_eq!(retained.unapplied_instruments, record.affected_instruments);
+    assert!(!cache.convert_scope_is_active(output, account_id));
+}
+
+#[rstest]
+fn test_convert_rejection_with_wallet_evidence_does_not_release_scope() {
+    let mut cache = Cache::default();
+    let output = InstrumentId::from("OUTPUT.POLYMARKET");
+    let account_id = AccountId::from("POLYMARKET-001");
+    let mut record = convert_scope_record(account_id, output);
+    record.status = Some(ConvertExecutionStatus::Rejected);
+    record.transaction = Some(ConvertTransaction {
+        wallet: "TEST-WALLET".to_string(),
+        relayer_transaction_id: Some("RELAY-001".to_string()),
+        transaction_hash: None,
+        nonce: Some("7".to_string()),
+        call_summary: None,
+    });
+
+    cache.add_convert_operation(&record).unwrap();
+    assert!(cache.convert_scope_is_active(output, account_id));
 }

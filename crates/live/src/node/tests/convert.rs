@@ -830,6 +830,120 @@ fn convert_dispatch_error_is_rejected_and_repeated_request_does_not_retry() {
 }
 
 #[rstest]
+fn convert_pre_sign_rejection_is_terminal_for_contradictory_evidence() {
+    let mut fixture = ConvertFixture::new(true);
+    let operation_id = fixture.submit(fixture.inputs(), None);
+    fixture.flush_commands();
+
+    fixture.emit(
+        operation_id,
+        ConvertExecutionOutcome::Rejected("pre-sign refusal".into()),
+    );
+    let rejected = fixture.last_result();
+    assert_eq!(rejected.status, ConvertExecutionStatus::Rejected);
+
+    fixture.emit(
+        operation_id,
+        ConvertExecutionOutcome::Failed {
+            transaction: Some(ConvertFixture::transaction()),
+            reason: "contradictory provider failure".into(),
+        },
+    );
+    fixture.emit(operation_id, fixture.confirmation(operation_id));
+
+    let retained = fixture
+        .node
+        .kernel
+        .cache
+        .borrow()
+        .load_convert_operation(operation_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(retained.status, Some(ConvertExecutionStatus::Rejected));
+    assert!(retained.transaction.is_none());
+    assert!(!retained.applied);
+    assert_eq!(fixture.last_result(), rejected);
+    assert!(fixture.callbacks.borrow().opened.is_empty());
+
+    let cache = fixture.node.kernel.cache.borrow();
+    assert!(!cache.convert_scope_is_active(fixture.yes_c, fixture.account_id));
+    assert!(
+        cache
+            .positions_open(
+                None,
+                Some(&fixture.yes_c),
+                None,
+                Some(&fixture.account_id),
+                None
+            )
+            .is_empty()
+    );
+}
+
+#[rstest]
+fn convert_confirmed_historical_gap_accepts_compatible_transaction_enrichment() {
+    let mut fixture = ConvertFixture::new(true);
+    let operation_id = fixture.submit(fixture.inputs(), None);
+    fixture.flush_commands();
+    let ConvertExecutionOutcome::Confirmed { verified, .. } = fixture.confirmation(operation_id)
+    else {
+        unreachable!();
+    };
+    fixture.emit(
+        operation_id,
+        ConvertExecutionOutcome::Confirmed {
+            verified,
+            pending_inputs: vec![fixture.no_a],
+        },
+    );
+    assert!(!fixture.last_result().applied);
+
+    {
+        let mut cache = fixture.node.kernel.cache.borrow_mut();
+        for instrument_id in [fixture.no_a, fixture.no_b, fixture.yes_c] {
+            cache
+                .add_instrument_close(InstrumentClose::new(
+                    instrument_id,
+                    Price::from("0.000"),
+                    InstrumentCloseType::ContractExpired,
+                    UnixNanos::from(90),
+                    UnixNanos::from(90),
+                ))
+                .unwrap();
+        }
+    }
+
+    let ConvertExecutionOutcome::Confirmed {
+        mut verified,
+        pending_inputs,
+    } = fixture.confirmation(operation_id)
+    else {
+        unreachable!();
+    };
+    verified.transaction.call_summary = Some("compatible call metadata".into());
+    fixture.emit(
+        operation_id,
+        ConvertExecutionOutcome::Confirmed {
+            verified,
+            pending_inputs,
+        },
+    );
+
+    let result = fixture.last_result();
+    assert_eq!(result.status, ConvertExecutionStatus::Confirmed);
+    assert!(!result.applied);
+    assert!(result.reason.as_deref().unwrap().contains("historical gap"));
+    assert_eq!(
+        result
+            .transaction
+            .as_ref()
+            .and_then(|transaction| transaction.call_summary.as_deref()),
+        Some("compatible call metadata"),
+    );
+    assert!(fixture.callbacks.borrow().opened.is_empty());
+}
+
+#[rstest]
 fn convert_returns_unknown_locally_and_preserves_confirmed_pending_accounting() {
     let mut fixture = ConvertFixture::new(true);
     let operation_id = fixture.submit(fixture.inputs(), None);
@@ -1052,4 +1166,199 @@ fn convert_retains_a_confirmed_history_gap_after_scope_settlement(
     assert!(gap.unapplied_instruments.contains(&fixture.yes_c));
     assert!(fixture.callbacks.borrow().opened.is_empty());
     assert!(fixture.calls.borrow().queries.is_empty());
+}
+
+#[rstest]
+fn convert_historical_gap_queries_original_locator_without_reapplying_accounting() {
+    let mut fixture = ConvertFixture::new(true);
+    let operation_id = fixture.submit(fixture.inputs(), None);
+    fixture.flush_commands();
+    let original = ConvertFixture::transaction();
+
+    fixture.emit(
+        operation_id,
+        ConvertExecutionOutcome::Unknown {
+            transaction: Some(original.clone()),
+            reason: "original execution remains unknown".into(),
+        },
+    );
+    {
+        let mut cache = fixture.node.kernel.cache.borrow_mut();
+        for instrument_id in [fixture.no_a, fixture.no_b, fixture.yes_c] {
+            cache
+                .add_instrument_close(InstrumentClose::new(
+                    instrument_id,
+                    Price::from("0.000"),
+                    InstrumentCloseType::ContractExpired,
+                    UnixNanos::from(90),
+                    UnixNanos::from(90),
+                ))
+                .unwrap();
+        }
+    }
+
+    let retained = fixture
+        .node
+        .kernel
+        .cache
+        .borrow()
+        .load_convert_operation(operation_id)
+        .unwrap()
+        .unwrap();
+    assert!(retained.historical_gap);
+    assert_eq!(retained.transaction, Some(original.clone()));
+
+    fixture.query(operation_id, fixture.strategy_id, fixture.account_id);
+    fixture.flush_commands();
+    let calls = fixture.calls.borrow();
+    assert_eq!(calls.queries.len(), 1);
+    assert_eq!(calls.queries[0].0.operation_id, operation_id);
+    assert_eq!(calls.queries[0].1, original);
+    drop(calls);
+
+    fixture.emit(operation_id, fixture.confirmation(operation_id));
+    let result = fixture.last_result();
+    assert_eq!(result.status, ConvertExecutionStatus::Confirmed);
+    assert!(!result.applied);
+    assert_eq!(result.transaction, Some(ConvertFixture::transaction()));
+    assert!(result.unapplied_instruments.contains(&fixture.yes_c));
+    assert!(result.reason.as_deref().unwrap().contains("historical"));
+    assert!(fixture.callbacks.borrow().opened.is_empty());
+    let retained = fixture
+        .node
+        .kernel
+        .cache
+        .borrow()
+        .load_convert_operation(operation_id)
+        .unwrap()
+        .unwrap();
+    assert!(retained.historical_gap);
+    assert!(!retained.applied);
+}
+
+#[rstest]
+fn convert_failed_scope_requires_explicit_invalid_authorization_to_release() {
+    let mut fixture = ConvertFixture::new(true);
+    let operation_id = fixture.submit(fixture.inputs(), None);
+    fixture.flush_commands();
+    let original = ConvertFixture::transaction();
+
+    fixture.emit(
+        operation_id,
+        ConvertExecutionOutcome::Submitted(original.clone()),
+    );
+    fixture.emit(
+        operation_id,
+        ConvertExecutionOutcome::Failed {
+            transaction: Some(original.clone()),
+            reason: "provider attempt failed".into(),
+        },
+    );
+    let retained = fixture
+        .node
+        .kernel
+        .cache
+        .borrow()
+        .load_convert_operation(operation_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(retained.status, Some(ConvertExecutionStatus::Failed));
+    assert!(!retained.authorization_invalid);
+    assert!(
+        fixture
+            .node
+            .kernel
+            .cache
+            .borrow()
+            .convert_scope_is_active(fixture.yes_c, fixture.account_id)
+    );
+
+    fixture.emit(
+        operation_id,
+        ConvertExecutionOutcome::Rejected("post-authorization refusal".into()),
+    );
+    assert_eq!(fixture.last_result().status, ConvertExecutionStatus::Failed);
+
+    fixture.query(operation_id, fixture.strategy_id, fixture.account_id);
+    fixture.flush_commands();
+    assert_eq!(fixture.calls.borrow().queries.len(), 1);
+
+    let mut conflicting = original.clone();
+    conflicting.wallet = "OTHER-WALLET".into();
+    fixture.emit(
+        operation_id,
+        ConvertExecutionOutcome::AuthorizationInvalid {
+            transaction: Some(conflicting),
+            reason: "conflicting authorization proof".into(),
+        },
+    );
+    let retained = fixture
+        .node
+        .kernel
+        .cache
+        .borrow()
+        .load_convert_operation(operation_id)
+        .unwrap()
+        .unwrap();
+    assert!(!retained.authorization_invalid);
+    assert_eq!(retained.status, Some(ConvertExecutionStatus::Failed));
+    assert!(
+        fixture
+            .node
+            .kernel
+            .cache
+            .borrow()
+            .convert_scope_is_active(fixture.yes_c, fixture.account_id)
+    );
+    assert_eq!(fixture.calls.borrow().queries.len(), 1);
+
+    fixture.emit(
+        operation_id,
+        ConvertExecutionOutcome::AuthorizationInvalid {
+            transaction: Some(original),
+            reason: "authorization proven invalid".into(),
+        },
+    );
+    let released = fixture.last_result();
+    assert_eq!(released.status, ConvertExecutionStatus::Failed);
+    let retained = fixture
+        .node
+        .kernel
+        .cache
+        .borrow()
+        .load_convert_operation(operation_id)
+        .unwrap()
+        .unwrap();
+    assert!(retained.authorization_invalid);
+    assert!(
+        !fixture
+            .node
+            .kernel
+            .cache
+            .borrow()
+            .convert_scope_is_active(fixture.yes_c, fixture.account_id)
+    );
+
+    let query_count = fixture.calls.borrow().queries.len();
+    fixture.query(operation_id, fixture.strategy_id, fixture.account_id);
+    fixture.flush_commands();
+    assert_eq!(fixture.calls.borrow().queries.len(), query_count);
+
+    fixture.emit(operation_id, fixture.confirmation(operation_id));
+    assert_eq!(fixture.last_result().status, ConvertExecutionStatus::Failed);
+    assert!(fixture.callbacks.borrow().opened.is_empty());
+}
+
+#[rstest]
+fn convert_applied_scope_release_notifies_execution_manager_activity_on_dispatch() {
+    let mut fixture = ConvertFixture::new(true);
+    let operation_id = fixture.submit(fixture.inputs(), None);
+    fixture.flush_commands();
+    let key = (fixture.yes_c, fixture.account_id);
+    let before = fixture.node.exec_manager.position_activity_revision(&key);
+
+    fixture.emit(operation_id, fixture.confirmation(operation_id));
+
+    assert!(fixture.node.exec_manager.position_activity_revision(&key) > before);
+    assert!(fixture.node.exec_manager.position_activity_is_recent(&key));
 }

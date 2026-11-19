@@ -174,6 +174,8 @@ pub struct ExecutionManager {
 
     position_activity: RecencyMap<InstrumentAccountKey>,
     position_activity_revisions: IndexMap<InstrumentAccountKey, u64>,
+    convert_activity: RecencyMap<InstrumentAccountKey>,
+    convert_scope_generation: u64,
     position_recon: IndexMap<InstrumentAccountKey, PositionReconciliationState>,
     position_recon_tolerances: IndexMap<AccountId, Decimal>,
 }
@@ -201,6 +203,8 @@ impl Debug for ExecutionManager {
             .field("fills_unapplied", &self.fills_unapplied)
             .field("position_activity", &self.position_activity)
             .field("position_activity_revisions", &self.position_activity_revisions)
+            .field("convert_activity", &self.convert_activity)
+            .field("convert_scope_generation", &self.convert_scope_generation)
             .field("position_recon", &self.position_recon)
             .field("position_recon_tolerances", &self.position_recon_tolerances)
             .finish()
@@ -240,6 +244,8 @@ impl ExecutionManager {
             fills_unapplied: RecencyMap::default(),
             position_activity: RecencyMap::default(),
             position_activity_revisions: IndexMap::new(),
+            convert_activity: RecencyMap::default(),
+            convert_scope_generation: 0,
             position_recon: IndexMap::new(),
             position_recon_tolerances: IndexMap::new(),
         })
@@ -673,10 +679,72 @@ impl ExecutionManager {
     /// report checks prepared earlier are no longer current. Uses monotonic `dst::time` so the
     /// grace window is unaffected by trading-clock acceleration or venue timestamps.
     pub fn record_position_activity(&mut self, instrument_id: InstrumentId, account_id: AccountId) {
+        self.record_position_activity_at(instrument_id, account_id, dst::time::Instant::now());
+    }
+
+    fn record_position_activity_at(
+        &mut self,
+        instrument_id: InstrumentId,
+        account_id: AccountId,
+        at: dst::time::Instant,
+    ) {
         let key = (instrument_id, account_id);
-        self.position_activity.mark(key);
+        self.position_activity.mark_at(key, at);
         let revision = self.position_activity_revisions.entry(key).or_default();
         *revision = revision.saturating_add(1);
+    }
+
+    /// Synchronizes Convert scope transitions into position activity revision and grace state.
+    pub(crate) fn sync_convert_scope_activity(&mut self) {
+        let changes = {
+            let cache = self.cache.borrow();
+            let generation = cache.convert_scope_generation();
+
+            if generation <= self.convert_scope_generation {
+                None
+            } else {
+                Some((
+                    generation,
+                    cache.convert_scope_changes_since(self.convert_scope_generation),
+                ))
+            }
+        };
+
+        if let Some((generation, changes)) = changes {
+            self.convert_scope_generation = generation;
+
+            for (instrument_id, account_id, at) in changes {
+                let key = (instrument_id, account_id);
+                self.record_position_activity_at(instrument_id, account_id, at);
+                self.convert_activity.mark_at(key, at);
+            }
+        }
+    }
+
+    fn convert_scope_check_is_current(
+        &self,
+        check: &PositionReportCheck,
+        key: &InstrumentAccountKey,
+    ) -> bool {
+        let cache = self.cache.borrow();
+
+        match check.command.instrument_id {
+            Some(instrument_id) => {
+                !cache.convert_scope_is_active(instrument_id, key.1)
+                    && cache.convert_scope_instrument_generation(instrument_id, key.1)
+                        <= check.convert_scope_generation
+            }
+            None => {
+                !cache.convert_scope_account_is_active(key.1)
+                    && cache.convert_scope_account_generation(key.1)
+                        <= check.convert_scope_generation
+            }
+        }
+    }
+
+    fn convert_activity_is_recent(&self, key: &InstrumentAccountKey) -> bool {
+        self.convert_activity
+            .within(key, Duration::from(self.config.position_check_threshold_ns))
     }
 
     /// Checks whether position activity falls within the reconciliation grace window.
@@ -765,6 +833,40 @@ impl ExecutionManager {
             return ReconciliationResult::default();
         }
 
+        self.sync_convert_scope_activity();
+
+        if self
+            .cache
+            .borrow()
+            .convert_scope_account_is_active(mass_status.account_id)
+        {
+            let reason = format!(
+                "Convert scope is unresolved for account {}",
+                mass_status.account_id
+            );
+            log::warn!("Deferring reconciliation mass status: {reason}");
+            return ReconciliationResult {
+                unresolved_positions: vec![reason],
+                ..ReconciliationResult::default()
+            };
+        }
+
+        let mut position_reports = mass_status.position_reports();
+        let mut deferred_position_count = 0;
+        position_reports.retain(|instrument_id, _| {
+            let deferred =
+                self.convert_activity_is_recent(&(*instrument_id, mass_status.account_id));
+            deferred_position_count += usize::from(deferred);
+            !deferred
+        });
+
+        if deferred_position_count > 0 {
+            log::warn!(
+                "Deferring {deferred_position_count} mass-status position instrument(s) for {}: recent Convert activity",
+                mass_status.account_id,
+            );
+        }
+
         self.validate_mass_status_order_sources(mass_status);
 
         // Publish raw reports before any state mutation (including fill adjustment
@@ -789,7 +891,7 @@ impl ExecutionManager {
         let raw_position_topic =
             MessagingSwitchboard::reconciliation_raw_position_status_report_topic();
 
-        for reports in mass_status.position_reports().values() {
+        for reports in position_reports.values() {
             for report in reports {
                 msgbus::publish_any(raw_position_topic, report);
             }
@@ -810,7 +912,7 @@ impl ExecutionManager {
         let venue = mass_status.venue;
         let order_count = mass_status.order_reports().len();
         let fill_count: usize = mass_status.fill_reports().values().map(Vec::len).sum();
-        let position_count: usize = mass_status.position_reports().values().map(Vec::len).sum();
+        let position_count: usize = position_reports.values().map(Vec::len).sum();
 
         log_info!(
             "Reconciling ExecutionMassStatus for {venue}",
@@ -839,7 +941,7 @@ impl ExecutionManager {
             .borrow()
             .get_client(&mass_status.client_id)
             .and_then(|client| client.venue_order_ids(mass_status));
-        let mut adjusted_reports = self.adjust_mass_status_fills(mass_status);
+        let mut adjusted_reports = self.adjust_mass_status_fills(mass_status, &position_reports);
         Self::preserve_external_order_history(
             mass_status,
             order_venue_ids.as_ref(),
@@ -852,8 +954,12 @@ impl ExecutionManager {
             order_only_fill_keys,
         } = adjusted_reports;
 
-        let bounded_order_only_ids =
-            self.order_only_ids(mass_status, &adjusted_order_reports, &adjusted_fill_reports);
+        let bounded_order_only_ids = self.order_only_ids(
+            mass_status,
+            &position_reports,
+            &adjusted_order_reports,
+            &adjusted_fill_reports,
+        );
 
         let mut events = Vec::new();
         let mut external_orders = Vec::new();
@@ -1325,8 +1431,8 @@ impl ExecutionManager {
                 )
                 .collect();
 
-            for (instrument_id, reports) in mass_status.position_reports() {
-                if !self.should_reconcile_instrument(&instrument_id) {
+            for (instrument_id, reports) in &position_reports {
+                if !self.should_reconcile_instrument(instrument_id) {
                     log::debug!(
                         "Skipping position reports for {instrument_id}: not in reconciliation_instrument_ids"
                     );
@@ -1341,7 +1447,7 @@ impl ExecutionManager {
                     }
 
                     if let Some(position_events) = self.reconcile_position_report(
-                        &report,
+                        report,
                         mass_status.account_id,
                         &instruments_with_unattributed_fills,
                     ) {
@@ -1415,7 +1521,8 @@ impl ExecutionManager {
         ReconciliationResult {
             events,
             external_orders,
-            unresolved_positions: self.unresolved_mass_status_positions(mass_status),
+            unresolved_positions: self
+                .unresolved_mass_status_positions(mass_status, &position_reports),
         }
     }
 
@@ -1509,22 +1616,26 @@ impl ExecutionManager {
         events.splice(..1, lifecycle);
     }
 
-    fn unresolved_mass_status_positions(&self, mass_status: &ExecutionMassStatus) -> Vec<String> {
+    fn unresolved_mass_status_positions(
+        &self,
+        mass_status: &ExecutionMassStatus,
+        position_reports: &IndexMap<InstrumentId, Vec<PositionStatusReport>>,
+    ) -> Vec<String> {
         if self.config.filter_position_reports {
             return Vec::new();
         }
 
         let mut unresolved = Vec::new();
 
-        for (instrument_id, reports) in mass_status.position_reports() {
-            if !self.should_reconcile_instrument(&instrument_id) {
+        for (instrument_id, reports) in position_reports {
+            if !self.should_reconcile_instrument(instrument_id) {
                 continue;
             }
 
-            let reports = distinct_position_reports(reports);
+            let reports = distinct_position_reports(reports.clone());
 
             if self
-                .netting_position_reports_match((instrument_id, mass_status.account_id), &reports)
+                .netting_position_reports_match((*instrument_id, mass_status.account_id), &reports)
             {
                 continue;
             }
@@ -1757,6 +1868,7 @@ impl ExecutionManager {
     fn order_only_ids(
         &self,
         mass_status: &ExecutionMassStatus,
+        position_reports: &IndexMap<InstrumentId, Vec<PositionStatusReport>>,
         order_reports: &IndexMap<VenueOrderId, OrderStatusReport>,
         fill_reports: &IndexMap<VenueOrderId, Vec<FillReport>>,
     ) -> IndexSet<VenueOrderId> {
@@ -1767,13 +1879,12 @@ impl ExecutionManager {
         let reported_instruments: IndexSet<InstrumentId> = if self.config.filter_position_reports {
             IndexSet::new()
         } else {
-            mass_status
-                .position_reports()
+            position_reports
                 .into_iter()
                 .filter(|(instrument_id, reports)| {
                     !reports.is_empty() && self.should_reconcile_instrument(instrument_id)
                 })
-                .map(|(instrument_id, _)| instrument_id)
+                .map(|(instrument_id, _)| *instrument_id)
                 .collect()
         };
 
@@ -2756,6 +2867,7 @@ impl ExecutionManager {
             command,
             client_coverage,
             activity_revisions,
+            convert_scope_generation: self.cache.borrow().convert_scope_generation(),
         }
     }
 
@@ -2771,6 +2883,8 @@ impl ExecutionManager {
         failed_clients: &IndexSet<ClientId>,
         clients: &[&dyn ExecutionClient],
     ) -> PositionFillReportPlan {
+        self.sync_convert_scope_activity();
+
         let venue_positions = self.group_position_reports(reports.iter().cloned());
 
         let keys = check
@@ -2792,6 +2906,15 @@ impl ExecutionManager {
         let mut queries = Vec::new();
 
         for &key in &keys {
+            if !self.convert_scope_check_is_current(check, &key) {
+                log::debug!(
+                    "Deferring position fill query for {}/{}: Convert scope changed during position report collection",
+                    key.0,
+                    key.1,
+                );
+                continue;
+            }
+
             let coverage = check
                 .client_coverage
                 .entry(key)
@@ -2893,10 +3016,16 @@ impl ExecutionManager {
         check: &PositionReportCheck,
         key: &InstrumentAccountKey,
     ) -> bool {
-        check
+        if !self.convert_scope_check_is_current(check, key) {
+            return false;
+        }
+
+        let prepared_revision = check
             .activity_revisions
             .get(key)
-            .is_some_and(|revision| self.position_activity_revision(key) == *revision)
+            .copied()
+            .unwrap_or_default();
+        self.position_activity_revision(key) == prepared_revision
     }
 
     /// Validates fill attribution and supplies a cached position ID when unambiguous.
@@ -3131,11 +3260,21 @@ impl ExecutionManager {
         failed_clients: &IndexSet<ClientId>,
     ) -> Vec<OrderEventAny> {
         log::debug!("Checking position consistency between cached-state and venues");
+        self.sync_convert_scope_activity();
 
         let venue_positions = self.group_position_reports(reports);
         let mut events = Vec::new();
 
         for (key, coverage) in &check.client_coverage {
+            if !self.convert_scope_check_is_current(check, key) {
+                log::debug!(
+                    "Deferring position reconciliation for {}/{}: Convert scope changed during the report request",
+                    key.0,
+                    key.1,
+                );
+                continue;
+            }
+
             let prepared_revision = check
                 .activity_revisions
                 .get(key)
@@ -3216,6 +3355,15 @@ impl ExecutionManager {
         let current_position_keys = self.open_position_keys_for_reconciliation();
 
         for (key, venue_reports) in &venue_positions {
+            if !self.convert_scope_check_is_current(check, key) {
+                log::debug!(
+                    "Deferring position reconciliation for {}/{}: Convert scope changed during the report request",
+                    key.0,
+                    key.1,
+                );
+                continue;
+            }
+
             if check.client_coverage.contains_key(key)
                 || venue_reports
                     .iter()
@@ -5116,7 +5264,11 @@ impl ExecutionManager {
     ///
     /// When historical fills don't fully explain the current position (e.g., lookback window
     /// started mid-position), this creates synthetic fills to align with the venue position.
-    fn adjust_mass_status_fills(&self, mass_status: &ExecutionMassStatus) -> AdjustedReports {
+    fn adjust_mass_status_fills(
+        &self,
+        mass_status: &ExecutionMassStatus,
+        position_reports: &IndexMap<InstrumentId, Vec<PositionStatusReport>>,
+    ) -> AdjustedReports {
         let mut final_orders: IndexMap<VenueOrderId, OrderStatusReport> =
             mass_status.order_reports();
         let mut final_fills: IndexMap<VenueOrderId, Vec<FillReport>> = mass_status.fill_reports();
@@ -5147,8 +5299,8 @@ impl ExecutionManager {
 
         let mut instruments_to_adjust = Vec::new();
 
-        for (instrument_id, position_reports) in mass_status.position_reports() {
-            if !self.should_reconcile_instrument(&instrument_id) {
+        for (instrument_id, reports) in position_reports {
+            if !self.should_reconcile_instrument(instrument_id) {
                 log::debug!(
                     "Skipping fill adjustment for {instrument_id}: not in reconciliation_instrument_ids"
                 );
@@ -5157,9 +5309,7 @@ impl ExecutionManager {
 
             // Skip hedge mode instruments (have venue_position_id) as partial-window
             // adjustment assumes a single net position per instrument
-            let is_hedge_mode = position_reports
-                .iter()
-                .any(|r| r.venue_position_id.is_some());
+            let is_hedge_mode = reports.iter().any(|r| r.venue_position_id.is_some());
 
             if is_hedge_mode {
                 log::debug!(
@@ -5173,7 +5323,7 @@ impl ExecutionManager {
                 !cache
                     .positions_open(
                         None,
-                        Some(&instrument_id),
+                        Some(instrument_id),
                         None,
                         Some(&mass_status.account_id),
                         None,
@@ -5188,7 +5338,7 @@ impl ExecutionManager {
                 continue;
             }
 
-            if let Some(instrument) = self.get_instrument(&instrument_id) {
+            if let Some(instrument) = self.get_instrument(instrument_id) {
                 instruments_to_adjust.push(instrument);
             } else {
                 log::debug!(
@@ -8072,6 +8222,112 @@ mod tests {
             }),
             "activity recorded after the request started must defer A's stale report",
         );
+    }
+
+    #[rstest]
+    #[case::immediate_sync(false)]
+    #[case::delayed_sync(true)]
+    #[cfg_attr(
+        not(all(feature = "simulation", madsim)),
+        tokio::test(start_paused = true)
+    )]
+    #[cfg_attr(all(feature = "simulation", madsim), madsim::test)]
+    async fn test_convert_scope_changes_invalidate_venue_only_position_and_start_grace_period(
+        #[case] delayed_sync: bool,
+    ) {
+        use nautilus_common::messages::execution::{
+            ConvertExecutionStatus, ConvertOperationRecord, ConvertTokenAmount, SubmitConvert,
+        };
+
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
+        let cache = Rc::new(RefCell::new(Cache::default()));
+        let mut manager = ExecutionManager::new(
+            clock,
+            cache.clone(),
+            ExecutionManagerConfig {
+                position_check_threshold_ns: DurationNanos::from_secs(5),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let instrument =
+            InstrumentAny::BinaryOption(nautilus_model::instruments::stubs::binary_option());
+        let output = instrument.id();
+        let input = InstrumentId::from("INPUT.POLYMARKET");
+        let account_id = AccountId::from("POLYMARKET-001");
+        cache.borrow_mut().add_instrument(instrument).unwrap();
+        let report = PositionStatusReport::new(
+            account_id,
+            output,
+            PositionSide::Long,
+            Quantity::from("25"),
+            UnixNanos::from(5),
+            UnixNanos::from(5),
+            None,
+            None,
+            Some(Decimal::new(50, 2)),
+        );
+        let mut record = ConvertOperationRecord::new(&SubmitConvert {
+            operation_id: UUID4::new(),
+            trader_id: TraderId::from("TESTER-001"),
+            strategy_id: StrategyId::from("CONVERT-001"),
+            account_id,
+            client_id: ClientId::from("POLYMARKET"),
+            inputs: vec![ConvertTokenAmount {
+                instrument_id: input,
+                quantity: Decimal::from(25),
+            }],
+            ts_init: UnixNanos::from(1),
+        });
+        record.affected_instruments = vec![input, output];
+        record.dispatched = true;
+        record.status = Some(ConvertExecutionStatus::Unknown);
+
+        let stale_check = manager.prepare_position_report_check(UUID4::new(), &[]);
+        cache.borrow_mut().add_convert_operation(&record).unwrap();
+        record.status = Some(ConvertExecutionStatus::Rejected);
+        cache.borrow_mut().add_convert_operation(&record).unwrap();
+        let grace_elapsed = Duration::from_secs(6);
+        if delayed_sync {
+            dst::time::sleep(grace_elapsed).await;
+            manager.sync_convert_scope_activity();
+            assert!(!manager.position_activity_is_recent(&(output, account_id)));
+        } else {
+            let recent_check = manager.prepare_position_report_check(UUID4::new(), &[]);
+            let recent_events = manager.reconcile_position_reports(
+                &recent_check,
+                vec![report.clone()],
+                &IndexSet::new(),
+                &IndexSet::new(),
+            );
+            assert!(
+                recent_events.is_empty(),
+                "released scope is still within grace"
+            );
+            dst::time::sleep(grace_elapsed).await;
+        }
+        let stale_events = manager.reconcile_position_reports(
+            &stale_check,
+            vec![report.clone()],
+            &IndexSet::new(),
+            &IndexSet::new(),
+        );
+        assert!(
+            stale_events.is_empty(),
+            "scope changes invalidate old reports even after grace"
+        );
+
+        let fresh_check = manager.prepare_position_report_check(UUID4::new(), &[]);
+        let fresh_events = manager.reconcile_position_reports(
+            &fresh_check,
+            vec![report],
+            &IndexSet::new(),
+            &IndexSet::new(),
+        );
+        assert!(fresh_events.iter().any(|event| matches!(
+            event, OrderEventAny::Filled(fill)
+                if fill.account_id == account_id && fill.last_qty == Quantity::from("25")
+        )));
     }
 
     #[rstest]

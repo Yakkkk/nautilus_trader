@@ -70,6 +70,8 @@ impl LiveNode {
         intervals: ReconciliationCheckIntervals,
         state: &mut ReconciliationCheckState<'_>,
     ) {
+        self.exec_manager.sync_convert_scope_activity();
+
         if reconciliation_check_due(now, *state.last_inflight_check, intervals.inflight) {
             if self.state() == NodeState::ShuttingDown {
                 return;
