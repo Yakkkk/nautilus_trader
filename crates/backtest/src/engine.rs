@@ -305,7 +305,15 @@ impl BacktestEngine {
             frozen_account,
         );
 
-        if !use_message_queue {
+        exchange
+            .borrow_mut()
+            .set_convert_event_handler(exec_client.convert_event_handler());
+
+        if use_message_queue {
+            exchange
+                .borrow_mut()
+                .set_queued_event_handler(exec_client.queued_order_event_handler());
+        } else {
             exchange
                 .borrow_mut()
                 .set_event_handler(exec_client.order_event_handler());

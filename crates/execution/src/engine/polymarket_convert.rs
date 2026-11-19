@@ -15,28 +15,261 @@
 
 //! Core accounting for verified Polymarket Convert operations.
 
-use nautilus_common::cache::Cache;
+use indexmap::IndexMap;
 pub use nautilus_common::messages::execution::{
     ConvertTokenAmount, ConvertTransaction, VerifiedConvert,
 };
+use nautilus_common::{cache::Cache, messages::execution::has_unique_inputs};
 use nautilus_core::UUID4;
 use nautilus_model::{
     enums::{InstrumentCloseType, OmsType, PositionSide},
     identifiers::{InstrumentId, PositionId, StrategyId},
-    instruments::{Instrument, InstrumentAny},
+    instruments::{Instrument, InstrumentAny, neg_risk::CtfNegRiskEvent},
     polymarket_convert::{
         PolymarketConvertInput, PolymarketConvertOutput, allocate_convert_costs_precise,
     },
     position::{Position, PositionConvert, PositionConvertKind, PositionReplayEvent},
     types::{Currency, Quantity},
 };
-use rust_decimal::Decimal;
+use rust_decimal::{Decimal, prelude::ToPrimitive};
 use serde::{Deserialize, Serialize};
 
 use super::ExecutionEngine;
 
 /// Prefix under which all Polymarket Convert records are retained in general cache state.
 pub const CONVERT_CACHE_PREFIX: &str = "polymarket_convert:";
+
+/// The number of decimal places used by CTF and USDC chain units.
+const CHAIN_UNITS_SCALE: u32 = 6;
+
+/// The simulated asset effect of one negative-risk conversion, in instrument units.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SimulatedConvertEffect {
+    pub inputs: Vec<ConvertTokenAmount>,
+    pub outputs: Vec<ConvertTokenAmount>,
+    pub net_cash: Decimal,
+}
+
+/// Calculates the chain-unit effects of a negative-risk conversion without applying them.
+///
+/// Implements the `NegRiskAdapter.convertPositions` arithmetic:
+/// `fee_raw = floor(input_raw * fee_bps / 10000)` and `out_raw = input_raw - fee_raw`.
+/// Each unselected YES receives `out_raw`, and cash is `(input_count - 1) * out_raw`.
+///
+/// # Errors
+///
+/// Returns an error if the inputs are empty, repeated, unequal, nonpositive, not exactly
+/// representable in six chain decimal places, outside the event, or the chain-unit arithmetic
+/// overflows.
+pub fn calculate_convert_effect(
+    event: &CtfNegRiskEvent,
+    inputs: &[ConvertTokenAmount],
+) -> Result<SimulatedConvertEffect, String> {
+    if inputs.is_empty() {
+        return Err("a conversion requires at least one NO input".to_string());
+    }
+
+    if !has_unique_inputs(inputs) {
+        return Err("conversion inputs must be unique".to_string());
+    }
+
+    let mut quantity = None;
+    for input in inputs {
+        if input.quantity <= Decimal::ZERO {
+            return Err(format!(
+                "conversion quantity for {} must be positive",
+                input.instrument_id,
+            ));
+        }
+
+        if input.quantity.normalize().scale() > CHAIN_UNITS_SCALE {
+            return Err(format!(
+                "conversion quantity for {} is not representable in six chain decimal places",
+                input.instrument_id,
+            ));
+        }
+
+        if let Some(quantity) = quantity {
+            if quantity != input.quantity {
+                return Err("conversion input quantities must be equal".to_string());
+            }
+        } else {
+            quantity = Some(input.quantity);
+        }
+    }
+    let quantity =
+        quantity.ok_or_else(|| "a conversion requires at least one NO input".to_string())?;
+
+    let input_ids: Vec<_> = inputs.iter().map(|input| input.instrument_id).collect();
+    let canonical = event
+        .convert_scope(&input_ids)
+        .map_err(|e| format!("invalid conversion scope: {e}"))?;
+
+    let input_raw = chain_units(quantity, "conversion input")?;
+    let fee_raw = input_raw
+        .checked_mul(u128::from(event.fee_bps()))
+        .ok_or_else(|| "conversion fee arithmetic overflowed".to_string())?
+        / 10_000;
+    let out_raw = input_raw
+        .checked_sub(fee_raw)
+        .ok_or_else(|| "conversion fee exceeded the input amount".to_string())?;
+    let out_quantity = chain_decimal(out_raw)?;
+
+    let cash_inputs = canonical
+        .inputs
+        .len()
+        .checked_sub(1)
+        .ok_or_else(|| "a conversion requires at least one NO input".to_string())?;
+    let cash_raw = out_raw
+        .checked_mul(cash_inputs as u128)
+        .ok_or_else(|| "conversion cash arithmetic overflowed".to_string())?;
+    let net_cash = chain_decimal(cash_raw)?;
+
+    let inputs = canonical
+        .inputs
+        .iter()
+        .map(|instrument_id| ConvertTokenAmount {
+            instrument_id: *instrument_id,
+            quantity,
+        })
+        .collect();
+    let outputs = canonical
+        .outputs
+        .iter()
+        .map(|instrument_id| ConvertTokenAmount {
+            instrument_id: *instrument_id,
+            quantity: out_quantity,
+        })
+        .collect();
+
+    Ok(SimulatedConvertEffect {
+        inputs,
+        outputs,
+        net_cash,
+    })
+}
+
+/// Tracks conversion inventory consumed by a simulated venue but not yet applied by the core.
+///
+/// Matching engines subtract the reserved quantity before checking available inventory, so a
+/// second conversion or ordinary SELL cannot reuse the same NO position while accounting is
+/// still deferred.
+#[derive(Clone, Debug, Default)]
+pub struct ConvertPendingInventory {
+    reservations: IndexMap<UUID4, Vec<(PositionId, Decimal)>>,
+    consumed: IndexMap<PositionId, Decimal>,
+}
+
+impl ConvertPendingInventory {
+    /// Reserves the consumed input quantities for one conversion.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the operation already has a reservation, the legs are empty, or a
+    /// position is duplicated or nonpositive.
+    pub fn reserve(
+        &mut self,
+        operation_id: UUID4,
+        legs: Vec<(PositionId, Decimal)>,
+    ) -> Result<(), String> {
+        if self.reservations.contains_key(&operation_id) {
+            return Err(format!(
+                "conversion {operation_id} already has a pending inventory reservation"
+            ));
+        }
+
+        if legs.is_empty() {
+            return Err(
+                "a conversion inventory reservation requires at least one input".to_string(),
+            );
+        }
+
+        let mut unique = IndexMap::with_capacity(legs.len());
+        for (position_id, quantity) in &legs {
+            if *quantity <= Decimal::ZERO {
+                return Err(format!(
+                    "conversion inventory for {position_id} must be positive"
+                ));
+            }
+
+            if unique.insert(*position_id, *quantity).is_some() {
+                return Err(format!(
+                    "conversion inventory reserved {position_id} more than once"
+                ));
+            }
+        }
+
+        let mut totals = Vec::with_capacity(unique.len());
+        for (position_id, quantity) in &unique {
+            let consumed = self.consumed(position_id);
+            let total = consumed
+                .checked_add(*quantity)
+                .ok_or_else(|| format!("conversion inventory overflow for {position_id}"))?;
+            totals.push((*position_id, total));
+        }
+
+        for (position_id, total) in totals {
+            self.consumed.insert(position_id, total);
+        }
+        self.reservations.insert(operation_id, legs);
+        Ok(())
+    }
+
+    /// Releases a conversion reservation when its core accounting has applied.
+    ///
+    /// Returns whether a reservation existed.
+    pub fn release(&mut self, operation_id: UUID4) -> bool {
+        let Some(legs) = self.reservations.shift_remove(&operation_id) else {
+            return false;
+        };
+
+        for (position_id, quantity) in legs {
+            let Some(consumed) = self.consumed.get_mut(&position_id) else {
+                continue;
+            };
+
+            *consumed = consumed.saturating_sub(quantity);
+            if consumed.is_zero() {
+                self.consumed.shift_remove(&position_id);
+            }
+        }
+        true
+    }
+
+    /// Returns the pending conversion quantity consumed from the position.
+    #[must_use]
+    pub fn consumed(&self, position_id: &PositionId) -> Decimal {
+        self.consumed.get(position_id).copied().unwrap_or_default()
+    }
+
+    /// Clears all pending reservations.
+    pub fn clear(&mut self) {
+        self.reservations.clear();
+        self.consumed.clear();
+    }
+}
+
+fn chain_units(value: Decimal, field: &str) -> Result<u128, String> {
+    let units = value
+        .checked_mul(Decimal::from(1_000_000_u64))
+        .ok_or_else(|| format!("`{field}` quantity exceeds the supported decimal range"))?;
+    if !units.fract().is_zero() {
+        return Err(format!(
+            "`{field}` quantity is not exactly representable in six chain decimal places"
+        ));
+    }
+
+    units
+        .to_u128()
+        .ok_or_else(|| format!("`{field}` quantity exceeds the supported chain-unit range"))
+}
+
+fn chain_decimal(raw: u128) -> Result<Decimal, String> {
+    let raw = i128::try_from(raw)
+        .map_err(|_| "conversion chain-unit amount exceeds the decimal range".to_string())?;
+    Decimal::try_from_i128_with_scale(raw, CHAIN_UNITS_SCALE)
+        .map_err(|_| "conversion chain-unit amount exceeds the decimal range".to_string())
+}
 
 /// The locally retained accounting record for a verified Convert.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1283,4 +1516,125 @@ fn validate_convert_plan_allocations(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use nautilus_model::instruments::neg_risk::{
+        CtfNegRiskEvent, NegRiskCondition, NegRiskOutcome,
+    };
+    use rstest::rstest;
+    use rust_decimal_macros::dec;
+
+    use super::*;
+    use crate::engine::polymarket_convert::calculate_convert_effect;
+
+    fn event(fee_bps: u16) -> CtfNegRiskEvent {
+        let conditions = (0_u8..3)
+            .map(|index| NegRiskCondition {
+                index,
+                condition_id: [index + 1; 32],
+                yes: NegRiskOutcome {
+                    token_id: [index * 2 + 1; 32],
+                    instrument_id: InstrumentId::from(format!("YES-{index}.POLYMARKET")),
+                },
+                no: NegRiskOutcome {
+                    token_id: [index * 2 + 2; 32],
+                    instrument_id: InstrumentId::from(format!("NO-{index}.POLYMARKET")),
+                },
+            })
+            .collect::<Vec<_>>();
+        let mut market_id = [0; 32];
+        market_id[0] = 1;
+        CtfNegRiskEvent::new_checked(market_id, fee_bps, conditions).unwrap()
+    }
+
+    fn inputs(quantities: &[(u8, Decimal)]) -> Vec<ConvertTokenAmount> {
+        quantities
+            .iter()
+            .map(|(index, quantity)| ConvertTokenAmount {
+                instrument_id: InstrumentId::from(format!("NO-{index}.POLYMARKET")),
+                quantity: *quantity,
+            })
+            .collect()
+    }
+
+    #[rstest]
+    #[case(0, dec!(100), dec!(100), dec!(100))]
+    #[case(250, dec!(0.000003), dec!(0.000003), dec!(0.000003))]
+    #[case(250, dec!(100), dec!(97.5), dec!(97.5))]
+    fn test_convert_effect_uses_floored_chain_fee(
+        #[case] fee_bps: u16,
+        #[case] quantity: Decimal,
+        #[case] expected_output: Decimal,
+        #[case] expected_cash: Decimal,
+    ) {
+        let event = event(fee_bps);
+        let inputs = inputs(&[(0, quantity), (1, quantity)]);
+        let effect = calculate_convert_effect(&event, &inputs).unwrap();
+
+        assert_eq!(effect.outputs.len(), 1);
+        assert_eq!(effect.outputs[0].quantity, expected_output);
+        assert_eq!(effect.net_cash, expected_cash);
+    }
+
+    #[rstest]
+    fn test_convert_effect_with_no_outputs_returns_all_cash() {
+        let event = event(0);
+        let inputs = inputs(&[(0, dec!(100)), (1, dec!(100)), (2, dec!(100))]);
+        let effect = calculate_convert_effect(&event, &inputs).unwrap();
+
+        assert!(effect.outputs.is_empty());
+        assert_eq!(effect.net_cash, dec!(200));
+    }
+
+    #[rstest]
+    fn test_convert_effect_rejects_decimal_overflow_without_panicking() {
+        let event = event(0);
+        let inputs = inputs(&[(0, Decimal::MAX), (1, Decimal::MAX)]);
+
+        assert!(calculate_convert_effect(&event, &inputs).is_err());
+    }
+
+    #[rstest]
+    fn test_pending_convert_inventory_prevents_reuse_until_both_released() {
+        let position_id = PositionId::from("NO-0.POLYMARKET-CONVERT-001");
+        let first = UUID4::new();
+        let second = UUID4::new();
+        let mut inventory = ConvertPendingInventory::default();
+
+        inventory
+            .reserve(first, vec![(position_id, dec!(100))])
+            .unwrap();
+        inventory
+            .reserve(second, vec![(position_id, dec!(100))])
+            .unwrap();
+        assert_eq!(inventory.consumed(&position_id), dec!(200));
+
+        assert!(inventory.release(first));
+        assert_eq!(inventory.consumed(&position_id), dec!(100));
+        assert!(inventory.release(second));
+        assert_eq!(inventory.consumed(&position_id), Decimal::ZERO);
+        assert!(!inventory.release(second));
+    }
+
+    #[rstest]
+    fn test_pending_convert_inventory_reservation_is_atomic_on_overflow() {
+        let position_a = PositionId::from("NO-0.POLYMARKET-CONVERT-001");
+        let position_b = PositionId::from("NO-1.POLYMARKET-CONVERT-001");
+        let first = UUID4::new();
+        let second = UUID4::new();
+        let mut inventory = ConvertPendingInventory::default();
+
+        inventory
+            .reserve(first, vec![(position_a, Decimal::MAX)])
+            .unwrap();
+        let error = inventory
+            .reserve(second, vec![(position_b, dec!(1)), (position_a, dec!(1))])
+            .unwrap_err();
+
+        assert!(error.contains("overflow"), "{error}");
+        assert_eq!(inventory.consumed(&position_b), Decimal::ZERO);
+        assert_eq!(inventory.consumed(&position_a), Decimal::MAX);
+    }
 }
