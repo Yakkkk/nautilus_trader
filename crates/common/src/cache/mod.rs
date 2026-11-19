@@ -78,7 +78,7 @@ use filter::{FilterSources, intersect_pair_or_many};
 use index::CacheIndex;
 use indexmap::IndexMap;
 use nautilus_core::{
-    DurationNanos, SharedCell, UnixNanos,
+    DurationNanos, SharedCell, UUID4, UnixNanos,
     correctness::{
         check_key_not_in_map, check_predicate_false, check_slice_not_empty, check_valid_string_utf8,
     },
@@ -99,7 +99,7 @@ use nautilus_model::{
         AccountId, ActorId, ClientId, ClientOrderId, ExecAlgorithmId, InstrumentId, OrderListId,
         PositionId, StrategyId, Venue, VenueOrderId,
     },
-    instruments::{Instrument, InstrumentAny, SyntheticInstrument},
+    instruments::{Instrument, InstrumentAny, SyntheticInstrument, neg_risk::CtfNegRiskEvent},
     orderbook::{
         OrderBook,
         own::{OwnOrderBook, should_handle_own_book_order},
@@ -121,7 +121,10 @@ pub use view::CacheView; // Re-export
 
 #[cfg(feature = "defi")]
 use crate::defi::cache::IntegrityError;
-use crate::xrate::{get_exchange_rate, get_exchange_rate_with_alternates};
+use crate::{
+    messages::execution::ConvertOperationRecord,
+    xrate::{get_exchange_rate, get_exchange_rate_with_alternates},
+};
 
 /// A common in-memory `Cache` for market and execution related data.
 #[cfg_attr(
@@ -136,6 +139,8 @@ pub struct Cache {
     currencies: AHashMap<Ustr, Currency>,
     instruments: AHashMap<InstrumentId, InstrumentAny>,
     instrument_closes: AHashMap<InstrumentId, InstrumentClose>,
+    convert_events: AHashMap<[u8; 32], CtfNegRiskEvent>,
+    convert_event_index: AHashMap<InstrumentId, [u8; 32]>,
     synthetics: AHashMap<InstrumentId, SyntheticInstrument>,
     books: AHashMap<InstrumentId, OrderBook>,
     own_books: AHashMap<InstrumentId, OwnOrderBook>,
@@ -252,6 +257,8 @@ impl Cache {
             currencies: AHashMap::new(),
             instruments: AHashMap::new(),
             instrument_closes: AHashMap::new(),
+            convert_events: AHashMap::new(),
+            convert_event_index: AHashMap::new(),
             synthetics: AHashMap::new(),
             books: AHashMap::new(),
             own_books: AHashMap::new(),
@@ -2419,6 +2426,8 @@ impl Cache {
             self.defi.clear_currencies();
             self.currencies.clear();
             self.instruments.clear();
+            self.convert_events.clear();
+            self.convert_event_index.clear();
             self.synthetics.clear();
         }
 
@@ -2482,6 +2491,94 @@ impl Cache {
             )?;
         }
         Ok(())
+    }
+
+    /// Adds a complete parsed negative-risk event for conversion admission.
+    ///
+    /// Re-adding an identical mapping is idempotent. Registering a different event for an
+    /// instrument that is already mapped is rejected without changing either event.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the mapping conflicts with an existing event.
+    pub fn add_convert_event(&mut self, event: CtfNegRiskEvent) -> anyhow::Result<()> {
+        let market_id = event.market_id();
+
+        if let Some(existing) = self.convert_events.get(&market_id) {
+            anyhow::ensure!(
+                existing == &event,
+                "negative-risk event {} conflicts with the existing mapping",
+                nautilus_core::hex::encode_prefixed(market_id),
+            );
+            return Ok(());
+        }
+
+        for condition in event.conditions() {
+            for instrument_id in [condition.yes.instrument_id, condition.no.instrument_id] {
+                if let Some(existing) = self.convert_event_index.get(&instrument_id) {
+                    anyhow::ensure!(
+                        existing == &market_id,
+                        "negative-risk instrument {instrument_id} is already mapped to event {}",
+                        nautilus_core::hex::encode_prefixed(*existing),
+                    );
+                }
+            }
+        }
+
+        for condition in event.conditions() {
+            for instrument_id in [condition.yes.instrument_id, condition.no.instrument_id] {
+                self.convert_event_index.insert(instrument_id, market_id);
+            }
+        }
+
+        self.convert_events.insert(market_id, event);
+        Ok(())
+    }
+
+    /// Returns the parsed negative-risk event containing the given instrument.
+    #[must_use]
+    pub fn convert_event_for_instrument(
+        &self,
+        instrument_id: &InstrumentId,
+    ) -> Option<&CtfNegRiskEvent> {
+        self.convert_event_index
+            .get(instrument_id)
+            .and_then(|market_id| self.convert_events.get(market_id))
+    }
+
+    /// Loads a retained Convert operation record.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the retained record cannot be decoded.
+    pub fn load_convert_operation(
+        &self,
+        operation_id: UUID4,
+    ) -> anyhow::Result<Option<ConvertOperationRecord>> {
+        let key = ConvertOperationRecord::cache_key(operation_id);
+        let Some(value) = self.get(&key)? else {
+            return Ok(None);
+        };
+        let record = serde_json::from_slice(value).map_err(|e| {
+            anyhow::anyhow!("failed to decode Convert operation record {operation_id}: {e}")
+        })?;
+        Ok(Some(record))
+    }
+
+    /// Stores a Convert operation record in general cache state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the record cannot be encoded or the cache write fails.
+    pub fn add_convert_operation(&mut self, record: &ConvertOperationRecord) -> anyhow::Result<()> {
+        let key = ConvertOperationRecord::cache_key(record.operation_id);
+        let value = serde_json::to_vec(record).map_err(|e| {
+            anyhow::anyhow!(
+                "failed to encode Convert operation record {}: {e}",
+                record.operation_id,
+            )
+        })?;
+        self.add(&key, value.into())
     }
 
     /// Adds an `OrderBook` to the cache.

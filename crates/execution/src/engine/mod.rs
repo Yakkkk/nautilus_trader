@@ -26,6 +26,8 @@ pub mod position;
 pub mod settlement;
 pub mod stubs;
 
+mod convert;
+
 use std::{
     borrow::Cow,
     cell::{Cell, RefCell, RefMut},
@@ -50,8 +52,9 @@ use nautilus_common::{
     messages::{
         ExecutionReport,
         execution::{
-            BatchCancelOrders, BatchModifyOrders, CancelAllOrders, CancelOrder, ModifyOrder,
-            QueryAccount, QueryOrder, SubmitOrder, SubmitOrderList, TradingCommand,
+            BatchCancelOrders, BatchModifyOrders, CancelAllOrders, CancelOrder,
+            ConvertExecutionEvent, ModifyOrder, QueryAccount, QueryOrder, SubmitOrder,
+            SubmitOrderList, TradingCommand,
         },
     },
     msgbus::{
@@ -254,6 +257,16 @@ impl ExecutionEngine {
             TypedIntoHandler::from(move |report: ExecutionReport| {
                 if let Some(rc) = weak3.upgrade() {
                     rc.borrow_mut().reconcile_execution_report(&report);
+                }
+            }),
+        );
+
+        let weak4 = WeakCell::from(Rc::downgrade(engine));
+        msgbus::register_any(
+            MessagingSwitchboard::exec_engine_process_convert(),
+            ShareableMessageHandler::from_typed(move |event: &ConvertExecutionEvent| {
+                if let Some(rc) = weak4.upgrade() {
+                    rc.borrow_mut().handle_convert_event(event.clone());
                 }
             }),
         );
@@ -2222,6 +2235,20 @@ impl ExecutionEngine {
             }
         }
 
+        // Convert commands never use external order topics or the generic routing fallbacks.
+        match &command {
+            TradingCommand::SubmitConvert(cmd) => {
+                self.handle_submit_convert(cmd);
+                return;
+            }
+            TradingCommand::QueryConvert(cmd) => {
+                let cmd = cmd.clone();
+                self.handle_query_convert(cmd);
+                return;
+            }
+            _ => {}
+        }
+
         if let Some(cid) = command.client_id()
             && self.external_clients.contains(&cid)
         {
@@ -2249,11 +2276,11 @@ impl ExecutionEngine {
             return;
         }
 
-        let client = if let Some(adapter) = self.find_client_for_command(&command) {
-            adapter.client.as_ref()
-        } else {
+        let Some(client) = self
+            .find_client_for_command(&command)
+            .map(|adapter| adapter.client.as_ref())
+        else {
             self.deny_unroutable_command(command);
-
             return;
         };
 
@@ -2267,6 +2294,9 @@ impl ExecutionEngine {
             TradingCommand::CancelAllOrders(cmd) => self.handle_cancel_all_orders(client, &cmd),
             TradingCommand::QueryOrder(cmd) => self.handle_query_order(client, cmd),
             TradingCommand::QueryAccount(cmd) => self.handle_query_account(client, cmd),
+            TradingCommand::SubmitConvert(_) | TradingCommand::QueryConvert(_) => {
+                unreachable!("Convert commands are handled before client selection")
+            }
         }
     }
 
@@ -2452,6 +2482,12 @@ impl ExecutionEngine {
                 let issuer = cmd.account_id.get_issuer();
                 format!("account_id={}, issuer={issuer}", cmd.account_id)
             }
+            TradingCommand::SubmitConvert(cmd) => {
+                format!("account_id={}, client_id={}", cmd.account_id, cmd.client_id)
+            }
+            TradingCommand::QueryConvert(cmd) => {
+                format!("account_id={}, client_id={}", cmd.account_id, cmd.client_id)
+            }
             _ => format!("venue={}", command.instrument_id().venue),
         }
     }
@@ -2495,6 +2531,8 @@ impl ExecutionEngine {
     fn account_id_for_command(&self, command: &TradingCommand) -> Option<AccountId> {
         match command {
             TradingCommand::QueryAccount(cmd) => Some(cmd.account_id),
+            TradingCommand::SubmitConvert(cmd) => Some(cmd.account_id),
+            TradingCommand::QueryConvert(cmd) => Some(cmd.account_id),
             TradingCommand::SubmitOrder(cmd) => self
                 .cache
                 .borrow()
@@ -2529,6 +2567,7 @@ impl ExecutionEngine {
             TradingCommand::CancelAllOrders(cmd) => Some(cmd.instrument_id),
             TradingCommand::QueryOrder(cmd) => Some(cmd.instrument_id),
             TradingCommand::QueryAccount(_) => None,
+            TradingCommand::SubmitConvert(_) | TradingCommand::QueryConvert(_) => None,
         }
     }
 

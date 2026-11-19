@@ -32,8 +32,9 @@ use nautilus_common::{
     enums::ComponentState,
     logging::{CMD, EVT, RECV, SEND},
     messages::execution::{
-        BatchCancelOrders, BatchModifyOrders, CancelAllOrders, CancelOrder, ModifyOrder,
-        QueryAccount, QueryOrder, SubmitOrder, SubmitOrderList, TradingCommand,
+        BatchCancelOrders, BatchModifyOrders, CancelAllOrders, CancelOrder, ConvertResult,
+        ConvertTokenAmount, ModifyOrder, QueryAccount, QueryConvert, QueryOrder, SubmitConvert,
+        SubmitOrder, SubmitOrderList, TradingCommand,
     },
     msgbus::{self, MessagingSwitchboard},
     timer::TimeEvent,
@@ -1299,6 +1300,43 @@ pub trait Strategy: DataActor {
         Ok(())
     }
 
+    /// Submits a negative-risk conversion and returns its stable operation ID.
+    ///
+    /// The command is routed through the risk engine. The returned ID identifies the operation
+    /// for later queries and result callbacks.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the strategy is not registered.
+    fn submit_convert(
+        &mut self,
+        inputs: Vec<ConvertTokenAmount>,
+        account_id: AccountId,
+        client_id: ClientId,
+        operation_id: Option<UUID4>,
+    ) -> anyhow::Result<UUID4>
+    where
+        Self: StrategyNative,
+    {
+        let core = StrategyNative::strategy_core_mut(self);
+        let trader_id = registered_trader_id(core)?;
+        let strategy_id = registered_strategy_id(core)?;
+        let ts_init = core.clock_mut().timestamp_ns();
+        let operation_id = operation_id.unwrap_or_default();
+
+        let command = SubmitConvert {
+            operation_id,
+            trader_id,
+            strategy_id,
+            account_id,
+            client_id,
+            inputs,
+            ts_init,
+        };
+        send_risk_command(TradingCommand::SubmitConvert(command));
+        Ok(operation_id)
+    }
+
     /// Queries account state from the execution client.
     ///
     /// Creates a [`QueryAccount`] command and sends it to the execution engine,
@@ -1332,6 +1370,37 @@ pub trait Strategy: DataActor {
         );
 
         send_exec_command(TradingCommand::QueryAccount(command));
+        Ok(())
+    }
+
+    /// Queries the original conversion without submitting a new conversion.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the strategy is not registered.
+    fn query_convert(
+        &mut self,
+        operation_id: UUID4,
+        account_id: AccountId,
+        client_id: ClientId,
+    ) -> anyhow::Result<()>
+    where
+        Self: StrategyNative,
+    {
+        let core = StrategyNative::strategy_core_mut(self);
+        let trader_id = registered_trader_id(core)?;
+        let strategy_id = registered_strategy_id(core)?;
+        let ts_init = core.clock_mut().timestamp_ns();
+
+        let command = QueryConvert {
+            operation_id,
+            trader_id,
+            strategy_id,
+            account_id,
+            client_id,
+            ts_init,
+        };
+        send_exec_command(TradingCommand::QueryConvert(command));
         Ok(())
     }
 
@@ -1547,6 +1616,27 @@ pub trait Strategy: DataActor {
         self.on_position_event(event);
     }
 
+    /// Handles conversion evidence and accounting results for this strategy.
+    fn handle_convert_result(&mut self, result: ConvertResult)
+    where
+        Self: StrategyNative,
+    {
+        let state = {
+            let core = StrategyNative::strategy_core_mut(self);
+            if core.actor.config.log_events {
+                let id = &core.actor.actor_id;
+                log::info!("{id} {RECV}{EVT} {result:?}");
+            }
+            core.actor.state()
+        };
+
+        if state != ComponentState::Running {
+            return;
+        }
+
+        self.on_convert_result(result);
+    }
+
     // -- LIFECYCLE METHODS -----------------------------------------------------------------------
 
     /// Called when the strategy is started.
@@ -1728,6 +1818,10 @@ pub trait Strategy: DataActor {
     /// Override this method to implement custom logic when a position is closed.
     #[allow(unused_variables)]
     fn on_position_closed(&mut self, event: PositionClosed) {}
+
+    /// Called when conversion execution evidence or local accounting changes.
+    #[allow(unused_variables)]
+    fn on_convert_result(&mut self, result: ConvertResult) {}
 
     /// Called when a market exit has been initiated.
     ///

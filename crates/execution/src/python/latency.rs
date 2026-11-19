@@ -117,6 +117,13 @@ impl PythonLatencyModel {
         command: &TradingCommand,
         ts_now: UnixNanos,
     ) -> anyhow::Result<DurationNanos> {
+        if matches!(
+            command,
+            TradingCommand::SubmitConvert(_) | TradingCommand::QueryConvert(_)
+        ) {
+            return Ok(self.get_base_latency());
+        }
+
         Python::attach(|py| -> PyResult<DurationNanos> {
             let command = match command {
                 TradingCommand::SubmitOrder(cmd) => cmd.clone().into_py_any(py)?,
@@ -128,6 +135,9 @@ impl PythonLatencyModel {
                 TradingCommand::CancelAllOrders(cmd) => cmd.clone().into_py_any(py)?,
                 TradingCommand::QueryOrder(cmd) => cmd.clone().into_py_any(py)?,
                 TradingCommand::QueryAccount(cmd) => cmd.clone().into_py_any(py)?,
+                TradingCommand::SubmitConvert(_) | TradingCommand::QueryConvert(_) => {
+                    unreachable!("Convert commands return the base latency before dispatch")
+                }
             };
 
             let latency = self

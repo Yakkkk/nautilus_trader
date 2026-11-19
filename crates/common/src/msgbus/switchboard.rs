@@ -53,6 +53,7 @@ static TIME_EVENT_TOPIC_MSTR: OnceLock<MStr<Topic>> = OnceLock::new();
 static EXEC_QUEUE_COMMAND_ENDPOINT: OnceLock<MStr<Endpoint>> = OnceLock::new();
 static EXEC_EXECUTE_ENDPOINT: OnceLock<MStr<Endpoint>> = OnceLock::new();
 static EXEC_PROCESS_ENDPOINT: OnceLock<MStr<Endpoint>> = OnceLock::new();
+static EXEC_PROCESS_CONVERT_ENDPOINT: OnceLock<MStr<Endpoint>> = OnceLock::new();
 static EXEC_RECONCILE_REPORT_ENDPOINT: OnceLock<MStr<Endpoint>> = OnceLock::new();
 static RISK_EXECUTE_ENDPOINT: OnceLock<MStr<Endpoint>> = OnceLock::new();
 static RISK_QUEUE_EXECUTE_ENDPOINT: OnceLock<MStr<Endpoint>> = OnceLock::new();
@@ -188,6 +189,13 @@ macro_rules! define_switchboard {
             #[must_use]
             pub fn exec_engine_process() -> MStr<Endpoint> {
                 *EXEC_PROCESS_ENDPOINT.get_or_init(|| "ExecEngine.process".into())
+            }
+
+            #[inline]
+            #[must_use]
+            pub fn exec_engine_process_convert() -> MStr<Endpoint> {
+                *EXEC_PROCESS_CONVERT_ENDPOINT
+                    .get_or_init(|| "ExecEngine.process_convert".into())
             }
 
             #[inline]
@@ -524,6 +532,10 @@ define_switchboard! {
     get_event_position_topic(strategy_id: StrategyId) -> strategy_id,
     "events.position.{}", strategy_id;
 
+    event_convert_topics: StrategyId,
+    get_event_convert_topic(strategy_id: StrategyId) -> strategy_id,
+    "events.convert.{}", strategy_id;
+
     snapshot_order_topics: ClientOrderId,
     get_snapshot_order_topic(client_order_id: ClientOrderId) -> client_order_id,
     "snapshots.order.{}", client_order_id;
@@ -738,6 +750,7 @@ define_wrappers! {
     get_snapshot_position_topic(position_id: PositionId) -> MStr<Topic>,
     get_event_order_topic(strategy_id: StrategyId) -> MStr<Topic>,
     get_event_position_topic(strategy_id: StrategyId) -> MStr<Topic>,
+    get_event_convert_topic(strategy_id: StrategyId) -> MStr<Topic>,
 }
 
 /// Returns a wildcard subscription pattern that matches all instrument topics

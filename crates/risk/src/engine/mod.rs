@@ -17,6 +17,8 @@
 
 pub mod config;
 
+mod convert;
+
 use std::{cell::RefCell, fmt::Debug, rc::Rc};
 
 use ahash::AHashMap;
@@ -574,6 +576,12 @@ impl RiskEngine {
             }
             TradingCommand::QueryAccount(query_account) => {
                 Self::send_to_execution(TradingCommand::QueryAccount(query_account));
+            }
+            TradingCommand::SubmitConvert(submit_convert) => {
+                self.handle_submit_convert(submit_convert);
+            }
+            TradingCommand::QueryConvert(query_convert) => {
+                Self::send_to_execution(TradingCommand::QueryConvert(query_convert));
             }
             _ => {
                 log::error!("Cannot handle command: {command}");

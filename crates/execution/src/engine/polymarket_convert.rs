@@ -16,16 +16,19 @@
 //! Core accounting for verified Polymarket Convert operations.
 
 use nautilus_common::cache::Cache;
-use nautilus_core::{UUID4, UnixNanos};
+pub use nautilus_common::messages::execution::{
+    ConvertTokenAmount, ConvertTransaction, VerifiedConvert,
+};
+use nautilus_core::UUID4;
 use nautilus_model::{
     enums::{InstrumentCloseType, OmsType, PositionSide},
-    identifiers::{AccountId, InstrumentId, PositionId, StrategyId, TraderId},
+    identifiers::{InstrumentId, PositionId, StrategyId},
     instruments::{Instrument, InstrumentAny},
     polymarket_convert::{
         PolymarketConvertInput, PolymarketConvertOutput, allocate_convert_costs_precise,
     },
     position::{Position, PositionConvert, PositionConvertKind, PositionReplayEvent},
-    types::{Currency, Money, Quantity},
+    types::{Currency, Quantity},
 };
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -34,40 +37,6 @@ use super::ExecutionEngine;
 
 /// Prefix under which all Polymarket Convert records are retained in general cache state.
 pub const CONVERT_CACHE_PREFIX: &str = "polymarket_convert:";
-
-/// Original wallet and transaction context supplied by the verifier.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ConvertTransaction {
-    pub wallet: String,
-    pub relayer_transaction_id: Option<String>,
-    pub transaction_hash: Option<String>,
-    /// The original wallet nonce as an unsigned decimal string.
-    pub nonce: Option<String>,
-    pub call_summary: Option<String>,
-}
-
-/// A verified token amount in instrument units, not raw chain units.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ConvertTokenAmount {
-    pub instrument_id: InstrumentId,
-    pub quantity: Decimal,
-}
-
-/// The verified effects of a single Convert; network verification is the caller's responsibility.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct VerifiedConvert {
-    pub operation_id: UUID4,
-    pub trader_id: TraderId,
-    pub strategy_id: StrategyId,
-    pub account_id: AccountId,
-    pub transaction: ConvertTransaction,
-    pub inputs: Vec<ConvertTokenAmount>,
-    pub outputs: Vec<ConvertTokenAmount>,
-    /// Includes every consumed NO and every potential YES, including zero or absent outputs.
-    pub affected_instruments: Vec<InstrumentId>,
-    pub net_cash: Money,
-    pub ts_event: UnixNanos,
-}
 
 /// The locally retained accounting record for a verified Convert.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -917,31 +886,48 @@ fn merge_verified_convert(
         return Err("net cash effect differed".to_string());
     }
 
-    let mut transaction = original.transaction.clone();
-    merge_optional(
-        &mut transaction.relayer_transaction_id,
-        incoming.transaction.relayer_transaction_id.as_deref(),
-        "relayer transaction ID",
-    )?;
-    merge_optional(
-        &mut transaction.transaction_hash,
-        incoming.transaction.transaction_hash.as_deref(),
-        "transaction hash",
-    )?;
-    merge_optional(
-        &mut transaction.nonce,
-        incoming.transaction.nonce.as_deref(),
-        "wallet nonce",
-    )?;
-    merge_optional(
-        &mut transaction.call_summary,
-        incoming.transaction.call_summary.as_deref(),
-        "call summary",
-    )?;
+    let transaction = merge_convert_transaction(&original.transaction, &incoming.transaction)?;
     let transaction_changed = original.transaction != transaction;
     original.transaction = transaction;
 
     Ok(transaction_changed)
+}
+
+/// Merges compatible original-transaction contexts without combining unrelated locators.
+///
+/// # Errors
+///
+/// Returns an error if wallets differ or an existing locator field conflicts.
+pub(crate) fn merge_convert_transaction(
+    original: &ConvertTransaction,
+    incoming: &ConvertTransaction,
+) -> Result<ConvertTransaction, String> {
+    if original.wallet != incoming.wallet {
+        return Err("wallet identity differed".to_string());
+    }
+
+    let mut transaction = original.clone();
+    merge_optional(
+        &mut transaction.relayer_transaction_id,
+        incoming.relayer_transaction_id.as_deref(),
+        "relayer transaction ID",
+    )?;
+    merge_optional(
+        &mut transaction.transaction_hash,
+        incoming.transaction_hash.as_deref(),
+        "transaction hash",
+    )?;
+    merge_optional(
+        &mut transaction.nonce,
+        incoming.nonce.as_deref(),
+        "wallet nonce",
+    )?;
+    merge_optional(
+        &mut transaction.call_summary,
+        incoming.call_summary.as_deref(),
+        "call summary",
+    )?;
+    Ok(transaction)
 }
 
 fn merge_optional(
@@ -1044,11 +1030,22 @@ fn validate_convert_position(
     Ok(())
 }
 
-fn convert_position_id(instrument_id: InstrumentId, strategy_id: StrategyId) -> PositionId {
+/// Returns the canonical netting position ID targeted by a conversion.
+#[must_use]
+pub fn convert_position_id(instrument_id: InstrumentId, strategy_id: StrategyId) -> PositionId {
     PositionId::new(format!("{instrument_id}-{strategy_id}"))
 }
 
-fn exact_convert_quantity(value: Decimal, precision: u8, field: &str) -> Result<Quantity, String> {
+/// Converts a decimal quantity to chain-facing units without rounding.
+///
+/// # Errors
+///
+/// Returns an error if the quantity is negative or cannot be represented exactly at `precision`.
+pub fn exact_convert_quantity(
+    value: Decimal,
+    precision: u8,
+    field: &str,
+) -> Result<Quantity, String> {
     if value < Decimal::ZERO {
         return Err(format!("`{field}` quantity cannot be negative"));
     }

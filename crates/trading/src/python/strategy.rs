@@ -42,6 +42,7 @@ use nautilus_common::{
             DataResponseEnvelope, ensure_routable_bar_types, ensure_routable_instrument_ids,
             ensure_subscription_routes, quote_routing,
         },
+        execution::{ConvertResult, ConvertTokenAmount},
         system::{QueueStateChanged, SocketStateChanged},
     },
     msgbus::TypedHandler,
@@ -61,7 +62,7 @@ use nautilus_common::{
     timer::{TimeEvent, TimeEventCallback},
 };
 use nautilus_core::{
-    Params, UnixNanos,
+    Params, UUID4, UnixNanos,
     correctness::{CorrectnessResult, CorrectnessResultExt, FAILED},
     from_pydict,
     python::{to_pyruntime_err, to_pyvalue_err, upgrade_py_weakref},
@@ -101,11 +102,15 @@ use pyo3::{
     prelude::*,
     types::{PyBytes, PyDict, PyList, PySet, PyWeakrefReference},
 };
+use rust_decimal::Decimal;
 use ustr::Ustr;
 
-use crate::strategy::{
-    BatchModifyOrder, ImportableStrategyConfig, Strategy, StrategyConfig, StrategyCore,
-    StrategyNative, route_time_event,
+use crate::{
+    python::convert::PyConvertResult,
+    strategy::{
+        BatchModifyOrder, ImportableStrategyConfig, Strategy, StrategyConfig, StrategyCore,
+        StrategyNative, route_time_event,
+    },
 };
 
 #[pyo3::pymethods]
@@ -666,6 +671,16 @@ impl PyStrategyInner {
         Ok(())
     }
 
+    fn dispatch_on_convert_result(&self, result: ConvertResult) -> PyResult<()> {
+        if let Some(py_self) = self.python_instance()? {
+            Python::attach(|py| {
+                let result = PyConvertResult::from(result);
+                py_self.call_method1(py, "on_convert_result", (result.into_py_any(py)?,))
+            })?;
+        }
+        Ok(())
+    }
+
     fn dispatch_on_data(&mut self, data: Py<PyAny>) -> PyResult<()> {
         if let Some(py_self) = self.python_instance()? {
             Python::attach(|py| py_self.call_method1(py, "on_data", (data,)))?;
@@ -1141,6 +1156,11 @@ impl Strategy for PyStrategyInner {
             "on_position_closed",
             self.dispatch_on_position_closed(event),
         );
+    }
+
+    fn on_convert_result(&mut self, result: ConvertResult) {
+        self.logger
+            .log_callback_error("on_convert_result", self.dispatch_on_convert_result(result));
     }
 }
 
@@ -2097,6 +2117,48 @@ impl PyStrategy {
             .map_err(to_pyruntime_err)
     }
 
+    /// Submits a negative-risk conversion and returns its stable operation ID.
+    ///
+    /// `inputs` contains `(instrument_id, quantity)` pairs for the NO outcomes to consume.
+    #[pyo3(name = "submit_convert")]
+    #[pyo3(signature = (inputs, account_id, client_id, operation_id=None))]
+    fn py_submit_convert(
+        &mut self,
+        inputs: Vec<(InstrumentId, Decimal)>,
+        account_id: AccountId,
+        client_id: ClientId,
+        operation_id: Option<UUID4>,
+    ) -> PyResult<UUID4> {
+        let inputs = inputs
+            .into_iter()
+            .map(|(instrument_id, quantity)| ConvertTokenAmount {
+                instrument_id,
+                quantity,
+            })
+            .collect();
+
+        Strategy::submit_convert(
+            self.inner_mut(),
+            inputs,
+            account_id,
+            client_id,
+            operation_id,
+        )
+        .map_err(to_pyruntime_err)
+    }
+
+    /// Queries the original conversion without submitting a new conversion.
+    #[pyo3(name = "query_convert")]
+    fn py_query_convert(
+        &mut self,
+        operation_id: UUID4,
+        account_id: AccountId,
+        client_id: ClientId,
+    ) -> PyResult<()> {
+        Strategy::query_convert(self.inner_mut(), operation_id, account_id, client_id)
+            .map_err(to_pyruntime_err)
+    }
+
     #[pyo3(name = "modify_order")]
     #[pyo3(signature = (client_order_id, quantity=None, price=None, trigger_price=None, client_id=None, params=None))]
     fn py_modify_order(
@@ -2540,6 +2602,10 @@ impl PyStrategy {
     #[allow(unused_variables, clippy::needless_pass_by_value)]
     #[pyo3(name = "on_position_closed")]
     fn py_on_position_closed(_slf: &Bound<'_, Self>, event: PositionClosed) {}
+
+    #[allow(unused_variables, clippy::needless_pass_by_value)]
+    #[pyo3(name = "on_convert_result")]
+    fn py_on_convert_result(_slf: &Bound<'_, Self>, result: PyConvertResult) {}
 
     #[allow(unused_variables, clippy::needless_pass_by_value)]
     #[pyo3(name = "on_data_response")]

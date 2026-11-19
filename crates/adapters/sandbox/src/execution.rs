@@ -1372,6 +1372,9 @@ impl SandboxInner {
             TradingCommand::CancelOrders(cmd) => self.apply_batch_cancel_orders(cmd),
             TradingCommand::CancelAllOrders(cmd) => self.apply_cancel_all_orders(cmd),
             TradingCommand::QueryOrder(_) | TradingCommand::QueryAccount(_) => {}
+            TradingCommand::SubmitConvert(_) | TradingCommand::QueryConvert(_) => {
+                anyhow::bail!("Sandbox execution does not support Convert")
+            }
         }
         Ok(())
     }
@@ -1460,6 +1463,7 @@ impl SandboxInner {
             // Cancel-all carries no individual command IDs to deny
             TradingCommand::CancelAllOrders(_) => {}
             TradingCommand::QueryOrder(_) | TradingCommand::QueryAccount(_) => {}
+            TradingCommand::SubmitConvert(_) | TradingCommand::QueryConvert(_) => {}
         }
     }
 
@@ -1808,6 +1812,9 @@ impl SandboxInner {
                 latency_model.get_delete_latency(command, ts_now)
             }
             TradingCommand::QueryOrder(_) | TradingCommand::QueryAccount(_) => {
+                Ok(DurationNanos::ZERO)
+            }
+            TradingCommand::SubmitConvert(_) | TradingCommand::QueryConvert(_) => {
                 Ok(DurationNanos::ZERO)
             }
         }
