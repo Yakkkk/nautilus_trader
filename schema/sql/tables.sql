@@ -304,7 +304,8 @@ CREATE TABLE IF NOT EXISTS "position"(
     strategy_id TEXT NOT NULL,
     instrument_id TEXT REFERENCES instrument(id) ON DELETE CASCADE,
     account_id TEXT NOT NULL,
-    opening_order_id TEXT NOT NULL,
+    opening_order_id TEXT,
+    opening_operation_id TEXT,
     closing_order_id TEXT,  -- REFERENCES TBD
     entry TEXT NOT NULL,
     side TEXT NOT NULL,
@@ -331,6 +332,8 @@ CREATE TABLE IF NOT EXISTS "position"(
     PRIMARY KEY (trader_id, id)
 );
 ALTER TABLE "position" ADD COLUMN IF NOT EXISTS replay_state JSONB;
+ALTER TABLE "position" ADD COLUMN IF NOT EXISTS opening_operation_id TEXT;
+ALTER TABLE "position" ALTER COLUMN opening_order_id DROP NOT NULL;
 
 CREATE TABLE IF NOT EXISTS "account_event"(
     id TEXT PRIMARY KEY NOT NULL,

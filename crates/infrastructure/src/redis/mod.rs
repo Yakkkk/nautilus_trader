@@ -30,6 +30,7 @@ use redis::RedisError;
 
 const REDIS_MIN_VERSION: &str = "6.2.0";
 const REDIS_DELIMITER: char = ':';
+pub(crate) const POSITION_REPLAY_PREFIX: &str = "position-replay";
 const REDIS_INDEX_PATTERN: &str = ":index:";
 const REDIS_XTRIM: &str = "XTRIM";
 const REDIS_MINID: &str = "MINID";

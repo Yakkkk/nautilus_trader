@@ -52,7 +52,7 @@ mod serial_tests {
                 cash_account_state_multi_changed_btc, wallet_account_state,
                 wallet_account_state_changed,
             },
-            order::spec::OrderFillVoidedSpec,
+            order::spec::{OrderFillVoidedSpec, OrderFilledSpec},
         },
         identifiers::{
             AccountId, ActorId, ClientId, ClientOrderId, InstrumentId, PositionId, StrategyId,
@@ -79,6 +79,8 @@ mod serial_tests {
     use serde::Serialize;
     use sqlx::{AssertSqlSafe, FromRow, PgPool, postgres::PgConnectOptions};
     use ustr::Ustr;
+
+    use crate::position_convert::{assert_same_position, convert_position};
 
     pub(crate) fn assert_entirely_equal<T: Serialize>(a: T, b: T) {
         let a_serialized = serde_json::to_string(&a).unwrap();
@@ -2196,6 +2198,8 @@ mod serial_tests {
         };
         closed_position.apply(&close_fill);
         pg_cache.update_position(&closed_position).unwrap();
+        let snapshot = PositionSnapshot::from(&closed_position, None);
+        pg_cache.add_position_snapshot(&snapshot).unwrap();
 
         let OrderEventAny::Filled(reopen_fill) = TestOrderEventStubs::filled(
             &reopen_order,
@@ -2238,6 +2242,10 @@ mod serial_tests {
         .unwrap();
 
         assert_eq!(events, reopened_position.events.clone());
+        assert_eq!(
+            pg_cache.load_position_snapshot(&position_id).unwrap(),
+            Some(snapshot)
+        );
 
         reset_test_database(&pg_cache).await;
         pg_cache.close().unwrap();
@@ -3338,6 +3346,89 @@ mod serial_tests {
                 (String::from("type"), expected_owner),
             ]
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_convert_position_snapshot_migrates_legacy_schema() {
+        let options = get_postgres_connect_options(None, None, None, None, None);
+        let mut database = get_test_pg_cache_database().await.unwrap();
+        reset_test_database(&database).await;
+        let trader_id = TraderId::default();
+        let instrument = InstrumentAny::BinaryOption(binary_option());
+        let converted = convert_position(trader_id, &instrument);
+        DatabaseQueries::add_currency(&database.pool, instrument.quote_currency())
+            .await
+            .unwrap();
+        DatabaseQueries::add_instrument(&database.pool, "BINARY_OPTION", Box::new(binary_option()))
+            .await
+            .unwrap();
+        let legacy_id = PositionId::from("P-LEGACY-CLOB");
+        let legacy_fill = OrderFilledSpec::builder()
+            .trader_id(trader_id)
+            .instrument_id(instrument.id())
+            .account_id(converted.account_id)
+            .position_id(legacy_id)
+            .last_qty(Quantity::from("3.00"))
+            .last_px(Price::from("0.500"))
+            .currency(instrument.quote_currency())
+            .event_id(UUID4::new())
+            .build();
+        let legacy = Position::new(&instrument, legacy_fill.clone());
+        DatabaseQueries::add_position(&database.pool, legacy_id, &legacy_fill)
+            .await
+            .unwrap();
+        DatabaseQueries::add_position_snapshot(
+            &database.pool,
+            PositionSnapshot::from(&legacy, None),
+        )
+        .await
+        .unwrap();
+        sqlx::raw_sql(
+            "ALTER TABLE position
+               DROP COLUMN opening_operation_id,
+               ALTER COLUMN opening_order_id SET NOT NULL",
+        )
+        .execute(&database.pool)
+        .await
+        .unwrap();
+        let schema_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../schema/sql").to_string();
+        let pool = connect_test_pg(options.clone().into()).await.unwrap();
+        init_postgres(&pool, options.database, options.password, Some(schema_dir))
+            .await
+            .unwrap();
+
+        let without_replay = PositionSnapshot::from(&converted, None);
+        DatabaseQueries::add_position_snapshot(&database.pool, without_replay.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            DatabaseQueries::load_position_snapshot(&database.pool, &converted.id, &trader_id)
+                .await
+                .unwrap(),
+            Some(without_replay),
+        );
+        let saved = PositionSnapshot::from_replay_state(&converted, None);
+        DatabaseQueries::add_position_snapshot(&database.pool, saved.clone())
+            .await
+            .unwrap();
+        let loaded_snapshot =
+            DatabaseQueries::load_position_snapshot(&database.pool, &converted.id, &trader_id)
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(loaded_snapshot, saved);
+        assert!(
+            DatabaseQueries::load_position_events(&database.pool, &converted.id, &trader_id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let positions = database.load_positions().await.unwrap();
+        assert_eq!(positions.len(), 2);
+        assert_same_position(&positions[&converted.id], &converted);
+        assert_same_position(&positions[&legacy_id], &legacy);
+        reset_test_database(&database).await;
+        database.close().unwrap();
     }
 
     // Extracts the guarded order-column migration from the real schema file, so the test runs the

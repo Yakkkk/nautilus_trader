@@ -86,10 +86,10 @@ use redis::{AsyncCommands, Pipeline, aio::ConnectionManager};
 use serde::{Deserialize, Serialize};
 use ustr::Ustr;
 
-use super::{REDIS_DELIMITER, REDIS_FLUSHDB, get_index_key};
+use super::{POSITION_REPLAY_PREFIX, REDIS_DELIMITER, REDIS_FLUSHDB, get_index_key};
 use crate::redis::{
     RedisConnectionConfig, create_redis_connection,
-    queries::{CurrencyRecord, DatabaseQueries},
+    queries::{CurrencyRecord, DatabaseQueries, PositionReplayAuthority},
 };
 
 // Task and connection names
@@ -269,6 +269,12 @@ pub enum DatabaseOperation {
     },
     Insert,
     Update,
+    WritePosition {
+        fill: Option<Bytes>,
+        snapshot: Option<Bytes>,
+        authority: Bytes,
+        replace_fills: bool,
+    },
     UpdateOrder,
     ReplaceList,
     Delete,
@@ -670,6 +676,9 @@ impl RedisCacheDatabase {
             "{SNAPSHOTS}{REDIS_DELIMITER}{POSITIONS}{REDIS_DELIMITER}{position_id}"
         ))?;
         self.delete_key(format!(
+            "{POSITION_REPLAY_PREFIX}{REDIS_DELIMITER}{position_id}"
+        ))?;
+        self.delete_key(format!(
             "{GENERAL}{REDIS_DELIMITER}position_oms:{position_id}"
         ))?;
 
@@ -928,8 +937,14 @@ async fn drain_buffer(
             DatabaseOperation::Close => panic!("Close command should not be drained"),
             DatabaseOperation::Flush(_) => panic!("Flush command should not be drained"),
             operation => {
-                match append_pipeline_command(&mut pipe, collection, &key, &operation, msg.payload)
-                {
+                match append_pipeline_command(
+                    &mut pipe,
+                    collection,
+                    &key,
+                    trader_key,
+                    &operation,
+                    msg.payload,
+                ) {
                     Ok(()) => {
                         has_pending_ops = true;
                         Ok(())
@@ -951,9 +966,32 @@ fn append_pipeline_command(
     pipe: &mut Pipeline,
     collection: &str,
     key: &str,
+    trader_key: &str,
     operation: &DatabaseOperation,
     payload: Option<Vec<Bytes>>,
 ) -> anyhow::Result<()> {
+    if let DatabaseOperation::WritePosition {
+        fill,
+        snapshot,
+        authority,
+        replace_fills,
+    } = operation
+    {
+        anyhow::ensure!(
+            collection == POSITIONS,
+            "Unsupported `WritePosition` collection '{collection}'"
+        );
+        return write_position(
+            pipe,
+            key,
+            trader_key,
+            fill.as_ref(),
+            snapshot.as_ref(),
+            authority,
+            *replace_fills,
+        );
+    }
+
     if matches!(operation, DatabaseOperation::Delete) {
         return delete(pipe, collection, key, payload);
     }
@@ -1073,8 +1111,16 @@ fn insert(pipe: &mut Pipeline, collection: &str, key: &str, value: &[Bytes]) -> 
 
     match collection {
         INDEX => insert_index(pipe, key, value),
-        GENERAL | CURRENCIES | INSTRUMENTS | INSTRUMENT_CLOSES | SYNTHETICS | ACTORS
-        | STRATEGIES | HEALTH | CUSTOM => {
+        GENERAL
+        | CURRENCIES
+        | INSTRUMENTS
+        | INSTRUMENT_CLOSES
+        | SYNTHETICS
+        | ACTORS
+        | STRATEGIES
+        | HEALTH
+        | CUSTOM
+        | POSITION_REPLAY_PREFIX => {
             insert_string(pipe, key, value[0].as_ref());
             Ok(())
         }
@@ -1163,6 +1209,53 @@ fn replace_list_operation(
     }
 }
 
+fn write_position(
+    pipe: &mut Pipeline,
+    key: &str,
+    trader_key: &str,
+    fill: Option<&Bytes>,
+    snapshot: Option<&Bytes>,
+    authority: &Bytes,
+    replace_fills: bool,
+) -> anyhow::Result<()> {
+    let (snapshot_key, replay_key) = position_storage_keys(key, trader_key)?;
+
+    if replace_fills {
+        pipe.del(key);
+    }
+
+    if let Some(fill) = fill {
+        if replace_fills {
+            pipe.rpush(key, fill.as_ref());
+        } else {
+            pipe.rpush_exists(key, fill.as_ref());
+        }
+    }
+
+    if let Some(snapshot) = snapshot {
+        pipe.rpush(&snapshot_key, snapshot.as_ref());
+    }
+
+    pipe.set(&replay_key, authority.as_ref());
+
+    Ok(())
+}
+
+fn position_storage_keys(key: &str, trader_key: &str) -> anyhow::Result<(String, String)> {
+    let prefix = format!("{trader_key}{REDIS_DELIMITER}{POSITIONS}{REDIS_DELIMITER}");
+    let position_id = key
+        .strip_prefix(&prefix)
+        .ok_or_else(|| anyhow::anyhow!("Invalid position key format: {key}"))?;
+    let snapshot_key = format!(
+        "{trader_key}{REDIS_DELIMITER}{SNAPSHOTS}{REDIS_DELIMITER}{POSITIONS}{REDIS_DELIMITER}{position_id}"
+    );
+    let replay_key = format!(
+        "{trader_key}{REDIS_DELIMITER}{POSITION_REPLAY_PREFIX}{REDIS_DELIMITER}{position_id}"
+    );
+
+    Ok((snapshot_key, replay_key))
+}
+
 fn update(pipe: &mut Pipeline, collection: &str, key: &str, value: &[Bytes]) -> anyhow::Result<()> {
     check_slice_not_empty(value, stringify!(value))?;
 
@@ -1194,7 +1287,14 @@ fn delete(
 
     match collection {
         INDEX => delete_from_index(pipe, key, value),
-        ORDERS | POSITIONS | ACCOUNTS | ACTORS | STRATEGIES | SNAPSHOTS | GENERAL => {
+        ORDERS
+        | POSITIONS
+        | ACCOUNTS
+        | ACTORS
+        | STRATEGIES
+        | SNAPSHOTS
+        | GENERAL
+        | POSITION_REPLAY_PREFIX => {
             delete_string(pipe, key);
             Ok(())
         }
@@ -1403,6 +1503,32 @@ impl RedisCacheDatabaseAdapter {
         payload: Option<Vec<Bytes>>,
     ) -> anyhow::Result<()> {
         let op = DatabaseCommand::new(op_type, key, payload);
+        self.database
+            .tx
+            .send(op)
+            .map_err(|e| anyhow::anyhow!("{FAILED_TX_CHANNEL}: {e}"))
+    }
+
+    fn write_position(
+        &self,
+        position_id: PositionId,
+        fill: Option<Bytes>,
+        snapshot: Option<Bytes>,
+        authority: &PositionReplayAuthority,
+        replace_fills: bool,
+    ) -> anyhow::Result<()> {
+        let authority = Bytes::from(self.database.serialize_payload(authority)?);
+        let key = format!("{POSITIONS}{REDIS_DELIMITER}{position_id}");
+        let op = DatabaseCommand::new(
+            DatabaseOperation::WritePosition {
+                fill,
+                snapshot,
+                authority,
+                replace_fills,
+            },
+            key,
+            None,
+        );
         self.database
             .tx
             .send(op)
@@ -1940,14 +2066,47 @@ impl CacheDatabaseAdapter for RedisCacheDatabaseAdapter {
 
     fn add_position(&self, position: &Position) -> anyhow::Result<()> {
         let position_id = position.id;
-        let key = format!("{POSITIONS}{REDIS_DELIMITER}{position_id}");
+        let event = position.last_event();
 
-        let payload = self.serialize_position_event(position)?;
-        self.replace_list(key, payload)?;
-
-        if position.requires_replay_state() {
-            self.add_position_snapshot(&PositionSnapshot::from_replay_state(position, None))?;
+        if event.is_none() && !position.requires_replay_state() {
+            anyhow::bail!("Cannot persist position with no events: {position_id}");
         }
+
+        let event_payload = event
+            .as_ref()
+            .map(|event| self.database.serialize_payload(event))
+            .transpose()?
+            .map(Bytes::from);
+        let snapshot = position
+            .requires_replay_state()
+            .then(|| PositionSnapshot::from_replay_state(position, None));
+
+        if snapshot
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.replay_state.is_none())
+        {
+            anyhow::bail!("Failed to serialize position replay state: {position_id}");
+        }
+
+        let snapshot_payload = snapshot
+            .as_ref()
+            .map(|snapshot| self.database.serialize_payload(snapshot))
+            .transpose()?
+            .map(Bytes::from);
+        let authority = match &snapshot {
+            Some(snapshot) => PositionReplayAuthority::Replay(Box::new(snapshot.clone())),
+            None => PositionReplayAuthority::FillOnly,
+        };
+
+        // Replaces the fill log for a new cycle, retains snapshot history, and atomically
+        // publishes the current replay authority.
+        self.write_position(
+            position_id,
+            event_payload,
+            snapshot_payload,
+            &authority,
+            true,
+        )?;
 
         let position_id_bytes = Bytes::from(position_id.to_string());
         self.database.insert(
@@ -1968,12 +2127,25 @@ impl CacheDatabaseAdapter for RedisCacheDatabaseAdapter {
     }
 
     fn add_position_snapshot(&self, snapshot: &PositionSnapshot) -> anyhow::Result<()> {
+        let payload = self.database.serialize_payload(snapshot)?;
+        let payload = Bytes::from(payload);
+
+        if snapshot.replay_state.is_some() {
+            let authority = PositionReplayAuthority::Replay(Box::new(snapshot.clone()));
+            return self.write_position(
+                snapshot.position_id,
+                None,
+                Some(payload),
+                &authority,
+                false,
+            );
+        }
+
         let key = format!(
             "{SNAPSHOTS}{REDIS_DELIMITER}{POSITIONS}{REDIS_DELIMITER}{}",
             snapshot.position_id
         );
-        let payload = self.database.serialize_payload(snapshot)?;
-        self.database.insert(key, Some(vec![Bytes::from(payload)]))
+        self.database.insert(key, Some(vec![payload]))
     }
 
     fn add_order_book(&self, _order_book: &OrderBook) -> anyhow::Result<()> {
@@ -2122,9 +2294,9 @@ impl CacheDatabaseAdapter for RedisCacheDatabaseAdapter {
         if position.requires_replay_state() {
             self.add_position_snapshot(&PositionSnapshot::from_replay_state(position, None))?;
         } else {
-            let key = format!("{POSITIONS}{REDIS_DELIMITER}{position_id}");
             let payload = self.serialize_position_event(position)?;
-            self.append_list(key, payload)?;
+            let authority = PositionReplayAuthority::FillOnly;
+            self.write_position(position_id, Some(payload), None, &authority, false)?;
         }
 
         let position_id_bytes = Bytes::from(position_id.to_string());
@@ -2165,7 +2337,11 @@ impl CacheDatabaseAdapter for RedisCacheDatabaseAdapter {
         ts_snapshot: UnixNanos,
         unrealized_pnl: Option<Money>,
     ) -> anyhow::Result<()> {
-        let mut snapshot = PositionSnapshot::from(position, unrealized_pnl);
+        let mut snapshot = if position.requires_replay_state() {
+            PositionSnapshot::from_replay_state(position, unrealized_pnl)
+        } else {
+            PositionSnapshot::from(position, unrealized_pnl)
+        };
         snapshot.ts_init = ts_snapshot;
         self.add_position_snapshot(&snapshot)
     }

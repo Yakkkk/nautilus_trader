@@ -73,7 +73,12 @@ mod serial_tests {
     use redis::AsyncCommands;
     use rstest::rstest;
 
-    use crate::position_flip::populate_flip_cache;
+    use crate::{
+        position_convert::{
+            convert_position, exercise_convert_cycle_reuse, exercise_convert_restart,
+        },
+        position_flip::populate_flip_cache,
+    };
 
     fn redis_test_mutex() -> &'static tokio::sync::Mutex<()> {
         static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
@@ -750,6 +755,82 @@ mod serial_tests {
         let adapter = RedisCacheDatabaseAdapter { database };
 
         Ok(adapter)
+    }
+
+    #[rstest]
+    #[case(SerializationEncoding::Json)]
+    #[case(SerializationEncoding::MsgPack)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_convert_position_survives_cache_restart(#[case] encoding: SerializationEncoding) {
+        let _guard = redis_test_mutex().lock().await;
+        let trader_id = TraderId::from(format!("CONVERT-{}", UUID4::new()));
+        Box::pin(exercise_convert_restart(trader_id, async || {
+            let database = RedisCacheDatabase::new(
+                trader_id,
+                UUID4::new(),
+                CacheConfig {
+                    encoding,
+                    ..Default::default()
+                },
+                redis_cache_config(),
+            )
+            .await
+            .unwrap();
+            Box::new(RedisCacheDatabaseAdapter { database }) as Box<dyn CacheDatabaseAdapter>
+        }))
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_convert_position_id_reuse_replaces_closed_cycle() {
+        let _guard = redis_test_mutex().lock().await;
+        let mut database = get_redis_cache_adapter().await.unwrap();
+        database.close().unwrap();
+        exercise_convert_cycle_reuse(TraderId::from("test-trader"), async || {
+            Box::new(connect_redis_cache_adapter().await.unwrap()) as Box<dyn CacheDatabaseAdapter>
+        })
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_convert_position_replay_does_not_shadow_general_entry() {
+        let _guard = redis_test_mutex().lock().await;
+        let mut writer = get_redis_cache_adapter().await.unwrap();
+        let instrument = InstrumentAny::BinaryOption(binary_option());
+        let position = convert_position(TraderId::from("test-trader"), &instrument);
+        let general_key = format!("position-replay:{}", position.id);
+        let general_value = Bytes::from_static(b"strategy state");
+        writer
+            .add(general_key.clone(), general_value.clone())
+            .unwrap();
+        writer.add_instrument(&instrument).unwrap();
+        writer.add_position(&position).unwrap();
+        writer.close().unwrap();
+
+        let mut reader = connect_redis_cache_adapter().await.unwrap();
+        assert_eq!(
+            reader.load().unwrap().get(&general_key),
+            Some(&general_value)
+        );
+        assert_eq!(
+            reader
+                .load_position(&position.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .quantity,
+            position.quantity
+        );
+        reader.delete_position(&position.id).unwrap();
+        reader.close().unwrap();
+
+        let mut reader = connect_redis_cache_adapter().await.unwrap();
+        assert!(reader.load_position(&position.id).await.unwrap().is_none());
+        assert_eq!(
+            reader.load().unwrap().get(&general_key),
+            Some(&general_value)
+        );
+        reader.close().unwrap();
     }
 
     #[rstest]
@@ -2469,6 +2550,8 @@ mod serial_tests {
         };
         closed_position.apply(&close_fill);
         adapter.update_position(&closed_position).unwrap();
+        let snapshot = PositionSnapshot::from(&closed_position, None);
+        adapter.add_position_snapshot(&snapshot).unwrap();
 
         let OrderEventAny::Filled(reopen_fill) = TestOrderEventStubs::filled(
             &reopen_order,
@@ -2555,6 +2638,21 @@ mod serial_tests {
             .collect();
 
         assert_eq!(fills, reopened_position.events.clone());
+        let snapshot_key = format!(
+            "{}:snapshots:positions:{position_id}",
+            adapter.database.trader_key,
+        );
+        let snapshots: Vec<Bytes> = adapter
+            .database
+            .con
+            .clone()
+            .lrange(snapshot_key, 0, -1)
+            .await
+            .unwrap();
+        assert!(snapshots.iter().any(|frame| {
+            DatabaseQueries::deserialize_payload::<PositionSnapshot>(encoding, frame).unwrap()
+                == snapshot
+        }));
 
         let mut adapter = adapter;
         adapter.flush().unwrap();
@@ -2708,10 +2806,13 @@ mod serial_tests {
         adapter.flush().unwrap();
     }
 
+    #[rstest]
+    #[case::current(false)]
+    #[case::legacy_after_purge(true)]
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_load_position_uses_settlement_snapshot() {
+    async fn test_load_position_uses_settlement_snapshot(#[case] legacy_after_purge: bool) {
         let _guard = redis_test_mutex().lock().await;
-        let adapter = get_redis_cache_adapter()
+        let mut adapter = get_redis_cache_adapter()
             .await
             .expect("Failed to create adapter");
 
@@ -2739,10 +2840,34 @@ mod serial_tests {
             unreachable!();
         };
 
-        let mut position = Position::new(&instrument, fill);
+        let mut position = Position::new(&instrument, fill.clone());
 
         adapter.add_instrument(&instrument).unwrap();
-        adapter.add_position(&position).unwrap();
+        let encoding = adapter.database.get_encoding();
+
+        if legacy_after_purge {
+            let mut removed_fill = fill.clone();
+            removed_fill.client_order_id = ClientOrderId::from("O-LEGACY-PURGED");
+            removed_fill.event_id = UUID4::new();
+            removed_fill.trade_id = TradeId::from("T-LEGACY-PURGED");
+            removed_fill.ts_event = UnixNanos::from(100);
+            position.try_apply(&removed_fill).unwrap();
+            position
+                .purge_events_for_order(removed_fill.client_order_id)
+                .unwrap();
+
+            let fill_key = format!("positions:{position_id}");
+
+            for original_fill in [fill, removed_fill] {
+                let bytes = DatabaseQueries::serialize_payload(encoding, &original_fill).unwrap();
+                adapter
+                    .database
+                    .insert(fill_key.clone(), Some(vec![Bytes::from(bytes)]))
+                    .unwrap();
+            }
+        } else {
+            adapter.add_position(&position).unwrap();
+        }
         position
             .apply_instrument_close(InstrumentClose::new(
                 instrument.id(),
@@ -2752,29 +2877,36 @@ mod serial_tests {
                 UnixNanos::from(301),
             ))
             .unwrap();
-        adapter.update_position(&position).unwrap();
 
-        wait_until_async(
-            || async {
-                adapter
-                    .load_position(&position_id)
-                    .await
-                    .unwrap()
-                    .is_some_and(|loaded| loaded.is_settled())
-            },
-            Duration::from_secs(5),
-        )
-        .await;
+        if legacy_after_purge {
+            let bytes = DatabaseQueries::serialize_payload(
+                encoding,
+                &PositionSnapshot::from_replay_state(&position, None),
+            )
+            .unwrap();
+            adapter
+                .database
+                .insert(
+                    format!("snapshots:positions:{position_id}"),
+                    Some(vec![Bytes::from(bytes)]),
+                )
+                .unwrap();
+        } else {
+            adapter.update_position(&position).unwrap();
+        }
 
+        adapter.close().unwrap();
+        let mut adapter = connect_redis_cache_adapter().await.unwrap();
         let loaded = adapter.load_position(&position_id).await.unwrap().unwrap();
 
+        assert!(loaded.is_settled());
         assert!(loaded.is_closed());
         assert_eq!(loaded.quantity, Quantity::from("0.00"));
         assert_eq!(loaded.realized_pnl, position.realized_pnl);
         assert_eq!(loaded.ts_closed, Some(UnixNanos::from(300)));
 
-        let mut adapter = adapter;
         adapter.flush().unwrap();
+        adapter.close().unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread")]

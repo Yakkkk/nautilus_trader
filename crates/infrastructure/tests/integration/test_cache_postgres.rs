@@ -67,6 +67,7 @@ mod serial_tests {
     use ustr::Ustr;
 
     use super::get_cache;
+    use crate::position_convert::{exercise_convert_cycle_reuse, exercise_convert_restart};
 
     async fn get_test_pg_cache_database() -> anyhow::Result<PostgresCacheDatabase> {
         match tokio::time::timeout(
@@ -88,6 +89,32 @@ mod serial_tests {
     // Clears every table between tests. The cache's own `flush` only removes its trader's rows.
     async fn reset_test_database(database: &PostgresCacheDatabase) {
         DatabaseQueries::truncate(&database.pool).await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_convert_position_survives_cache_restart() {
+        let trader_id = TraderId::default();
+        let mut database = get_test_pg_cache_database().await.unwrap();
+        reset_test_database(&database).await;
+        Box::pin(exercise_convert_restart(trader_id, async || {
+            Box::new(get_test_pg_cache_database().await.unwrap()) as Box<dyn CacheDatabaseAdapter>
+        }))
+        .await;
+        reset_test_database(&database).await;
+        database.close().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_convert_position_id_reuse_replaces_closed_cycle() {
+        let trader_id = TraderId::default();
+        let mut database = get_test_pg_cache_database().await.unwrap();
+        reset_test_database(&database).await;
+        exercise_convert_cycle_reuse(trader_id, async || {
+            Box::new(get_test_pg_cache_database().await.unwrap()) as Box<dyn CacheDatabaseAdapter>
+        })
+        .await;
+        reset_test_database(&database).await;
+        database.close().unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread")]
