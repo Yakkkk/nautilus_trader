@@ -82,15 +82,68 @@ pub fn allocate_convert_costs(
     net_cash: Decimal,
     settlement_currency: Currency,
 ) -> CorrectnessResult<PolymarketConvertAllocation> {
+    allocate_convert_costs_inner(inputs, outputs, net_cash, settlement_currency, false)
+}
+
+/// Allocates released costs that may carry fractional settlement-currency units.
+///
+/// This applies the same cost and PnL relationships as [`allocate_convert_costs`], but accepts
+/// fractional released costs from a proportional position reduction without first rounding them
+/// to the settlement currency precision. Every non-final share is rounded down at the maximum
+/// scale needed by the released costs, net cash, and settlement currency precision, and the final
+/// positive-weight share receives the exact remainder.
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - Inputs are empty or either allocated side contains duplicate instrument IDs.
+/// - An input quantity is nonpositive, an output quantity is negative, or cash or released cost
+///   is negative.
+/// - The settlement currency precision is invalid or a final allocated leg cannot be represented
+///   exactly as `Decimal`.
+pub fn allocate_convert_costs_precise(
+    inputs: &[PolymarketConvertInput],
+    outputs: &[PolymarketConvertOutput],
+    net_cash: Decimal,
+    settlement_currency: Currency,
+) -> CorrectnessResult<PolymarketConvertAllocation> {
+    allocate_convert_costs_inner(inputs, outputs, net_cash, settlement_currency, true)
+}
+
+fn allocate_convert_costs_inner(
+    inputs: &[PolymarketConvertInput],
+    outputs: &[PolymarketConvertOutput],
+    net_cash: Decimal,
+    settlement_currency: Currency,
+    precise: bool,
+) -> CorrectnessResult<PolymarketConvertAllocation> {
     if inputs.is_empty() {
         return Err(invalid("`inputs` was empty"));
     }
 
-    let precision = settlement_currency.precision;
-    check_fixed_precision(precision)?;
+    let currency_precision = settlement_currency.precision;
+    check_fixed_precision(currency_precision)?;
+    let precision = if precise {
+        inputs
+            .iter()
+            .map(|input| input.released_cost.normalize().scale())
+            .chain(std::iter::once(net_cash.normalize().scale()))
+            .max()
+            .unwrap_or(0)
+            .max(u32::from(currency_precision))
+    } else {
+        u32::from(currency_precision)
+    };
 
     let mut legs = Vec::with_capacity(inputs.len());
     for input in inputs {
+        if input.released_cost < Decimal::ZERO {
+            return Err(invalid(format!(
+                "input `{}` released cost cannot be negative, was {}",
+                input.instrument_id, input.released_cost
+            )));
+        }
+
         if input.quantity <= Decimal::ZERO {
             return Err(invalid(format!(
                 "input `{}` quantity was not positive, was {}",
@@ -141,7 +194,10 @@ pub fn allocate_convert_costs(
             .checked_add(*cost_units)
             .ok_or_else(|| invalid("total released cost cannot be represented"))?;
     }
-    units_to_decimal(total_cost_units, precision)?;
+
+    if !precise {
+        units_to_decimal(total_cost_units, precision)?;
+    }
 
     let has_outputs = !receipts.is_empty();
     let (carryover_units, pnl_units, pnl_negative) = if has_outputs {
@@ -155,8 +211,11 @@ pub fn allocate_convert_costs(
     } else {
         (U512::ZERO, total_cost_units - net_cash_units, true)
     };
-    units_to_decimal(carryover_units, precision)?;
-    units_to_decimal(pnl_units, precision)?;
+
+    if !precise {
+        units_to_decimal(carryover_units, precision)?;
+        units_to_decimal(pnl_units, precision)?;
+    }
 
     let pnl_weights = if total_cost_units.is_zero() {
         legs.iter()
@@ -201,7 +260,7 @@ fn invalid(message: impl Into<String>) -> CorrectnessError {
     }
 }
 
-fn amount_to_units(value: Decimal, precision: u8, field: &str) -> CorrectnessResult<U512> {
+fn amount_to_units(value: Decimal, precision: u32, field: &str) -> CorrectnessResult<U512> {
     if value < Decimal::ZERO {
         return Err(invalid(format!(
             "`{field}` cannot be negative, was {value}"
@@ -209,13 +268,13 @@ fn amount_to_units(value: Decimal, precision: u8, field: &str) -> CorrectnessRes
     }
 
     let normalized = value.normalize();
-    if normalized.scale() > u32::from(precision) {
+    if normalized.scale() > precision {
         return Err(invalid(format!(
             "`{field}` cannot be represented exactly at settlement precision {precision}, was {value}"
         )));
     }
 
-    let factor = U512::from(10_u8).pow(U512::from(u32::from(precision) - normalized.scale()));
+    let factor = U512::from(10_u8).pow(U512::from(precision - normalized.scale()));
     U512::from(normalized.mantissa().unsigned_abs())
         .checked_mul(factor)
         .ok_or_else(|| {
@@ -244,7 +303,7 @@ fn allocate_units(
     total_units: U512,
     negative: bool,
     weights: &[Decimal],
-    precision: u8,
+    precision: u32,
 ) -> CorrectnessResult<Vec<Decimal>> {
     let weight_scale = weights.iter().map(Decimal::scale).max().unwrap_or(0);
     let ten = U512::from(10_u8);
@@ -299,9 +358,9 @@ fn allocate_units(
     Ok(amounts)
 }
 
-fn units_to_decimal(mut units: U512, precision: u8) -> CorrectnessResult<Decimal> {
+fn units_to_decimal(mut units: U512, precision: u32) -> CorrectnessResult<Decimal> {
     let ten = U512::from(10_u8);
-    let mut scale = u32::from(precision);
+    let mut scale = precision;
     while scale > 0 && units % ten == U512::ZERO {
         units /= ten;
         scale -= 1;

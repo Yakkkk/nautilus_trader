@@ -20,7 +20,10 @@ use nautilus_common::{
     clock::VirtualClock,
 };
 use nautilus_core::{UUID4, UnixNanos};
-use nautilus_execution::engine::ExecutionEngine;
+use nautilus_execution::engine::{
+    ExecutionEngine,
+    polymarket_convert::{ConvertRecord, ConvertTokenAmount, ConvertTransaction, VerifiedConvert},
+};
 use nautilus_model::{
     accounts::{AccountAny, CashAccount},
     data::InstrumentClose,
@@ -314,6 +317,179 @@ async fn exercise_replay_after_removing_fill(
     let mut reader = connect().await;
     assert!(reader.load_positions().await.unwrap().is_empty());
     reader.close().unwrap();
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) enum ConvertRecoveryCase {
+    Partial,
+    MissingPlan,
+    ReplacedCycle,
+}
+
+pub(super) async fn exercise_convert_batch_recovery(
+    trader_id: TraderId,
+    connect: impl AsyncFn() -> Box<dyn CacheDatabaseAdapter>,
+    case: ConvertRecoveryCase,
+) {
+    let mut binary_no = binary_option();
+    binary_no.id = InstrumentId::from("RECOVERY-NO.POLYMARKET");
+    let input = InstrumentAny::BinaryOption(binary_no);
+    let mut binary_yes = binary_option();
+    binary_yes.id = InstrumentId::from("RECOVERY-YES.POLYMARKET");
+    let output = InstrumentAny::BinaryOption(binary_yes);
+    let original = convert_position(trader_id, &input);
+    let currency = input.cost_currency();
+    let verified = VerifiedConvert {
+        operation_id: UUID4::new(),
+        trader_id,
+        strategy_id: original.strategy_id,
+        account_id: original.account_id,
+        transaction: ConvertTransaction {
+            wallet: "0x1234".into(),
+            relayer_transaction_id: Some("RELAYER-RECOVERY".into()),
+            transaction_hash: Some("0x5678".into()),
+            nonce: Some("42".into()),
+            call_summary: Some("convert RECOVERY-NO".into()),
+        },
+        inputs: vec![ConvertTokenAmount {
+            instrument_id: input.id(),
+            quantity: Decimal::from(40),
+        }],
+        outputs: vec![ConvertTokenAmount {
+            instrument_id: output.id(),
+            quantity: Decimal::from(40),
+        }],
+        affected_instruments: vec![input.id(), output.id()],
+        net_cash: Money::from("10 USDC"),
+        ts_event: UnixNanos::from(200),
+    };
+    let mut reference = Cache::default();
+    reference.add_instrument(input.clone()).unwrap();
+    reference.add_instrument(output.clone()).unwrap();
+    reference
+        .add_position_without_order(&original, OmsType::Netting)
+        .unwrap();
+    let mut engine = ExecutionEngine::new(
+        Rc::new(RefCell::new(VirtualClock::new())),
+        Rc::new(RefCell::new(reference)),
+        None,
+    );
+    let mut record = engine
+        .apply_verified_convert(verified.clone(), &[])
+        .unwrap();
+    assert!(record.applied, "{:?}", record.reason);
+    let output_change = *record
+        .plan
+        .as_ref()
+        .unwrap()
+        .iter()
+        .find(|change| change.instrument_id == output.id())
+        .unwrap();
+
+    let mut writer = Cache::new(None, Some(connect().await));
+    writer.add_currency(currency).unwrap();
+    writer.add_instrument(input.clone()).unwrap();
+    writer.add_instrument(output.clone()).unwrap();
+    let funds = Money::from("1000 USDC");
+    let account = AccountState::new(
+        original.account_id,
+        AccountType::Cash,
+        vec![AccountBalance::new(funds, Money::zero(currency), funds)],
+        Vec::new(),
+        true,
+        UUID4::new(),
+        UnixNanos::default(),
+        UnixNanos::default(),
+        Some(currency),
+    );
+    writer
+        .add_account(AccountAny::Cash(CashAccount::new(account, false, false)))
+        .unwrap();
+    let persisted_input = if matches!(case, ConvertRecoveryCase::ReplacedCycle) {
+        convert_position(trader_id, &input)
+    } else {
+        original.clone()
+    };
+    writer
+        .add_position_without_order(&persisted_input, OmsType::Netting)
+        .unwrap();
+    writer
+        .apply_position_convert(&output, output_change)
+        .unwrap()
+        .unwrap();
+
+    if matches!(case, ConvertRecoveryCase::MissingPlan) {
+        record.plan = None;
+    }
+
+    writer
+        .add(
+            &ConvertRecord::cache_key(verified.operation_id),
+            serde_json::to_vec(&record).unwrap().into(),
+        )
+        .unwrap();
+    writer.dispose();
+
+    let mut reader = Cache::new(None, Some(connect().await));
+    reader.cache_general().unwrap();
+    reader.cache_all().await.unwrap();
+    reader.build_index();
+    let cache = Rc::new(RefCell::new(reader));
+    let mut restarted = ExecutionEngine::new(
+        Rc::new(RefCell::new(VirtualClock::new())),
+        Rc::clone(&cache),
+        None,
+    );
+    assert_eq!(
+        restarted.convert_record(verified.operation_id).unwrap(),
+        Some(record.clone())
+    );
+    let recovered = restarted
+        .recover_convert(verified.operation_id, &[])
+        .unwrap();
+
+    match case {
+        ConvertRecoveryCase::Partial => {
+            assert!(recovered.applied, "{:?}", recovered.reason);
+            assert!(recovered.unapplied_instruments.is_empty());
+            assert_eq!(
+                restarted
+                    .recover_convert(verified.operation_id, &[])
+                    .unwrap(),
+                recovered
+            );
+            let input_position = cache.borrow().position_owned(&original.id).unwrap();
+            assert_eq!(input_position.quantity, Quantity::from("60.00"));
+            assert_eq!(input_position.cost_open, Decimal::from(30));
+        }
+        ConvertRecoveryCase::MissingPlan | ConvertRecoveryCase::ReplacedCycle => {
+            assert!(!recovered.applied);
+            assert!(recovered.reason.is_some());
+            assert!(recovered.unapplied_instruments.contains(&input.id()));
+
+            if matches!(case, ConvertRecoveryCase::ReplacedCycle) {
+                assert_eq!(recovered.unapplied_instruments, vec![input.id()]);
+            }
+
+            assert_same_position(
+                &cache.borrow().position(&original.id).unwrap(),
+                &persisted_input,
+            );
+        }
+    }
+
+    assert_eq!(recovered.verified, verified);
+    assert_eq!(recovered.plan, record.plan);
+    let out = cache
+        .borrow()
+        .position_owned(&output_change.position_id)
+        .unwrap();
+    assert_eq!(out.quantity, Quantity::from("40.00"));
+    let [PositionReplayEvent::Converted(replayed)] = out.replay_events.as_slice() else {
+        panic!("Expected a single Convert replay change");
+    };
+    assert_eq!(*replayed, output_change);
+    cache.borrow_mut().dispose();
 }
 
 fn sell_through_execution(

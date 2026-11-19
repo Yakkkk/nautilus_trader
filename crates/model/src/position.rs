@@ -437,6 +437,40 @@ impl Position {
         }
     }
 
+    /// Returns the exact cost released by consuming `quantity` from this position.
+    ///
+    /// A partial consumption releases the position's open cost in proportion to its signed
+    /// quantity. Consuming the full quantity releases the remaining cost without rounding. This
+    /// is the same allocation used when applying a Convert decrease.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the position is not an open long, `quantity` is nonpositive, the
+    /// quantity exceeds the position, or proportional arithmetic cannot be represented exactly.
+    pub fn try_convert_release_cost(&self, quantity: Quantity) -> CorrectnessResult<Decimal> {
+        check_predicate_true(
+            !self.is_inverse,
+            "Convert accounting does not support inverse positions",
+        )?;
+        check_predicate_true(
+            self.side == PositionSide::Long && self.is_open(),
+            "Convert decreases require an open long position",
+        )?;
+
+        let qty = qty(quantity)?;
+        check_predicate_true(qty > Decimal::ZERO, "`quantity` must be positive")?;
+        check_predicate_true(
+            qty <= self.signed_qty,
+            "Convert decrease exceeds the position quantity",
+        )?;
+
+        if qty == self.signed_qty {
+            Ok(self.cost_open)
+        } else {
+            proportion(self.cost_open, qty, self.signed_qty)
+        }
+    }
+
     fn check_convert_instrument(
         instrument_id: InstrumentId,
         instrument_param: &str,
@@ -696,11 +730,7 @@ impl Position {
             "Convert decrease exceeds the position quantity",
         )?;
 
-        let allocated_cost = if qty == prior_qty {
-            self.cost_open
-        } else {
-            proportion(self.cost_open, qty, prior_qty)?
-        };
+        let allocated_cost = self.try_convert_release_cost(change.quantity)?;
         check_equal(
             &change.cost,
             &allocated_cost,

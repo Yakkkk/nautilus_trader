@@ -21,6 +21,7 @@
 //! endpoints via its registered execution clients.
 
 pub mod config;
+pub mod polymarket_convert;
 pub mod position;
 pub mod settlement;
 pub mod stubs;

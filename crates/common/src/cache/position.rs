@@ -193,6 +193,35 @@ impl Cache {
         Ok(CacheSnapshotRef::new(blob_ref, encoded))
     }
 
+    /// Builds an archive payload without changing cache state.
+    pub(crate) fn prepare_position_snapshot(
+        &self,
+        position: &Position,
+    ) -> (PositionId, String, Position) {
+        let (blob_ref, snapshot) = self.build_position_snapshot(position);
+        (position.id, blob_ref, snapshot)
+    }
+
+    /// Stores a prepared archive and persists it best effort.
+    pub(crate) fn commit_prepared_position_snapshot_best_effort(
+        &mut self,
+        prepared: (PositionId, String, Position),
+    ) {
+        let (position_id, blob_ref, snapshot) = prepared;
+        let encoded = if self.database.is_some() {
+            match self.persist_position_snapshot(&blob_ref, &snapshot) {
+                Ok(encoded) => Some(encoded),
+                Err(e) => {
+                    log::error!("Failed to persist position snapshot for {position_id}: {e:#}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        self.store_position_snapshot(position_id, snapshot, encoded);
+    }
+
     /// Replaces every NETTING archive frame held for `position` with the cycles a correction
     /// rebuilt, worth `closed_cycles_pnl`.
     ///
