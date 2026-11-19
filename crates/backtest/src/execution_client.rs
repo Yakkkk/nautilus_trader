@@ -15,7 +15,11 @@
 
 //! Provides a `BacktestExecutionClient` implementation for backtesting.
 
-use std::{cell::RefCell, fmt::Debug, rc::Rc};
+use std::{
+    cell::{Cell, RefCell},
+    fmt::Debug,
+    rc::Rc,
+};
 
 use async_trait::async_trait;
 use nautilus_common::{
@@ -24,8 +28,9 @@ use nautilus_common::{
     clock::Clock,
     factories::OrderEventFactory,
     messages::execution::{
-        BatchCancelOrders, BatchModifyOrders, CancelAllOrders, CancelOrder, ModifyOrder,
-        QueryAccount, QueryOrder, SubmitOrder, SubmitOrderList, TradingCommand,
+        BatchCancelOrders, BatchModifyOrders, CancelAllOrders, CancelOrder, ConvertExecutionEvent,
+        ModifyOrder, QueryAccount, QueryOrder, SubmitConvert, SubmitOrder, SubmitOrderList,
+        TradingCommand,
     },
     msgbus::{self, MessagingSwitchboard},
 };
@@ -36,11 +41,22 @@ use nautilus_model::{
     enums::OmsType,
     events::OrderEventAny,
     identifiers::{AccountId, ClientId, ClientOrderId, TraderId, Venue},
+    instruments::neg_risk::ConvertScope,
     orders::OrderAny,
     types::{AccountBalance, MarginBalance},
 };
 
 use crate::exchange::SimulatedExchange;
+
+#[derive(Clone, Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "one deferred queue preserves order without boxing every order event"
+)]
+enum DeferredExecutionEvent {
+    Order(OrderEventAny),
+    Convert(ConvertExecutionEvent),
+}
 
 /// Execution client implementation for backtesting trading operations.
 ///
@@ -61,7 +77,8 @@ pub struct BacktestExecutionClient {
     /// the msgbus during `submit_order` because the exec engine holds a
     /// borrow via its `execute` handler. Instead, events are buffered here
     /// and drained by the engine after the execute borrow is released.
-    queued_events: Rc<RefCell<Vec<OrderEventAny>>>,
+    queued_events: Rc<RefCell<Vec<DeferredExecutionEvent>>>,
+    defer_order_events: Rc<Cell<bool>>,
     routing: bool,
     _frozen_account: bool,
 }
@@ -113,6 +130,7 @@ impl BacktestExecutionClient {
             cache,
             clock,
             queued_events: Rc::new(RefCell::new(Vec::new())),
+            defer_order_events: Rc::new(Cell::new(false)),
             routing,
             _frozen_account: frozen_account,
         }
@@ -122,18 +140,63 @@ impl BacktestExecutionClient {
         Ok(self.cache.borrow().try_order_owned(&client_order_id)?)
     }
 
-    /// Drain buffered order events, sending each to the exec engine.
+    /// Drain buffered execution events after command dispatch releases the engine borrow.
     pub fn drain_queued_events(&self) {
-        let events: Vec<OrderEventAny> = self.queued_events.borrow_mut().drain(..).collect();
-        let endpoint = MessagingSwitchboard::exec_engine_process();
+        let events = std::mem::take(&mut *self.queued_events.borrow_mut());
+        let order_endpoint = MessagingSwitchboard::exec_engine_process();
+        let convert_endpoint = MessagingSwitchboard::exec_engine_process_convert();
+
         for event in events {
-            msgbus::send_order_event(endpoint, event);
+            match event {
+                DeferredExecutionEvent::Order(event) => {
+                    msgbus::send_order_event(order_endpoint, event);
+                }
+                DeferredExecutionEvent::Convert(event) => {
+                    msgbus::send_any(convert_endpoint, &event);
+
+                    if let Some(exchange) = self.exchange.upgrade() {
+                        exchange
+                            .borrow()
+                            .release_convert_inventory_if_applied(event.operation_id);
+                    }
+                }
+            }
         }
+        self.defer_order_events.set(false);
     }
 
     pub(crate) fn order_event_handler(&self) -> Rc<dyn Fn(OrderEventAny)> {
         let queued_events = Rc::clone(&self.queued_events);
-        Rc::new(move |event| queued_events.borrow_mut().push(event))
+        Rc::new(move |event| {
+            queued_events
+                .borrow_mut()
+                .push(DeferredExecutionEvent::Order(event));
+        })
+    }
+
+    pub(crate) fn queued_order_event_handler(&self) -> Rc<dyn Fn(OrderEventAny)> {
+        let queued_events = Rc::clone(&self.queued_events);
+        let defer_order_events = Rc::clone(&self.defer_order_events);
+        Rc::new(move |event| {
+            if defer_order_events.get() || !queued_events.borrow().is_empty() {
+                queued_events
+                    .borrow_mut()
+                    .push(DeferredExecutionEvent::Order(event));
+            } else {
+                msgbus::send_order_event(MessagingSwitchboard::exec_engine_process(), event);
+            }
+        })
+    }
+
+    pub(crate) fn convert_event_handler(&self) -> Rc<dyn Fn(ConvertExecutionEvent)> {
+        let queued_events = Rc::clone(&self.queued_events);
+        let defer_order_events = Rc::clone(&self.defer_order_events);
+        Rc::new(move |event| {
+            defer_order_events.set(true);
+            queued_events
+                .borrow_mut()
+                .push(DeferredExecutionEvent::Convert(event));
+        })
     }
 }
 
@@ -194,7 +257,16 @@ impl ExecutionClient for BacktestExecutionClient {
 
     fn reset(&mut self) -> anyhow::Result<()> {
         self.queued_events.borrow_mut().clear();
+        self.defer_order_events.set(false);
         Ok(())
+    }
+
+    fn submit_convert(&self, cmd: SubmitConvert, scope: ConvertScope) -> anyhow::Result<()> {
+        let exchange = self
+            .exchange
+            .upgrade()
+            .ok_or_else(|| anyhow::anyhow!("SimulatedExchange has been dropped"))?;
+        exchange.borrow_mut().send_convert(cmd, scope)
     }
 
     fn submit_order(&self, cmd: SubmitOrder) -> anyhow::Result<()> {
@@ -203,7 +275,9 @@ impl ExecutionClient for BacktestExecutionClient {
         let order = self.get_order(cmd.client_order_id)?;
         let ts_init = self.clock.borrow().timestamp_ns();
         let event = self.factory.generate_order_submitted(&order, ts_init);
-        self.queued_events.borrow_mut().push(event);
+        self.queued_events
+            .borrow_mut()
+            .push(DeferredExecutionEvent::Order(event));
 
         if let Some(exchange) = self.exchange.upgrade() {
             exchange.borrow_mut().send(TradingCommand::SubmitOrder(cmd));
@@ -226,7 +300,7 @@ impl ExecutionClient for BacktestExecutionClient {
 
         for order in &orders {
             let event = self.factory.generate_order_submitted(order, ts_init);
-            queued.push(event);
+            queued.push(DeferredExecutionEvent::Order(event));
         }
         drop(queued);
 
@@ -408,12 +482,21 @@ mod tests {
         let event = OrderEventAny::Submitted(OrderSubmitted::test_default());
         let handler = client.order_event_handler();
         handler(event.clone());
-        assert_eq!(*client.queued_events.borrow(), vec![event]);
+        {
+            let queued = client.queued_events.borrow();
+            assert_eq!(queued.len(), 1);
+            match &queued[0] {
+                DeferredExecutionEvent::Order(queued) => assert_eq!(queued, &event),
+                DeferredExecutionEvent::Convert(_) => {
+                    panic!("expected a deferred order event")
+                }
+            }
+        }
 
         cloned.reset().unwrap();
 
-        assert_eq!(*client.queued_events.borrow(), Vec::<OrderEventAny>::new());
-        assert_eq!(*cloned.queued_events.borrow(), Vec::<OrderEventAny>::new());
+        assert!(client.queued_events.borrow().is_empty());
+        assert!(cloned.queued_events.borrow().is_empty());
     }
 
     #[rstest]

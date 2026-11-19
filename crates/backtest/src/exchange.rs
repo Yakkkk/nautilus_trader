@@ -29,7 +29,9 @@ use nautilus_common::{
     cache::Cache,
     clients::ExecutionClient,
     clock::{Clock, VirtualClock},
-    messages::execution::{ModifyOrder, SubmitOrderList, TradingCommand},
+    messages::execution::{
+        ConvertExecutionEvent, ModifyOrder, SubmitConvert, SubmitOrderList, TradingCommand,
+    },
     msgbus::{self, MessagingSwitchboard, TypedHandler, switchboard},
 };
 use nautilus_core::{
@@ -37,6 +39,7 @@ use nautilus_core::{
     correctness::{CorrectnessResultExt, FAILED, check_equal},
 };
 use nautilus_execution::{
+    engine::polymarket_convert::ConvertPendingInventory,
     matching::RestingOrder,
     matching_engine::{
         OrderMatchingEngine,
@@ -62,7 +65,7 @@ use nautilus_model::{
     },
     events::{FundingSettlement, OrderEventAny, OrderUpdated, PositionAdjusted, PositionEvent},
     identifiers::{AccountId, InstrumentId, Venue},
-    instruments::{Instrument, InstrumentAny},
+    instruments::{Instrument, InstrumentAny, neg_risk::ConvertScope},
     orderbook::OrderBook,
     orders::{Order, OrderAny},
     position::Position,
@@ -79,6 +82,8 @@ use crate::{
     },
 };
 
+mod convert;
+
 /// Represents commands with simulated network latency in a min-heap priority queue.
 /// The commands are ordered by timestamp for FIFO processing, with the
 /// earliest timestamp having the highest priority in the queue.
@@ -86,11 +91,11 @@ use crate::{
 struct InflightCommand {
     timestamp: UnixNanos,
     counter: u32,
-    command: TradingCommand,
+    command: ExchangeCommand,
 }
 
 impl InflightCommand {
-    const fn new(timestamp: UnixNanos, counter: u32, command: TradingCommand) -> Self {
+    const fn new(timestamp: UnixNanos, counter: u32, command: ExchangeCommand) -> Self {
         Self {
             timestamp,
             counter,
@@ -101,12 +106,25 @@ impl InflightCommand {
     fn matches_scope(&self, ts_now: UnixNanos, scope: SettlementScope) -> bool {
         match scope {
             SettlementScope::All => true,
-            SettlementScope::Data(instrument_id) => {
-                self.command.ts_init() == ts_now
-                    || instrument_id.is_some_and(|id| self.command.instrument_id() == id)
-            }
+            SettlementScope::Data(instrument_id) => match &self.command {
+                ExchangeCommand::Convert(..) => true,
+                ExchangeCommand::Trading(command) => {
+                    command.ts_init() == ts_now
+                        || instrument_id.is_some_and(|id| command.instrument_id() == id)
+                }
+            },
         }
     }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "queue entries keep the Convert command and scope paired without an allocation"
+)]
+enum ExchangeCommand {
+    Trading(TradingCommand),
+    Convert(SubmitConvert, ConvertScope),
 }
 
 impl Ord for InflightCommand {
@@ -158,6 +176,7 @@ pub struct SimulatedExchange {
     default_leverage: Decimal,
     exec_client: Option<Rc<dyn ExecutionClient>>,
     event_handler: Option<Rc<dyn Fn(OrderEventAny)>>,
+    convert_event_handler: Option<Rc<dyn Fn(ConvertExecutionEvent)>>,
     /// Set only while a trading command is being processed synchronously, which is the
     /// window in which the execution engine holds a borrow and a re-entrant event would
     /// panic. Outside it (market data, iteration, expiration, liquidation, open-order
@@ -178,8 +197,9 @@ pub struct SimulatedExchange {
     callback_error: Option<String>,
     clock: Rc<RefCell<dyn Clock>>,
     cache: Rc<RefCell<Cache>>,
-    message_queue: VecDeque<TradingCommand>,
+    message_queue: VecDeque<ExchangeCommand>,
     inflight_queue: BinaryHeap<InflightCommand>,
+    convert_inventory: Rc<RefCell<ConvertPendingInventory>>,
     inflight_orders: InflightOrders,
     matching_orders: MatchingOrders,
     inflight_counter: AHashMap<UnixNanos, u32>,
@@ -255,6 +275,7 @@ impl SimulatedExchange {
             default_leverage,
             exec_client: None,
             event_handler: None,
+            convert_event_handler: None,
             deferring_events: Rc::new(Cell::new(false)),
             fill_model: config.fill_model,
             fee_model: config.fee_model,
@@ -273,6 +294,7 @@ impl SimulatedExchange {
             cache,
             message_queue: VecDeque::new(),
             inflight_queue: BinaryHeap::new(),
+            convert_inventory: Rc::new(RefCell::new(ConvertPendingInventory::default())),
             inflight_orders: InflightOrders::default(),
             matching_orders: MatchingOrders::default(),
             inflight_counter: AHashMap::new(),
@@ -540,6 +562,7 @@ impl SimulatedExchange {
         if let Some(handler) = &self.event_handler {
             matching_engine.set_event_handler(Rc::clone(handler));
         }
+        matching_engine.set_pending_convert_inventory(Rc::clone(&self.convert_inventory));
         self.instruments.insert(instrument_id, instrument);
         matching_engine.set_inflight_orders(self.inflight_orders.clone());
         matching_engine.set_matching_orders(self.matching_orders.clone());
@@ -595,11 +618,27 @@ impl SimulatedExchange {
                 msgbus::send_order_event(MessagingSwitchboard::exec_engine_process(), event);
             }
         });
+        self.set_matching_event_handler(gated);
+    }
 
+    /// Sets an event handler which always queues matching events for the engine drain.
+    pub(crate) fn set_queued_event_handler(&mut self, handler: Rc<dyn Fn(OrderEventAny)>) {
+        self.set_matching_event_handler(handler);
+    }
+
+    fn set_matching_event_handler(&mut self, handler: Rc<dyn Fn(OrderEventAny)>) {
         for matching_engine in self.matching_engines.values_mut() {
-            matching_engine.set_event_handler(Rc::clone(&gated));
+            matching_engine.set_event_handler(Rc::clone(&handler));
         }
-        self.event_handler = Some(gated);
+        self.event_handler = Some(handler);
+    }
+
+    /// Sets the deferred handler used for simulated conversion evidence.
+    ///
+    /// Conversion evidence is always queued by the execution client; the exchange never dispatches
+    /// it synchronously while a trading command is being processed.
+    pub(crate) fn set_convert_event_handler(&mut self, handler: Rc<dyn Fn(ConvertExecutionEvent)>) {
+        self.convert_event_handler = Some(handler);
     }
 
     /// Returns the best bid price for the given instrument, if available.
@@ -947,7 +986,8 @@ impl SimulatedExchange {
             self.process_trading_command(command);
         } else if self.latency_model.is_none() {
             self.inflight_orders.insert(&command);
-            self.message_queue.push_back(command);
+            self.message_queue
+                .push_back(ExchangeCommand::Trading(command));
         } else {
             let (timestamp, counter) = match self.generate_inflight_command(&command) {
                 Ok(arrival) => arrival,
@@ -958,8 +998,11 @@ impl SimulatedExchange {
             };
 
             self.inflight_orders.insert(&command);
-            self.inflight_queue
-                .push(InflightCommand::new(timestamp, counter, command));
+            self.inflight_queue.push(InflightCommand::new(
+                timestamp,
+                counter,
+                ExchangeCommand::Trading(command),
+            ));
         }
     }
 
@@ -971,7 +1014,9 @@ impl SimulatedExchange {
             let ts_now = self.clock.borrow().timestamp_ns();
 
             let latency = match command {
-                TradingCommand::SubmitOrder(_) | TradingCommand::SubmitOrderList(_) => {
+                TradingCommand::SubmitOrder(_)
+                | TradingCommand::SubmitOrderList(_)
+                | TradingCommand::SubmitConvert(_) => {
                     latency_model.get_insert_latency(command, ts_now)?
                 }
                 TradingCommand::ModifyOrder(_) | TradingCommand::ModifyOrders(_) => {
@@ -1610,8 +1655,13 @@ impl SimulatedExchange {
             self.inflight_counter.remove(timestamp);
         }
 
-        while let Some(command) = self.message_queue.pop_front() {
-            self.process_trading_command(command);
+        while let Some(queued) = self.message_queue.pop_front() {
+            match queued {
+                ExchangeCommand::Trading(command) => self.process_trading_command(command),
+                ExchangeCommand::Convert(command, scope) => {
+                    self.execute_convert(&command, &scope);
+                }
+            }
         }
     }
 
@@ -1718,6 +1768,7 @@ impl SimulatedExchange {
         self.inflight_queue.clear();
         self.inflight_orders.clear();
         self.inflight_counter.clear();
+        self.convert_inventory.borrow_mut().clear();
 
         log::info!("Resetting exchange state");
         self.callback_error = callback_error;
@@ -3026,7 +3077,11 @@ mod tests {
 
     #[rstest]
     fn test_inflight_command_matches_settlement_scope() {
-        let inflight = InflightCommand::new(UnixNanos::from(1), 0, query_order());
+        let inflight = InflightCommand::new(
+            UnixNanos::from(1),
+            0,
+            ExchangeCommand::Trading(query_order()),
+        );
         let instrument_id = InstrumentId::from("AUD/USD.SIM");
         let other_id = InstrumentId::from("GBP/USD.SIM");
 

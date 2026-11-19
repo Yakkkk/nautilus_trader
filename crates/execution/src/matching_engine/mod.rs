@@ -87,6 +87,7 @@ use self::{
     orders::{MatchingOrders, OtoCommand},
 };
 use crate::{
+    engine::polymarket_convert::ConvertPendingInventory,
     matching::{MatchAction, OrderMatchingCore, RestingOrder},
     models::{
         fee::{FeeModel, FeeModelHandle},
@@ -134,6 +135,7 @@ pub struct OrderMatchingEngine {
     execution_bar_deltas: IndexMap<BarType, SignedDuration>,
     account_ids: IndexMap<TraderId, AccountId>,
     pending_fills: IndexMap<TradeId, PendingFill>,
+    pending_convert_inventory: Option<Rc<RefCell<ConvertPendingInventory>>>,
     post_match_order_ids: IndexSet<ClientOrderId>,
     orders: MatchingOrders,
     ids_generator: IdsGenerator,
@@ -234,6 +236,7 @@ impl OrderMatchingEngine {
             execution_bar_deltas: IndexMap::new(),
             account_ids: IndexMap::new(),
             pending_fills: IndexMap::new(),
+            pending_convert_inventory: None,
             post_match_order_ids: IndexSet::new(),
             orders: MatchingOrders::default(),
             ids_generator,
@@ -288,6 +291,122 @@ impl OrderMatchingEngine {
     /// Cross-instrument OTO orders require the shared record and protocol in [`MatchingOrders`].
     pub fn set_matching_orders(&mut self, orders: MatchingOrders) {
         self.orders = orders;
+    }
+
+    /// Attaches pending simulated conversion inventory shared by this venue.
+    pub fn set_pending_convert_inventory(
+        &mut self,
+        inventory: Rc<RefCell<ConvertPendingInventory>>,
+    ) {
+        self.pending_convert_inventory = Some(inventory);
+    }
+
+    /// Returns the position quantity available for another simulated consumption.
+    ///
+    /// Includes unapplied fills and subtracts pending conversion inventory.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a pending position quantity overflows.
+    pub fn available_position_quantity(
+        &mut self,
+        position_id: PositionId,
+    ) -> anyhow::Result<Decimal> {
+        self.purge_applied_fills();
+        let cache = self.cache.borrow();
+        self.position_quantity_for_id(&cache, Some(position_id), None, None)
+    }
+
+    /// Returns the remaining quantity of arrived ask orders for the account and strategy.
+    ///
+    /// The query merges pending updates and cached fills only through the matching engine's
+    /// order snapshot path, so callers see the venue order state rather than stale cache state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a pending order snapshot cannot be constructed or a quantity overflows.
+    pub fn arrived_sell_remaining(
+        &self,
+        strategy_id: StrategyId,
+        account_id: AccountId,
+    ) -> anyhow::Result<Decimal> {
+        let mut total = Decimal::ZERO;
+
+        for resting in self.get_open_ask_orders() {
+            let needs_snapshot = {
+                let cache = self.cache.borrow();
+                let Some(order) = cache.order(&resting.client_order_id) else {
+                    continue;
+                };
+
+                if order.strategy_id() != strategy_id {
+                    continue;
+                }
+
+                let account_matches = match order.account_id() {
+                    Some(order_account_id) => order_account_id == account_id,
+                    None => cache
+                        .client_id(&order.client_order_id())
+                        .and_then(|client_id| cache.account_id_for_client(client_id))
+                        .is_some_and(|resolved_account_id| *resolved_account_id == account_id),
+                };
+
+                if !account_matches {
+                    continue;
+                }
+
+                let has_pending_updates = self
+                    .orders
+                    .pending_updates
+                    .borrow()
+                    .contains_key(&resting.client_order_id);
+                let has_pending_fills = self
+                    .orders
+                    .cached_filled_qty
+                    .borrow()
+                    .get(&resting.client_order_id)
+                    .is_some_and(|filled_qty| *filled_qty != order.filled_qty());
+                has_pending_updates || has_pending_fills
+            };
+
+            let leaves = if needs_snapshot {
+                let order = self
+                    .order_snapshot(resting.client_order_id)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "Cannot snapshot arrived sell order {}",
+                            resting.client_order_id,
+                        )
+                    })?;
+                order.leaves_qty().as_decimal()
+            } else {
+                let cache = self.cache.borrow();
+                let order = cache.order(&resting.client_order_id).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Arrived sell order {} disappeared from cache",
+                        resting.client_order_id,
+                    )
+                })?;
+                order.leaves_qty().as_decimal()
+            };
+
+            total = total.checked_add(leaves).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Arrived sell remaining quantity overflow for {}",
+                    resting.client_order_id,
+                )
+            })?;
+        }
+
+        Ok(total)
+    }
+
+    /// Returns whether the position has fill effects which the core has not applied.
+    pub fn has_unapplied_fills_for_position(&mut self, position_id: PositionId) -> bool {
+        self.purge_applied_fills();
+        self.pending_fills
+            .values()
+            .any(|fill| fill.position_id == Some(position_id))
     }
 
     fn dispatch_order_event(&self, event: OrderEventAny) {
@@ -6256,7 +6375,16 @@ impl OrderMatchingEngine {
                     PositionId::new(format!("{}-{}", order.instrument_id(), order.strategy_id()))
                 })
             });
+        self.position_quantity_for_id(cache, position_id, position, Some(order))
+    }
 
+    fn position_quantity_for_id(
+        &self,
+        cache: &Cache,
+        position_id: Option<PositionId>,
+        position: Option<&Position>,
+        order: Option<&OrderAny>,
+    ) -> anyhow::Result<Decimal> {
         let cached_position = position_id.as_ref().and_then(|id| cache.position(id));
         let position = position.or(cached_position.as_deref());
         let splits_virtual_position = self.restricts_short_selling()
@@ -6274,11 +6402,13 @@ impl OrderMatchingEngine {
         for fill in self.pending_fills.values() {
             let matches_position = match position_id {
                 Some(position_id) => fill.position_id == Some(position_id),
-                None => order.parent_order_id().is_some_and(|parent_id| {
-                    fill.client_order_id == parent_id
-                        || cache
-                            .order(&fill.client_order_id)
-                            .is_some_and(|order| order.parent_order_id() == Some(parent_id))
+                None => order.is_some_and(|order| {
+                    order.parent_order_id().is_some_and(|parent_id| {
+                        fill.client_order_id == parent_id
+                            || cache
+                                .order(&fill.client_order_id)
+                                .is_some_and(|order| order.parent_order_id() == Some(parent_id))
+                    })
                 }),
             };
 
@@ -6300,6 +6430,17 @@ impl OrderMatchingEngine {
             } else {
                 remaining
             };
+        }
+
+        if let Some(inventory) = &self.pending_convert_inventory
+            && let Some(position_id) = position_id
+        {
+            let consumed = inventory.borrow().consumed(&position_id);
+            if !consumed.is_zero() {
+                quantity = quantity.checked_sub(consumed).ok_or_else(|| {
+                    anyhow::anyhow!("Pending conversion quantity overflow for {position_id}")
+                })?;
+            }
         }
 
         Ok(quantity)
