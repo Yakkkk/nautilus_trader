@@ -109,6 +109,8 @@ from nautilus_trader.model import TraderId
 from nautilus_trader.model import TradeTick
 from nautilus_trader.model import Venue
 from nautilus_trader.model import VenueOrderId
+from nautilus_trader.trading import ConvertExecutionStatus
+from nautilus_trader.trading import ConvertResult
 from nautilus_trader.trading import ForexSession
 from nautilus_trader.trading import ImportableStrategyConfig
 from nautilus_trader.trading import Strategy
@@ -139,6 +141,56 @@ HISTORICAL_REQUEST_DATETIME_CASES = [
 DATA_OPERATION_REGISTRATION_ERROR = (
     "Strategy must be registered before publishing, managing synthetics, or requesting data"
 )
+
+
+def test_strategy_convert_delivers_rejection_with_original_operation_id() -> None:
+    """
+    Test the Python command and callback without a venue that supports conversion.
+    """
+    account_id = AccountId("SIM-001")
+    client_id = ClientId("SIM")
+    results: list[ConvertResult] = []
+    operation_ids: list[UUID4] = []
+
+    class ConvertProbe(Strategy):
+        def on_start(self) -> None:
+            operation_ids.append(
+                self.submit_convert(
+                    [(InstrumentId.from_str("NO-A.SIM"), Decimal("1.234567"))],
+                    account_id,
+                    client_id,
+                ),
+            )
+
+        def on_convert_result(self, result: ConvertResult) -> None:
+            results.append(result)
+
+    usd = Currency.from_str("USD")
+    engine = BacktestEngine(BacktestEngineConfig(bypass_logging=True, run_analysis=False))
+    engine.add_venue(
+        venue=Venue("SIM"),
+        oms_type=OmsType.NETTING,
+        account_type=AccountType.CASH,
+        starting_balances=[Money.from_str("1000 USD")],
+        base_currency=usd,
+        fee_model=MakerTakerFeeModel(
+            maker_rate=Decimal(0),
+            taker_rate=Decimal(0),
+        ),
+    )
+    try:
+        engine.add_strategy(ConvertProbe(StrategyConfig(strategy_id=StrategyId("CONVERT-001"))))
+        engine.run()
+        assert len(operation_ids) == 1
+        assert isinstance(operation_ids[0], UUID4)
+        assert len(results) == 1
+        assert results[0].operation_id == operation_ids[0]
+        assert results[0].account_id == account_id
+        assert results[0].status == ConvertExecutionStatus.REJECTED
+        assert not results[0].applied
+        assert results[0].reason
+    finally:
+        engine.dispose()
 
 
 class HistoricalRequestProbeStrategy(Strategy):

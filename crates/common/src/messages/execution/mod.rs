@@ -16,6 +16,7 @@
 //! Execution specific messages such as order commands.
 
 pub mod cancel;
+pub mod convert;
 pub mod modify;
 pub mod query;
 pub mod report;
@@ -33,6 +34,11 @@ use strum::Display as StrumDisplay;
 
 pub use self::{
     cancel::{BatchCancelOrders, CancelAllOrders, CancelOrder},
+    convert::{
+        ConvertExecutionEvent, ConvertExecutionOutcome, ConvertExecutionStatus,
+        ConvertOperationRecord, ConvertResult, ConvertTokenAmount, ConvertTransaction,
+        QueryConvert, SubmitConvert, VerifiedConvert, has_unique_inputs, normalized_inputs,
+    },
     modify::{BatchModifyOrders, ModifyOrder},
     query::{QueryAccount, QueryOrder},
     report::{
@@ -91,6 +97,8 @@ pub enum TradingCommand {
     #[strum(transparent)]
     SubmitOrderList(SubmitOrderList),
     #[strum(transparent)]
+    SubmitConvert(SubmitConvert),
+    #[strum(transparent)]
     ModifyOrder(ModifyOrder),
     #[strum(transparent)]
     ModifyOrders(BatchModifyOrders),
@@ -104,12 +112,15 @@ pub enum TradingCommand {
     QueryOrder(QueryOrder),
     #[strum(transparent)]
     QueryAccount(QueryAccount),
+    #[strum(transparent)]
+    QueryConvert(QueryConvert),
 }
 
 #[derive(Deserialize)]
 enum TradingCommandType {
     SubmitOrder,
     SubmitOrderList,
+    SubmitConvert,
     ModifyOrder,
     BatchModifyOrders,
     CancelOrder,
@@ -117,6 +128,7 @@ enum TradingCommandType {
     CancelAllOrders,
     QueryOrder,
     QueryAccount,
+    QueryConvert,
 }
 
 #[derive(Deserialize)]
@@ -142,6 +154,9 @@ impl<'de> Deserialize<'de> for TradingCommand {
             TradingCommandType::SubmitOrderList => serde_json::from_value(value)
                 .map(Self::SubmitOrderList)
                 .map_err(D::Error::custom),
+            TradingCommandType::SubmitConvert => serde_json::from_value(value)
+                .map(Self::SubmitConvert)
+                .map_err(D::Error::custom),
             TradingCommandType::ModifyOrder => serde_json::from_value(value)
                 .map(Self::ModifyOrder)
                 .map_err(D::Error::custom),
@@ -163,6 +178,9 @@ impl<'de> Deserialize<'de> for TradingCommand {
             TradingCommandType::QueryAccount => serde_json::from_value(value)
                 .map(Self::QueryAccount)
                 .map_err(D::Error::custom),
+            TradingCommandType::QueryConvert => serde_json::from_value(value)
+                .map(Self::QueryConvert)
+                .map_err(D::Error::custom),
         }
     }
 }
@@ -173,6 +191,7 @@ impl TradingCommand {
         match self {
             Self::SubmitOrder(command) => command.client_id,
             Self::SubmitOrderList(command) => command.client_id,
+            Self::SubmitConvert(command) => Some(command.client_id),
             Self::ModifyOrder(command) => command.client_id,
             Self::ModifyOrders(command) => command.client_id,
             Self::CancelOrder(command) => command.client_id,
@@ -180,6 +199,7 @@ impl TradingCommand {
             Self::CancelAllOrders(command) => command.client_id,
             Self::QueryOrder(command) => command.client_id,
             Self::QueryAccount(command) => command.client_id,
+            Self::QueryConvert(command) => Some(command.client_id),
         }
     }
 
@@ -187,7 +207,7 @@ impl TradingCommand {
     ///
     /// # Panics
     ///
-    /// Panics if the command is `QueryAccount` which does not have an instrument ID.
+    /// Panics if the command is account-scoped or applies to multiple instruments.
     #[must_use]
     pub const fn instrument_id(&self) -> InstrumentId {
         match self {
@@ -199,7 +219,9 @@ impl TradingCommand {
             Self::CancelOrders(command) => command.instrument_id,
             Self::CancelAllOrders(command) => command.instrument_id,
             Self::QueryOrder(command) => command.instrument_id,
-            Self::QueryAccount(_) => panic!("No instrument ID for command"),
+            Self::QueryAccount(_) | Self::SubmitConvert(_) | Self::QueryConvert(_) => {
+                panic!("No instrument ID for command")
+            }
         }
     }
 
@@ -208,6 +230,7 @@ impl TradingCommand {
         match self {
             Self::SubmitOrder(command) => command.ts_init,
             Self::SubmitOrderList(command) => command.ts_init,
+            Self::SubmitConvert(command) => command.ts_init,
             Self::ModifyOrder(command) => command.ts_init,
             Self::ModifyOrders(command) => command.ts_init,
             Self::CancelOrder(command) => command.ts_init,
@@ -215,6 +238,7 @@ impl TradingCommand {
             Self::CancelAllOrders(command) => command.ts_init,
             Self::QueryOrder(command) => command.ts_init,
             Self::QueryAccount(command) => command.ts_init,
+            Self::QueryConvert(command) => command.ts_init,
         }
     }
 
@@ -223,6 +247,7 @@ impl TradingCommand {
         match self {
             Self::SubmitOrder(command) => Some(command.strategy_id),
             Self::SubmitOrderList(command) => Some(command.strategy_id),
+            Self::SubmitConvert(command) => Some(command.strategy_id),
             Self::ModifyOrder(command) => Some(command.strategy_id),
             Self::ModifyOrders(command) => Some(command.strategy_id),
             Self::CancelOrder(command) => Some(command.strategy_id),
@@ -230,6 +255,7 @@ impl TradingCommand {
             Self::CancelAllOrders(command) => Some(command.strategy_id),
             Self::QueryOrder(command) => Some(command.strategy_id),
             Self::QueryAccount(_) => None,
+            Self::QueryConvert(command) => Some(command.strategy_id),
         }
     }
 
@@ -245,6 +271,7 @@ impl TradingCommand {
             Self::CancelAllOrders(command) => command.params.as_ref(),
             Self::QueryOrder(command) => command.params.as_ref(),
             Self::QueryAccount(command) => command.params.as_ref(),
+            Self::SubmitConvert(_) | Self::QueryConvert(_) => None,
         }
     }
 }
@@ -266,7 +293,7 @@ mod tests {
 
     fn trading_commands() -> Vec<TradingCommand> {
         let trader_id = TraderId::from("TRADER-001");
-        let client_id = Some(ClientId::from("EXTERNAL"));
+        let client_id = ClientId::from("EXTERNAL");
         let strategy_id = StrategyId::from("STRATEGY-001");
         let instrument_id = InstrumentId::from("AUD/USD.SIM");
         let ts_init = UnixNanos::from(1_000_000_000);
@@ -274,7 +301,7 @@ mod tests {
         let client_order_id = order_init.client_order_id;
         let submit_order = SubmitOrder::new(
             trader_id,
-            client_id,
+            Some(client_id),
             strategy_id,
             instrument_id,
             client_order_id,
@@ -295,7 +322,7 @@ mod tests {
         );
         let submit_order_list = SubmitOrderList::new(
             trader_id,
-            client_id,
+            Some(client_id),
             strategy_id,
             order_list,
             vec![order_init],
@@ -308,7 +335,7 @@ mod tests {
         );
         let modify_order = ModifyOrder::new(
             trader_id,
-            client_id,
+            Some(client_id),
             strategy_id,
             instrument_id,
             client_order_id,
@@ -323,7 +350,7 @@ mod tests {
         );
         let cancel_order = CancelOrder::new(
             trader_id,
-            client_id,
+            Some(client_id),
             strategy_id,
             instrument_id,
             client_order_id,
@@ -340,7 +367,7 @@ mod tests {
             TradingCommand::ModifyOrder(modify_order.clone()),
             TradingCommand::ModifyOrders(BatchModifyOrders::new(
                 trader_id,
-                client_id,
+                Some(client_id),
                 strategy_id,
                 instrument_id,
                 vec![modify_order],
@@ -352,7 +379,7 @@ mod tests {
             TradingCommand::CancelOrder(cancel_order.clone()),
             TradingCommand::CancelOrders(BatchCancelOrders::new(
                 trader_id,
-                client_id,
+                Some(client_id),
                 strategy_id,
                 instrument_id,
                 vec![cancel_order],
@@ -363,7 +390,7 @@ mod tests {
             )),
             TradingCommand::CancelAllOrders(CancelAllOrders::new(
                 trader_id,
-                client_id,
+                Some(client_id),
                 strategy_id,
                 instrument_id,
                 None,
@@ -374,7 +401,7 @@ mod tests {
             )),
             TradingCommand::QueryOrder(QueryOrder::new(
                 trader_id,
-                client_id,
+                Some(client_id),
                 strategy_id,
                 instrument_id,
                 client_order_id,
@@ -386,13 +413,33 @@ mod tests {
             )),
             TradingCommand::QueryAccount(QueryAccount::new(
                 trader_id,
-                client_id,
+                Some(client_id),
                 AccountId::from("SIM-001"),
                 UUID4::from("00000000-0000-4000-8000-000000000009"),
                 ts_init,
                 None,
                 None,
             )),
+            TradingCommand::SubmitConvert(SubmitConvert {
+                operation_id: UUID4::from("00000000-0000-4000-8000-000000000013"),
+                trader_id,
+                strategy_id,
+                account_id: AccountId::from("SIM-001"),
+                client_id,
+                inputs: vec![ConvertTokenAmount {
+                    instrument_id,
+                    quantity: "1.234567".parse().unwrap(),
+                }],
+                ts_init,
+            }),
+            TradingCommand::QueryConvert(QueryConvert {
+                operation_id: UUID4::from("00000000-0000-4000-8000-000000000013"),
+                trader_id,
+                strategy_id,
+                account_id: AccountId::from("SIM-001"),
+                client_id,
+                ts_init,
+            }),
         ]
     }
 
@@ -456,6 +503,7 @@ mod tests {
             let expected = match &command {
                 TradingCommand::SubmitOrder(command) => command.to_string(),
                 TradingCommand::SubmitOrderList(command) => command.to_string(),
+                TradingCommand::SubmitConvert(command) => command.to_string(),
                 TradingCommand::ModifyOrder(command) => command.to_string(),
                 TradingCommand::ModifyOrders(command) => command.to_string(),
                 TradingCommand::CancelOrder(command) => command.to_string(),
@@ -463,6 +511,7 @@ mod tests {
                 TradingCommand::CancelAllOrders(command) => command.to_string(),
                 TradingCommand::QueryOrder(command) => command.to_string(),
                 TradingCommand::QueryAccount(command) => command.to_string(),
+                TradingCommand::QueryConvert(command) => command.to_string(),
             };
 
             assert_eq!(command.to_string(), expected);
@@ -495,8 +544,8 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "unknown variant `UnknownCommand`, expected one of `SubmitOrder`, `SubmitOrderList`, \
-             `ModifyOrder`, `BatchModifyOrders`, `CancelOrder`, `BatchCancelOrders`, \
-             `CancelAllOrders`, `QueryOrder`, `QueryAccount`",
+             `SubmitConvert`, `ModifyOrder`, `BatchModifyOrders`, `CancelOrder`, \
+             `BatchCancelOrders`, `CancelAllOrders`, `QueryOrder`, `QueryAccount`, `QueryConvert`",
         );
     }
 
@@ -511,11 +560,15 @@ mod tests {
             assert_eq!(command.ts_init(), ts_init);
             assert_eq!(command.params(), None);
 
-            if matches!(command, TradingCommand::QueryAccount(_)) {
-                assert_eq!(command.strategy_id(), None);
-            } else {
-                assert_eq!(command.strategy_id(), Some(strategy_id));
-                assert_eq!(command.instrument_id(), instrument_id);
+            match command {
+                TradingCommand::QueryAccount(_) => assert_eq!(command.strategy_id(), None),
+                TradingCommand::SubmitConvert(_) | TradingCommand::QueryConvert(_) => {
+                    assert_eq!(command.strategy_id(), Some(strategy_id));
+                }
+                _ => {
+                    assert_eq!(command.strategy_id(), Some(strategy_id));
+                    assert_eq!(command.instrument_id(), instrument_id);
+                }
             }
         }
     }

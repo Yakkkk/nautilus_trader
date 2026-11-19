@@ -86,6 +86,8 @@ pub enum ExecutionEvent {
     Report(ExecutionReport),
     #[strum(transparent)]
     Account(AccountState),
+    /// Evidence returned by an execution client for a conversion.
+    Convert(execution::ConvertExecutionEvent),
     /// Custom data published on the bus, such as venue account operations.
     Data(CustomData),
 }

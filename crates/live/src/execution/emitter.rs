@@ -35,7 +35,7 @@ use arc_swap::ArcSwapOption;
 use nautilus_common::{
     factories::OrderEventFactory,
     live::sender::EventSender,
-    messages::{ExecutionEvent, ExecutionReport},
+    messages::{ExecutionEvent, ExecutionReport, execution::ConvertExecutionEvent},
 };
 use nautilus_core::{Params, UUID4, UnixNanos, time::AtomicTime};
 use nautilus_model::{
@@ -604,6 +604,13 @@ impl ExecutionEventEmitter {
     /// Emits an account state event.
     pub fn send_account_state(&self, state: AccountState) {
         if let Err(e) = self.try_send_account_state(state) {
+            log::warn!("{e}");
+        }
+    }
+
+    /// Emits execution evidence for an original conversion.
+    pub fn send_convert_event(&self, event: ConvertExecutionEvent) {
+        if let Err(e) = self.try_send(ExecutionEvent::Convert(event), "Convert event") {
             log::warn!("{e}");
         }
     }

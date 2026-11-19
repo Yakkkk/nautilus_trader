@@ -45,7 +45,8 @@ use nautilus_common::{
         },
         execution::{
             BatchCancelOrders, BatchModifyOrders, CancelAllOrders, CancelOrder, ExecutionReport,
-            ModifyOrder, QueryAccount, QueryOrder, SubmitOrder, SubmitOrderList, TradingCommand,
+            ModifyOrder, QueryAccount, QueryConvert, QueryOrder, SubmitConvert, SubmitOrder,
+            SubmitOrderList, TradingCommand,
         },
     },
     timer::TimeEvent,
@@ -95,6 +96,10 @@ pub const PAYLOAD_TYPE_BATCH_CANCEL_ORDERS: &str = "BatchCancelOrders";
 pub const PAYLOAD_TYPE_QUERY_ORDER: &str = "QueryOrder";
 /// The canonical `payload_type` tag for [`QueryAccount`].
 pub const PAYLOAD_TYPE_QUERY_ACCOUNT: &str = "QueryAccount";
+/// The canonical `payload_type` tag for [`SubmitConvert`].
+pub const PAYLOAD_TYPE_SUBMIT_CONVERT: &str = "SubmitConvert";
+/// The canonical `payload_type` tag for [`QueryConvert`].
+pub const PAYLOAD_TYPE_QUERY_CONVERT: &str = "QueryConvert";
 
 /// The canonical `payload_type` tag for [`OrderInitialized`].
 pub const PAYLOAD_TYPE_ORDER_INITIALIZED: &str = "OrderInitialized";
@@ -430,6 +435,8 @@ fn extract_trading_command_identity(command: &TradingCommand) -> UUID4 {
         TradingCommand::CancelAllOrders(c) => c.command_id,
         TradingCommand::QueryOrder(c) => c.command_id,
         TradingCommand::QueryAccount(c) => c.command_id,
+        TradingCommand::SubmitConvert(c) => c.operation_id,
+        TradingCommand::QueryConvert(c) => c.operation_id,
     }
 }
 
@@ -500,6 +507,14 @@ fn extract_query_account_headers(cmd: &QueryAccount) -> Headers {
     headers_from_fields(cmd.correlation_id, cmd.causation_id)
 }
 
+fn extract_convert_headers(_cmd: &SubmitConvert) -> Headers {
+    Headers::empty()
+}
+
+fn extract_query_convert_headers(_cmd: &QueryConvert) -> Headers {
+    Headers::empty()
+}
+
 // `send_trading_command` reaches the bus tap with the wrapper's `TypeId`, so the
 // extractor must mirror the encoder's variant dispatch to surface the inner command's
 // correlation metadata on the captured entry.
@@ -514,6 +529,8 @@ fn extract_trading_command_headers(command: &TradingCommand) -> Headers {
         TradingCommand::CancelAllOrders(cmd) => extract_cancel_all_orders_headers(cmd),
         TradingCommand::QueryOrder(cmd) => extract_query_order_headers(cmd),
         TradingCommand::QueryAccount(cmd) => extract_query_account_headers(cmd),
+        TradingCommand::SubmitConvert(cmd) => extract_convert_headers(cmd),
+        TradingCommand::QueryConvert(cmd) => extract_query_convert_headers(cmd),
     }
 }
 
@@ -610,6 +627,12 @@ pub fn encode_trading_command(command: &TradingCommand) -> Result<EncodedPayload
         TradingCommand::CancelAllOrders(cmd) => encode_cancel_all_orders(cmd),
         TradingCommand::QueryOrder(cmd) => encode_query_order(cmd),
         TradingCommand::QueryAccount(cmd) => encode_query_account(cmd),
+        TradingCommand::SubmitConvert(cmd) => {
+            encode_convert_command(cmd, PAYLOAD_TYPE_SUBMIT_CONVERT)
+        }
+        TradingCommand::QueryConvert(cmd) => {
+            encode_convert_command(cmd, PAYLOAD_TYPE_QUERY_CONVERT)
+        }
     }
 }
 
@@ -1038,6 +1061,15 @@ fn encode_query_account(cmd: &QueryAccount) -> Result<EncodedPayload, EncodeErro
     let payload = encode_serde(cmd)?;
     Ok(EncodedPayload::with_payload_type(
         payload_type(PAYLOAD_TYPE_QUERY_ACCOUNT),
+        payload,
+        Vec::new(),
+    ))
+}
+
+fn encode_convert_command<T: Serialize>(cmd: &T, tag: &str) -> Result<EncodedPayload, EncodeError> {
+    let payload = encode_serde(cmd)?;
+    Ok(EncodedPayload::with_payload_type(
+        payload_type(tag),
         payload,
         Vec::new(),
     ))

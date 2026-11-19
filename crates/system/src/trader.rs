@@ -43,11 +43,11 @@ use nautilus_common::{
     },
     enums::{ComponentState, ComponentTrigger, Environment},
     logging::RECV,
-    messages::execution::TradingCommand,
+    messages::execution::{ConvertResult, TradingCommand},
     msgbus,
     msgbus::{
         ShareableMessageHandler, TypedHandler, get_message_bus,
-        switchboard::{get_event_order_topic, get_event_position_topic},
+        switchboard::{get_event_convert_topic, get_event_order_topic, get_event_position_topic},
     },
     timer::{TimeEvent, TimeEventCallback},
 };
@@ -132,7 +132,7 @@ pub struct Trader {
     /// Strategy stop functions for managed stop behavior.
     strategy_stop_fns: AHashMap<StrategyId, Box<dyn FnMut() -> bool>>,
     /// Msgbus handler IDs for strategy event subscriptions (order, position).
-    strategy_handler_ids: AHashMap<StrategyId, (Ustr, Ustr)>,
+    strategy_handler_ids: AHashMap<StrategyId, (Ustr, Ustr, ShareableMessageHandler)>,
     /// Registered exec algorithm IDs (algorithms stored in global registry).
     pub(crate) exec_algorithm_ids: Vec<ExecAlgorithmId>,
     /// Restores strategy event subscriptions for concrete execution algorithms.
@@ -517,6 +517,21 @@ impl Trader {
         let position_handler_id = position_handler.id();
         msgbus::subscribe_position_events(position_topic.into(), position_handler, None);
 
+        // Subscribe to conversion results for this strategy
+        let convert_actor_id = actor_id;
+        let convert_handler = ShareableMessageHandler::from_typed(move |result: &ConvertResult| {
+            if let Some(mut strategy) = try_get_actor_unchecked::<T>(&convert_actor_id) {
+                strategy.handle_convert_result(result.clone());
+            } else {
+                log::error!("Strategy {convert_actor_id} not found for conversion result handling");
+            }
+        });
+        msgbus::subscribe_any(
+            get_event_convert_topic(strategy_id).into(),
+            convert_handler.clone(),
+            None,
+        );
+
         let control_actor_id = actor_id;
         let control_handler = TypedHandler::from(move |command: &StrategyCommand| {
             if let Some(mut strategy) = try_get_actor_unchecked::<T>(&control_actor_id) {
@@ -546,8 +561,10 @@ impl Trader {
                 save: Self::save_component_state::<T>,
             },
         );
-        self.strategy_handler_ids
-            .insert(strategy_id, (order_handler_id, position_handler_id));
+        self.strategy_handler_ids.insert(
+            strategy_id,
+            (order_handler_id, position_handler_id, convert_handler),
+        );
 
         // Register stop hook
         let stop_actor_id = actor_id;
@@ -1557,13 +1574,15 @@ impl Trader {
 
     /// Removes the msgbus registrations the trader installed for `strategy_id`.
     fn remove_strategy_subscriptions(&mut self, strategy_id: StrategyId) {
-        if let Some((order_handler_id, position_handler_id)) =
+        if let Some((order_handler_id, position_handler_id, convert_handler)) =
             self.strategy_handler_ids.remove(&strategy_id)
         {
             let order_topic = get_event_order_topic(strategy_id);
             let position_topic = get_event_position_topic(strategy_id);
+            let convert_topic = get_event_convert_topic(strategy_id);
             msgbus::remove_order_event_handler(order_topic.into(), order_handler_id);
             msgbus::remove_position_event_handler(position_topic.into(), position_handler_id);
+            msgbus::unsubscribe_any(convert_topic.into(), &convert_handler);
         }
 
         get_message_bus()

@@ -47,9 +47,10 @@ use nautilus_common::{
     clients::{ExecutionClient, ExecutionReportTask},
     live::dst::task::JoinHandle,
     messages::execution::{
-        BatchCancelOrders, BatchModifyOrders, CancelAllOrders, CancelOrder, GenerateFillReports,
-        GenerateOrderStatusReport, GenerateOrderStatusReports, GeneratePositionStatusReports,
-        ModifyOrder, QueryAccount, QueryOrder, SubmitOrder, SubmitOrderList,
+        BatchCancelOrders, BatchModifyOrders, CancelAllOrders, CancelOrder, ConvertTransaction,
+        GenerateFillReports, GenerateOrderStatusReport, GenerateOrderStatusReports,
+        GeneratePositionStatusReports, ModifyOrder, QueryAccount, QueryConvert, QueryOrder,
+        SubmitConvert, SubmitOrder, SubmitOrderList,
     },
 };
 use nautilus_core::{Params, UnixNanos};
@@ -59,7 +60,7 @@ use nautilus_model::{
     identifiers::{
         AccountId, ClientId, ClientOrderId, InstrumentId, StrategyId, Venue, VenueOrderId,
     },
-    instruments::{Instrument, InstrumentAny},
+    instruments::{Instrument, InstrumentAny, neg_risk::ConvertScope},
     orders::OrderAny,
     reports::{ExecutionMassStatus, FillReport, OrderStatusReport, PositionStatusReport},
     types::{AccountBalance, MarginBalance, Money, Price, Quantity},
@@ -503,6 +504,18 @@ impl ExecutionClient for LiveExecutionClient {
 
     fn submit_order_list(&self, cmd: SubmitOrderList) -> anyhow::Result<()> {
         self.client.borrow().submit_order_list(cmd)
+    }
+
+    fn submit_convert(&self, cmd: SubmitConvert, scope: ConvertScope) -> anyhow::Result<()> {
+        self.client.borrow().submit_convert(cmd, scope)
+    }
+
+    fn query_convert(
+        &self,
+        cmd: QueryConvert,
+        transaction: &ConvertTransaction,
+    ) -> anyhow::Result<()> {
+        self.client.borrow().query_convert(cmd, transaction)
     }
 
     fn modify_order(&self, cmd: ModifyOrder) -> anyhow::Result<()> {

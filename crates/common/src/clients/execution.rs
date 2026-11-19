@@ -27,7 +27,7 @@ use nautilus_model::{
     identifiers::{
         AccountId, ClientId, ClientOrderId, InstrumentId, StrategyId, Venue, VenueOrderId,
     },
-    instruments::InstrumentAny,
+    instruments::{InstrumentAny, neg_risk::ConvertScope},
     orders::OrderAny,
     reports::{ExecutionMassStatus, FillReport, OrderStatusReport, PositionStatusReport},
     types::{AccountBalance, MarginBalance, Money, Price, Quantity},
@@ -36,11 +36,11 @@ use rust_decimal::Decimal;
 
 use super::log_not_implemented;
 use crate::messages::execution::{
-    BatchCancelOrders, BatchModifyOrders, CancelAllOrders, CancelOrder, GenerateFillReports,
-    GenerateFillReportsBuilder, GenerateOrderStatusReport, GenerateOrderStatusReports,
-    GenerateOrderStatusReportsBuilder, GeneratePositionStatusReports,
-    GeneratePositionStatusReportsBuilder, ModifyOrder, QueryAccount, QueryOrder, SubmitOrder,
-    SubmitOrderList,
+    BatchCancelOrders, BatchModifyOrders, CancelAllOrders, CancelOrder, ConvertTransaction,
+    GenerateFillReports, GenerateFillReportsBuilder, GenerateOrderStatusReport,
+    GenerateOrderStatusReports, GenerateOrderStatusReportsBuilder, GeneratePositionStatusReports,
+    GeneratePositionStatusReportsBuilder, ModifyOrder, QueryAccount, QueryConvert, QueryOrder,
+    SubmitConvert, SubmitOrder, SubmitOrderList,
 };
 
 /// Default maximum absolute position difference tolerated during reconciliation.
@@ -347,6 +347,39 @@ pub trait ExecutionClient {
     fn query_account(&self, cmd: QueryAccount) -> anyhow::Result<()> {
         log_not_implemented(self.client_id(), &cmd);
         Ok(())
+    }
+
+    /// Dispatches an admitted conversion. A synchronous error means no submission was made.
+    ///
+    /// A client emits execution evidence through its event sender only after this call returns
+    /// `Ok`, so later evidence can be bound to a dispatched request.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if conversion is unsupported or cannot be dispatched.
+    fn submit_convert(&self, _cmd: SubmitConvert, _scope: ConvertScope) -> anyhow::Result<()> {
+        anyhow::bail!(
+            "Execution client {} does not support Convert",
+            self.client_id()
+        )
+    }
+
+    /// Dispatches a bounded, read-only check of the original transaction.
+    ///
+    /// The client must not create a new conversion submission for a query.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if querying conversion is unsupported or cannot be dispatched.
+    fn query_convert(
+        &self,
+        _cmd: QueryConvert,
+        _transaction: &ConvertTransaction,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!(
+            "Execution client {} does not support querying Convert",
+            self.client_id()
+        )
     }
 
     /// Queries the status of an order.
