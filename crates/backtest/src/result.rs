@@ -946,7 +946,7 @@ fn replace_identity(
 fn primary_identity_class(key: &str) -> Option<IdentityClass> {
     match key {
         "client_order_id" => Some(IdentityClass::ClientOrder),
-        "event_id" => Some(IdentityClass::Event),
+        "cycle_id" | "event_id" | "operation_id" => Some(IdentityClass::Event),
         "order_list_id" => Some(IdentityClass::OrderList),
         "position_id" => Some(IdentityClass::Position),
         "trade_id" => Some(IdentityClass::Trade),
@@ -959,7 +959,13 @@ fn identity_scalar_class(key: &str) -> Option<IdentityClass> {
     match key {
         "client_order_id" | "closing_order_id" | "exec_spawn_id" | "opening_order_id"
         | "parent_order_id" => Some(IdentityClass::ClientOrder),
-        "causation_id" | "event_id" | "init_id" => Some(IdentityClass::Event),
+        "causation_id"
+        | "cycle_id"
+        | "event_id"
+        | "init_id"
+        | "opening_operation_id"
+        | "operation_id"
+        | "previous_cycle_id" => Some(IdentityClass::Event),
         "order_list_id" => Some(IdentityClass::OrderList),
         "position_id" => Some(IdentityClass::Position),
         "last_trade_id" | "trade_id" => Some(IdentityClass::Trade),
@@ -1319,7 +1325,8 @@ mod tests {
         ]);
         first["positions"] = json!([
             {
-                "position_id": "33333333-3333-4333-8333-333333333333"
+                "position_id": "33333333-3333-4333-8333-333333333333",
+                "cycle_id": "22222222-2222-4222-8222-222222222222"
             }
         ]);
         let mut repeated = first.clone();
@@ -1343,6 +1350,105 @@ mod tests {
             "venue-order-1"
         );
         assert_eq!(first["positions"][0]["position_id"], "position-1");
+        assert_eq!(first["positions"][0]["cycle_id"], "event-1");
+    }
+
+    #[rstest]
+    fn test_canonicalize_document_normalizes_convert_cycle_identities() {
+        let prior_event_id = "11111111-1111-4111-8111-111111111111";
+        let operation_id = "55555555-5555-4555-8555-555555555555";
+        let position_id = "33333333-3333-4333-8333-333333333333";
+        let mut first = test_document();
+        first["fills"] = json!([
+            {
+                "event": {
+                    "Filled": {
+                        "event_id": prior_event_id
+                    }
+                }
+            }
+        ]);
+        first["position_snapshots"] = json!([
+            {
+                "position_id": position_id,
+                "cycle_id": prior_event_id,
+                "events": [{"event_id": prior_event_id}]
+            },
+            {
+                "position_id": position_id,
+                "cycle_id": operation_id,
+                "opening_operation_id": operation_id,
+                "replay_events": [{
+                    "Converted": {
+                        "operation_id": operation_id,
+                        "cycle_id": operation_id,
+                        "kind": {"Open": {"previous_cycle_id": prior_event_id}}
+                    }
+                }]
+            }
+        ]);
+        first["positions"] = json!([
+            {
+                "position_id": position_id,
+                "cycle_id": operation_id,
+                "opening_operation_id": operation_id,
+                "replay_events": [{
+                    "Converted": {
+                        "operation_id": operation_id,
+                        "cycle_id": operation_id,
+                        "kind": {"Open": {"previous_cycle_id": prior_event_id}}
+                    }
+                }]
+            }
+        ]);
+        let mut repeated = first.clone();
+        replace_test_identity(&mut repeated["fills"]);
+        replace_test_identity(&mut repeated["position_snapshots"]);
+        replace_test_identity(&mut repeated["positions"]);
+        let mut reordered = first.clone();
+        reordered["position_snapshots"]
+            .as_array_mut()
+            .unwrap()
+            .reverse();
+
+        canonicalize_document(&mut first).unwrap();
+        canonicalize_document(&mut repeated).unwrap();
+        canonicalize_document(&mut reordered).unwrap();
+
+        assert_eq!(first, repeated);
+        assert_eq!(first, reordered);
+        let prior_cycle_id = first["position_snapshots"][0]["cycle_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let current_cycle_id = first["position_snapshots"][1]["cycle_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let current = &first["position_snapshots"][1];
+        let converted = &current["replay_events"][0]["Converted"];
+
+        assert_ne!(prior_cycle_id, current_cycle_id);
+        assert_eq!(
+            current["opening_operation_id"].as_str(),
+            Some(current_cycle_id.as_str())
+        );
+        assert_eq!(
+            converted["operation_id"].as_str(),
+            Some(current_cycle_id.as_str())
+        );
+        assert_eq!(
+            converted["cycle_id"].as_str(),
+            Some(current_cycle_id.as_str())
+        );
+        assert_eq!(
+            converted["kind"]["Open"]["previous_cycle_id"].as_str(),
+            Some(prior_cycle_id.as_str())
+        );
+        assert_eq!(
+            first["positions"][0]["cycle_id"].as_str(),
+            Some(current_cycle_id.as_str())
+        );
     }
 
     #[rstest]
