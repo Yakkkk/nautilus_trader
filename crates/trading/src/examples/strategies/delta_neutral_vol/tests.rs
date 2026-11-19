@@ -1057,7 +1057,7 @@ fn test_fill_void_corrects_only_affected_leg_and_preserves_external_baseline(
 
     for position in &positions {
         assert_eq!(
-            strategy.order_filled_qty[&position.opening_order_id],
+            strategy.order_filled_qty[&position.opening_order_id.expect("opening order")],
             position.events[0].last_qty.as_decimal()
         );
     }
@@ -1300,7 +1300,7 @@ fn test_fill_void_ignores_other_strategy_fills_in_shared_venue_position() {
 #[rstest]
 fn test_timer_drops_applied_quantities_for_purged_orders() {
     let (mut strategy, positions) = start_strategy_with_positions();
-    let purged_id = positions[0].opening_order_id;
+    let purged_id = positions[0].opening_order_id.expect("opening order");
     strategy
         .core
         .cache_rc()
@@ -1319,11 +1319,11 @@ fn test_timer_drops_applied_quantities_for_purged_orders() {
     assert_eq!(strategy.order_filled_qty.len(), 2);
     assert!(!strategy.order_filled_qty.contains_key(&purged_id));
     assert_eq!(
-        strategy.order_filled_qty[&positions[1].opening_order_id],
+        strategy.order_filled_qty[&positions[1].opening_order_id.expect("opening order")],
         5.into()
     );
     assert_eq!(
-        strategy.order_filled_qty[&positions[2].opening_order_id],
+        strategy.order_filled_qty[&positions[2].opening_order_id.expect("opening order")],
         6.into()
     );
     assert_eq!(

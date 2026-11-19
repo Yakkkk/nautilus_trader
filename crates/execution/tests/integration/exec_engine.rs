@@ -751,7 +751,7 @@ fn test_instrument_close_settles_open_binary_positions(
         assert_eq!(closed.quantity, Quantity::from("0.00"));
         assert_eq!(closed.peak_quantity, Quantity::from(last_qty));
         assert_eq!(closed.last_qty, Quantity::from(last_qty));
-        assert_eq!(closed.last_px, close.close_price);
+        assert_eq!(closed.last_px, Some(close.close_price));
         assert_eq!(closed.currency, Currency::USDC());
         assert_eq!(closed.avg_px_open, Decimal::try_from(avg_px_open).unwrap());
         assert_eq!(closed.avg_px_close, Some(close.close_price.as_decimal()));
@@ -852,7 +852,7 @@ fn test_instrument_close_settles_open_position_at_cached_close() {
         panic!("expected position closed event, was {:?}", received[0]);
     };
 
-    assert_eq!(closed.last_px, first_close.close_price);
+    assert_eq!(closed.last_px, Some(first_close.close_price));
     assert_eq!(closed.ts_event, first_close.ts_event);
     assert!(position.is_settled());
     assert_eq!(position.realized_pnl, Some(Money::from("5.90 USDC")));
@@ -4585,7 +4585,7 @@ fn test_process_leg_fill_without_order_updates_position_and_publishes_order_befo
         PositionEvent::PositionOpened(_)
     ));
     assert_eq!(position.id, expected_position_id);
-    assert_eq!(position.opening_order_id, client_order_id);
+    assert_eq!(position.opening_order_id, Some(client_order_id));
     assert_eq!(position.quantity, Quantity::from(1));
     assert!(!cache.order_exists(&client_order_id));
     assert_eq!(cache.position_id(&client_order_id), None);
@@ -4727,7 +4727,7 @@ fn test_hedging_leg_fill_without_order_reuses_position_for_same_synthetic_leg(
         );
 
         assert_eq!(positions.len(), 1);
-        assert_eq!(positions[0].opening_order_id, client_order_id);
+        assert_eq!(positions[0].opening_order_id, Some(client_order_id));
         assert_eq!(positions[0].quantity, Quantity::from(1));
         assert!(!cache.order_exists(&client_order_id));
         assert_eq!(cache.position_id(&client_order_id), None);
@@ -4750,7 +4750,7 @@ fn test_hedging_leg_fill_without_order_reuses_position_for_same_synthetic_leg(
         assert_eq!(position.event_count(), 2);
         assert!(position.trade_ids.contains(&fill.trade_id));
         assert!(position.trade_ids.contains(&second_fill.trade_id));
-        assert_eq!(position.opening_order_id, client_order_id);
+        assert_eq!(position.opening_order_id, Some(client_order_id));
     }
     assert!(!cache.order_exists(&client_order_id));
     assert_eq!(cache.position_id(&client_order_id), None);
@@ -4831,8 +4831,8 @@ fn test_hedging_leg_fill_without_order_reuses_open_position_after_flip(
 
         assert_eq!(open_positions.len(), 1);
         assert_eq!(closed_positions.len(), 1);
-        assert_eq!(open_positions[0].opening_order_id, client_order_id);
-        assert_eq!(closed_positions[0].opening_order_id, client_order_id);
+        assert_eq!(open_positions[0].opening_order_id, Some(client_order_id));
+        assert_eq!(closed_positions[0].opening_order_id, Some(client_order_id));
         assert_eq!(open_positions[0].side, PositionSide::Short);
         assert_eq!(open_positions[0].quantity, Quantity::from(1));
         open_positions[0].id
@@ -16567,7 +16567,7 @@ fn test_hedging_flip_remainders_require_matching_orders(
 
         if ClientOrderId::from(opening_order_id) != reversal_order.client_order_id() {
             let mut position = cache.position_mut(&flipped_position_id).unwrap();
-            position.opening_order_id = ClientOrderId::from(opening_order_id);
+            position.opening_order_id = Some(ClientOrderId::from(opening_order_id));
 
             let PositionReplayEvent::Filled(fill) = position.replay_events.last_mut().unwrap()
             else {
@@ -16652,7 +16652,7 @@ fn test_hedging_flip_remainders_require_matching_orders(
     assert_ne!(flipped_position_id, position_id);
     assert_eq!(
         positions[0].opening_order_id,
-        ClientOrderId::from(opening_order_id)
+        Some(ClientOrderId::from(opening_order_id))
     );
     assert_eq!(positions[0].side, PositionSide::Short);
     assert_eq!(positions[0].quantity, Quantity::from(expected_position_qty));
@@ -19476,7 +19476,7 @@ fn test_reconcile_fill_report_does_not_reopen_snapshot_reconciled_position(
     assert_eq!(replay_order.status(), OrderStatus::Filled);
     assert_eq!(replay_order.filled_qty(), Quantity::from(100_000));
     assert_eq!(positions.len(), 1);
-    assert_eq!(positions[0].opening_order_id, opening_client_order_id);
+    assert_eq!(positions[0].opening_order_id, Some(opening_client_order_id));
     assert_eq!(positions[0].signed_decimal_qty(), expected_qty);
     assert_eq!(
         positions[0].trade_ids.contains(&replay_trade_id),
@@ -19530,7 +19530,7 @@ fn test_reconcile_fill_report_preserves_snapshot_for_unlinked_hedging_order(
         Some(Money::from("1.23 USD"))
     );
     assert_eq!(positions.len(), 1);
-    assert_eq!(positions[0].opening_order_id, opening);
+    assert_eq!(positions[0].opening_order_id, Some(opening));
     assert_eq!(positions[0].signed_decimal_qty(), dec!(100_000));
     assert!(!positions[0].trade_ids.contains(&trade_id));
 }
@@ -19609,7 +19609,7 @@ fn test_reconcile_order_report_does_not_double_snapshot_position(
     assert_eq!(replay_order.filled_qty(), Quantity::from(100_000));
     assert_eq!(replay_order.trade_ids().len(), expected_fills);
     assert_eq!(positions.len(), 1);
-    assert_eq!(positions[0].opening_order_id, opening_client_order_id);
+    assert_eq!(positions[0].opening_order_id, Some(opening_client_order_id));
     assert_eq!(positions[0].signed_decimal_qty(), expected_qty);
     assert_eq!(
         positions[0].trade_ids.len(),
@@ -19658,7 +19658,7 @@ fn test_reconcile_order_report_applies_fill_to_other_hedge(
     let positions = cache.positions_open(None, Some(&instrument.id()), None, None, None);
     let other = positions
         .iter()
-        .find(|position| position.opening_order_id == client_order_id)
+        .find(|position| position.opening_order_id == Some(client_order_id))
         .unwrap();
 
     assert_eq!(positions.len(), 2);
@@ -19857,7 +19857,7 @@ fn test_reconcile_netting_snapshot_covers_other_strategy(
         Quantity::from(25_000)
     );
     assert_eq!(positions.len(), 1);
-    assert_eq!(positions[0].opening_order_id, opening);
+    assert_eq!(positions[0].opening_order_id, Some(opening));
     assert_eq!(positions[0].signed_decimal_qty(), dec!(100_000));
 }
 
@@ -20101,11 +20101,11 @@ fn test_reconcile_fill_report_applies_earlier_fill_outside_reconciled_position(
     let positions = cache.positions_open(None, None, None, None, None);
     let reconciled = positions
         .iter()
-        .find(|position| position.opening_order_id == reconciled_client_order_id)
+        .find(|position| position.opening_order_id == Some(reconciled_client_order_id))
         .unwrap();
     let applied = positions
         .iter()
-        .find(|position| position.opening_order_id == client_order_id)
+        .find(|position| position.opening_order_id == Some(client_order_id))
         .unwrap();
 
     assert_eq!(order.status(), OrderStatus::Filled);
@@ -20305,7 +20305,7 @@ fn test_open_position_persistence_failure_still_publishes_event() {
 
     let received = received.borrow();
     assert_eq!(position.quantity, Quantity::from(100_000));
-    assert_eq!(position.opening_order_id, order.client_order_id());
+    assert_eq!(position.opening_order_id, Some(order.client_order_id()));
     assert_eq!(received.len(), 1);
 
     let PositionEvent::PositionOpened(opened) = &received[0] else {
@@ -20400,7 +20400,10 @@ fn test_reopen_position_persistence_failure_still_publishes_event() {
 
     let received = received.borrow();
     assert_eq!(position.quantity, Quantity::from(100_000));
-    assert_eq!(position.opening_order_id, reopen_order.client_order_id());
+    assert_eq!(
+        position.opening_order_id,
+        Some(reopen_order.client_order_id())
+    );
     assert_eq!(received.len(), 1);
 
     let PositionEvent::PositionOpened(opened) = &received[0] else {
@@ -25814,7 +25817,7 @@ fn test_closed_netting_position_ignores_duplicate_from_prior_cycle() {
     assert_eq!(position.quantity, Quantity::from(100_000));
     assert_eq!(
         position.opening_order_id,
-        ClientOrderId::from("O-REPLAY-REOPEN-3"),
+        Some(ClientOrderId::from("O-REPLAY-REOPEN-3")),
     );
     assert_eq!(position.events.len(), 1);
     assert_eq!(position.replay_events.len(), 4);

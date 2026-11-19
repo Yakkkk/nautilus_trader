@@ -1,9 +1,8 @@
 # PositionOpened
 
 `PositionOpened` records the opening snapshot of a new position. The `ExecutionEngine` emits it when
-a fill creates the position (see
-[From fill to position](index.md#from-fill-to-position-the-causal-chain)). Handler:
-`on_position_opened`.
+a fill or an allocated [Convert change](../positions.md#convert-accounting) opens the position.
+Handler: `on_position_opened`.
 
 ## Fields
 
@@ -17,8 +16,8 @@ fields are:
 | `side`         | `PositionSide`    | The current position side (`LONG` or `SHORT`).     |
 | `signed_qty`   | `float`           | The signed position quantity.                      |
 | `quantity`     | `Quantity`        | The current open quantity.                         |
-| `last_qty`     | `Quantity`        | The quantity of the fill that opened the position. |
-| `last_px`      | `Price`           | The price of the fill that opened the position.    |
+| `last_qty`     | `Quantity`        | The quantity that opened the position.             |
+| `last_px`      | `Price` or `None` | The opening fill price, absent for Convert.        |
 | `currency`     | `Currency`        | The position quote currency.                       |
 | `avg_px_open`  | `float`           | The average open price.                            |
 | `realized_pnl` | `Money` or `None` | The current cycle's realized PnL in cost currency. |

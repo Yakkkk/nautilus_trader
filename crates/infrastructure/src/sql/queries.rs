@@ -1317,7 +1317,7 @@ impl DatabaseQueries {
             .bind(snapshot.strategy_id.to_string())
             .bind(snapshot.instrument_id.to_string())
             .bind(snapshot.account_id.to_string())
-            .bind(snapshot.opening_order_id.to_string())
+            .bind(snapshot.opening_order_id.map(|order_id| order_id.to_string()))
             .bind(snapshot.closing_order_id.map(|x| x.to_string()))
             .bind(snapshot.entry.to_string())
             .bind(snapshot.side.to_string())

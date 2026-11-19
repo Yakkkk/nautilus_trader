@@ -56,6 +56,18 @@ A position closes when the **net quantity becomes zero** (`FLAT`). At closure:
 - In either OMS type, when the position later reopens under the same ID, the engine snapshots
   the closed state to preserve historical PnL (see [Position snapshotting](#position-snapshotting)).
 
+### Convert accounting
+
+The position model can also apply an already allocated Polymarket Convert change to a `NETTING` position.
+The change can open or increase a long position, or reduce it to a smaller quantity or close it. Convert
+does not create an order or fill. An operation-opened position has an `opening_operation_id` instead of an
+`opening_order_id`. A Convert lifecycle event records the operation and affected quantity but has no
+`last_px`: its cost basis is not a trade price.
+
+Ordinary fills and contract settlement can still close the position. Unrealized PnL uses the market as
+usual and is unavailable without a suitable price. This accounting support does not expose a Convert
+submission command to strategies.
+
 ### Settlement at contract expiration
 
 In a live node, an `InstrumentClose` of type `CONTRACT_EXPIRED` settles binary option positions only on venues

@@ -216,7 +216,7 @@ class.
 | `instrument_id`    | ✓      | ✓       | ✓      | Instrument for the position.                 |
 | `position_id`      | ✓      | ✓       | ✓      | Unique position identifier.                  |
 | `account_id`       | ✓      | ✓       | ✓      | Account the position belongs to.             |
-| `opening_order_id` | ✓      | ✓       | ✓      | Order that opened the position.              |
+| `opening_order_id` | ✓      | ✓       | ✓      | Opening order, if opened by a fill.          |
 | `closing_order_id` | -      | -       | ✓      | Order that closed the position.              |
 | `entry`            | ✓      | ✓       | ✓      | Side of the opening fill.                    |
 | `side`             | ✓      | ✓       | ✓      | Current position side.                       |
@@ -224,8 +224,8 @@ class.
 | `quantity`         | ✓      | ✓       | ✓      | Unsigned position quantity.                  |
 | `peak_quantity`    | -      | ✓       | ✓      | Largest quantity held.                       |
 | `peak_qty`         | -      | ✓       | ✓      | Compatibility alias for `peak_quantity`.     |
-| `last_qty`         | ✓      | ✓       | ✓      | Quantity of the fill or correction.          |
-| `last_px`          | ✓      | ✓       | ✓      | Price of the fill or correction.             |
+| `last_qty`         | ✓      | ✓       | ✓      | Quantity affected by the event.              |
+| `last_px`          | ✓      | ✓       | ✓      | Fill or settlement price, if applicable.     |
 | `currency`         | ✓      | ✓       | ✓      | Position quote currency.                     |
 | `avg_px_open`      | ✓      | ✓       | ✓      | Average entry price.                         |
 | `avg_px_close`     | -      | ✓       | ✓      | Average exit price, if available.            |
@@ -238,6 +238,10 @@ class.
 | `event_id`         | ✓      | ✓       | ✓      | Unique event identifier.                     |
 | `ts_event`         | ✓      | ✓       | ✓      | Timestamp of the triggering event.           |
 | `ts_init`          | ✓      | ✓       | ✓      | Timestamp when event was created.            |
+
+All three events expose `opening_operation_id` when the cycle opened through Convert, and `convert` when
+the event itself records an allocated Convert change. Both fields are optional. See
+[Convert accounting](../positions.md#convert-accounting).
 
 ### Tracing orders to positions
 

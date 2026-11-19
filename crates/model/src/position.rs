@@ -15,13 +15,15 @@
 
 //! Market positions, replay history, and checked financial arithmetic.
 //!
-//! [`Position`] tracks open and closed positions from fills, adjustments, and instrument settlement.
+//! [`Position`] tracks open and closed positions from fills, Convert, adjustments, and instrument
+//! settlement.
 //! It records quantity, side, average prices, commissions, and realized PnL.
 //!
 //! # Replay
 //!
-//! The replay journal records fills, adjustments, and instrument close events. Retained history
-//! supports price restatements and cumulative fill corrections across close and reopen cycles.
+//! The replay journal records fills, Convert changes, adjustments, and instrument close events.
+//! Retained history supports price restatements and cumulative fill corrections across close and
+//! reopen cycles.
 //!
 //! # Checked Arithmetic
 //!
@@ -58,7 +60,7 @@ use crate::{
     enums::{
         InstrumentClass, InstrumentCloseType, OrderSide, PositionAdjustmentType, PositionSide,
     },
-    events::{OrderFillVoided, OrderFilled, PositionAdjusted},
+    events::{OrderFillVoided, OrderFilled, PositionAdjusted, position::PositionEvent},
     identifiers::{
         AccountId, ClientOrderId, InstrumentId, PositionId, StrategyId, Symbol, TradeId, TraderId,
         Venue, VenueOrderId,
@@ -113,7 +115,13 @@ pub struct Position {
     pub instrument_id: InstrumentId,
     pub id: PositionId,
     pub account_id: AccountId,
-    pub opening_order_id: ClientOrderId,
+    pub opening_order_id: Option<ClientOrderId>,
+    /// The Convert operation that opened the current cycle, if not opened by a fill.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opening_operation_id: Option<UUID4>,
+    /// The opening fill event or Convert operation ID for the current cycle.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cycle_id: Option<UUID4>,
     pub closing_order_id: Option<ClientOrderId>,
     pub entry: OrderSide,
     pub side: PositionSide,
@@ -154,12 +162,49 @@ pub struct Position {
     pub allows_negative_price: Option<bool>,
 }
 
-#[expect(clippy::large_enum_variant)]
+#[cfg_attr(
+    feature = "high-precision",
+    expect(clippy::large_enum_variant, reason = "Keeps replay events inline")
+)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum PositionReplayEvent {
     Filled(OrderFilled),
     Adjusted(PositionAdjusted),
     InstrumentClosed(InstrumentClose),
+    Converted(PositionConvert),
+}
+
+/// The effect of a Convert operation on one position cycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PositionConvertKind {
+    /// Opens a new cycle, optionally replacing the specified closed cycle.
+    Open { previous_cycle_id: Option<UUID4> },
+    /// Adds received assets to an open long position.
+    Increase,
+    /// Removes consumed assets from an open long position.
+    Decrease,
+}
+
+/// A single, already allocated Convert position change, with no order or execution price.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PositionConvert {
+    pub operation_id: UUID4,
+    pub trader_id: TraderId,
+    pub strategy_id: StrategyId,
+    pub instrument_id: InstrumentId,
+    pub position_id: PositionId,
+    pub account_id: AccountId,
+    /// The target cycle; equals `operation_id` when opening a cycle.
+    pub cycle_id: UUID4,
+    pub kind: PositionConvertKind,
+    /// The positive quantity received or consumed.
+    pub quantity: Quantity,
+    /// The allocated cost added or released, denominated in the position cost currency.
+    pub cost: Decimal,
+    /// The allocated realized PnL for a reduction, denominated in the position cost currency.
+    pub realized_pnl: Decimal,
+    pub ts_event: UnixNanos,
+    pub ts_init: UnixNanos,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -168,6 +213,12 @@ pub struct PositionFillVoid {
     pub voided_qty: Quantity,
     pub commission_voided: Option<Money>,
 }
+
+type FillVoidAllocations = (
+    AHashSet<usize>,
+    AHashMap<usize, Quantity>,
+    AHashMap<usize, Money>,
+);
 
 impl Position {
     /// Creates a new [`Position`] instance.
@@ -212,7 +263,9 @@ impl Position {
             instrument_id: fill.instrument_id,
             id: position_id,
             account_id: fill.account_id,
-            opening_order_id: fill.client_order_id,
+            opening_order_id: Some(fill.client_order_id),
+            opening_operation_id: None,
+            cycle_id: Some(fill.event_id),
             closing_order_id: None,
             entry: fill.order_side,
             side: PositionSide::Flat,
@@ -252,6 +305,439 @@ impl Position {
         Ok(item)
     }
 
+    /// Opens a long position from a Convert change without creating a fill.
+    ///
+    /// The change's `position_id` is used as supplied. NETTING fill routing expects the canonical
+    /// `{instrument_id}-{strategy_id}` position ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the opening change or its accounting values are invalid.
+    pub fn new_from_convert(
+        instrument: &InstrumentAny,
+        change: PositionConvert,
+    ) -> CorrectnessResult<Self> {
+        Self::check_convert_instrument(instrument.id(), "instrument.id()", &change)?;
+        check_predicate_true(
+            !instrument.is_inverse(),
+            "Convert accounting does not support inverse instruments",
+        )?;
+        let PositionConvertKind::Open { previous_cycle_id } = change.kind else {
+            return Err(invalid(
+                "`change.kind` must open a position cycle for a new position",
+            ));
+        };
+        Self::check_convert_values(&change)?;
+
+        let mut item = Self {
+            events: Vec::<OrderFilled>::new(),
+            adjustments: Vec::<PositionAdjusted>::new(),
+            replay_events: Vec::new(),
+            fill_voids: Vec::new(),
+            trader_id: change.trader_id,
+            strategy_id: change.strategy_id,
+            instrument_id: change.instrument_id,
+            id: change.position_id,
+            account_id: change.account_id,
+            opening_order_id: None,
+            opening_operation_id: None,
+            cycle_id: None,
+            closing_order_id: None,
+            entry: OrderSide::Buy,
+            side: PositionSide::Flat,
+            signed_qty: Decimal::ZERO,
+            quantity: Quantity::zero(instrument.size_precision()),
+            peak_qty: Quantity::zero(instrument.size_precision()),
+            price_precision: instrument.price_precision(),
+            size_precision: instrument.size_precision(),
+            multiplier: instrument.multiplier(),
+            is_inverse: instrument.is_inverse(),
+            is_currency_pair: matches!(
+                instrument,
+                InstrumentAny::CurrencyPair(_) | InstrumentAny::TokenizedAsset(_)
+            ),
+            instrument_class: instrument.instrument_class(),
+            base_currency: instrument.base_currency(),
+            quote_currency: instrument.quote_currency(),
+            settlement_currency: instrument.cost_currency(),
+            ts_init: change.ts_init,
+            ts_opened: UnixNanos::default(),
+            ts_last: UnixNanos::default(),
+            ts_closed: None,
+            duration_ns: DurationNanos::default(),
+            avg_px_open: Decimal::ZERO,
+            avg_px_close: None,
+            realized_return: 0.0,
+            realized_pnl: None,
+            trade_ids: AHashSet::<TradeId>::new(),
+            buy_qty: Quantity::zero(instrument.size_precision()),
+            sell_qty: Quantity::zero(instrument.size_precision()),
+            commissions: IndexMap::<Currency, Money>::new(),
+            cost_open: Decimal::ZERO,
+            cost_close: Decimal::ZERO,
+            qty_closed: Decimal::ZERO,
+            realized_pnl_remainder: Decimal::ZERO,
+            allows_negative_price: Some(instrument.allows_negative_price()),
+        };
+
+        item.open_convert_cycle(change, previous_cycle_id, false)?;
+        item.replay_events
+            .push(PositionReplayEvent::Converted(change));
+        item.check_accounting()?;
+        Ok(item)
+    }
+
+    /// Applies an allocated Convert change to the current open position cycle.
+    ///
+    /// Returns `None` for an identical change already recorded in this position.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the change is conflicting, stale, or invalid. An error leaves the
+    /// position unchanged.
+    pub fn apply_convert(
+        &mut self,
+        change: PositionConvert,
+    ) -> CorrectnessResult<Option<PositionEvent>> {
+        self.check_convert_identity(&change)?;
+        Self::check_convert_values(&change)?;
+        check_predicate_true(
+            !self.is_inverse,
+            "Convert accounting does not support inverse positions",
+        )?;
+
+        if self.has_convert_change(&change)? {
+            return Ok(None);
+        }
+
+        match change.kind {
+            PositionConvertKind::Open { .. } => Err(invalid(
+                "cannot apply an unrecorded Convert opening to an existing position",
+            )),
+            PositionConvertKind::Increase | PositionConvertKind::Decrease => {
+                let Some(cycle_id) = self.current_cycle_id() else {
+                    return Err(invalid("position has no current cycle"));
+                };
+                check_equal(
+                    &cycle_id,
+                    &change.cycle_id,
+                    "self.cycle_id",
+                    "change.cycle_id",
+                )?;
+                check_predicate_true(
+                    self.side == PositionSide::Long && self.is_open(),
+                    "Convert changes require an open long position",
+                )?;
+
+                let mut next = self.clone();
+                next.apply_convert_state(change, true)?;
+                *self = next;
+                Ok(Some(PositionEvent::from_convert(self, change)))
+            }
+        }
+    }
+
+    fn check_convert_instrument(
+        instrument_id: InstrumentId,
+        instrument_param: &str,
+        change: &PositionConvert,
+    ) -> CorrectnessResult<()> {
+        check_equal(
+            &instrument_id,
+            &change.instrument_id,
+            instrument_param,
+            "change.instrument_id",
+        )
+    }
+
+    fn check_convert_identity(&self, change: &PositionConvert) -> CorrectnessResult<()> {
+        check_equal(
+            &self.trader_id,
+            &change.trader_id,
+            "self.trader_id",
+            "change.trader_id",
+        )?;
+        check_equal(
+            &self.strategy_id,
+            &change.strategy_id,
+            "self.strategy_id",
+            "change.strategy_id",
+        )?;
+        check_equal(
+            &self.instrument_id,
+            &change.instrument_id,
+            "self.instrument_id",
+            "change.instrument_id",
+        )?;
+        check_equal(
+            &self.id,
+            &change.position_id,
+            "self.id",
+            "change.position_id",
+        )?;
+        check_equal(
+            &self.account_id,
+            &change.account_id,
+            "self.account_id",
+            "change.account_id",
+        )
+    }
+
+    fn check_convert_values(change: &PositionConvert) -> CorrectnessResult<()> {
+        let quantity = qty(change.quantity)?;
+        check_predicate_true(
+            quantity > Decimal::ZERO,
+            "`change.quantity` must be positive",
+        )?;
+        check_predicate_true(
+            change.cost >= Decimal::ZERO,
+            "`change.cost` must be nonnegative",
+        )?;
+
+        match change.kind {
+            PositionConvertKind::Open { .. } => {
+                check_predicate_true(
+                    change.cycle_id == change.operation_id,
+                    "`change.cycle_id` must equal `change.operation_id` when opening a cycle",
+                )?;
+                check_predicate_true(
+                    change.realized_pnl.is_zero(),
+                    "Convert opening cannot carry realized PnL",
+                )
+            }
+            PositionConvertKind::Increase => check_predicate_true(
+                change.realized_pnl.is_zero(),
+                "Convert increase cannot carry realized PnL",
+            ),
+            PositionConvertKind::Decrease => Ok(()),
+        }
+    }
+
+    /// Returns the opening fill event or Convert operation ID for the current cycle.
+    ///
+    /// Older serialized positions may not store `cycle_id`, so the current cycle falls back to
+    /// the opening fill event.
+    #[must_use]
+    pub fn current_cycle_id(&self) -> Option<UUID4> {
+        self.cycle_id
+            .or_else(|| self.events.first().map(|fill| fill.event_id))
+    }
+
+    /// Returns whether `change` is already recorded with identical identity and accounting.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a recorded change shares the operation ID with conflicting identity,
+    /// target, or accounting values.
+    pub fn has_convert_change(&self, change: &PositionConvert) -> CorrectnessResult<bool> {
+        let mut found = false;
+
+        for event in &self.replay_events {
+            let PositionReplayEvent::Converted(existing) = event else {
+                continue;
+            };
+
+            if existing.operation_id != change.operation_id {
+                continue;
+            }
+
+            if existing.kind != change.kind
+                || existing.instrument_id != change.instrument_id
+                || existing.position_id != change.position_id
+                || existing.account_id != change.account_id
+                || existing.cycle_id != change.cycle_id
+            {
+                return Err(invalid(&format!(
+                    "Convert change {} conflicts with the recorded identity or target for position {}",
+                    change.operation_id, self.id,
+                )));
+            }
+
+            if existing.quantity != change.quantity
+                || existing.cost != change.cost
+                || existing.realized_pnl != change.realized_pnl
+            {
+                return Err(invalid(&format!(
+                    "Convert change {} conflicts with the recorded accounting for position {}",
+                    change.operation_id, self.id,
+                )));
+            }
+
+            found = true;
+        }
+
+        Ok(found)
+    }
+
+    fn apply_convert_state(
+        &mut self,
+        change: PositionConvert,
+        record_replay: bool,
+    ) -> CorrectnessResult<()> {
+        Self::check_convert_values(&change)?;
+        check_predicate_true(
+            !self.is_inverse,
+            "Convert accounting does not support inverse positions",
+        )?;
+
+        match change.kind {
+            PositionConvertKind::Open { previous_cycle_id } => {
+                self.open_convert_cycle(change, previous_cycle_id, true)?;
+            }
+            PositionConvertKind::Increase => self.increase_convert_cycle(change)?,
+            PositionConvertKind::Decrease => self.decrease_convert_cycle(change)?,
+        }
+
+        if record_replay {
+            self.replay_events
+                .push(PositionReplayEvent::Converted(change));
+        }
+
+        self.debug_assert_invariants();
+        Ok(())
+    }
+
+    fn open_convert_cycle(
+        &mut self,
+        change: PositionConvert,
+        previous_cycle_id: Option<UUID4>,
+        require_previous_cycle: bool,
+    ) -> CorrectnessResult<()> {
+        check_predicate_true(
+            self.side == PositionSide::Flat,
+            "Convert opening requires a flat position cycle",
+        )?;
+
+        check_predicate_true(
+            !require_previous_cycle || previous_cycle_id == self.cycle_id,
+            "Convert opening `previous_cycle_id` does not match the recorded position cycle",
+        )?;
+
+        let signed_qty = qty(change.quantity)?;
+        let quantity = quantity(signed_qty, self.size_precision)?;
+
+        self.events.clear();
+        self.trade_ids.clear();
+        self.adjustments.clear();
+        self.buy_qty = Quantity::zero(self.size_precision);
+        self.sell_qty = Quantity::zero(self.size_precision);
+        self.commissions.clear();
+        self.opening_order_id = None;
+        self.opening_operation_id = Some(change.operation_id);
+        self.cycle_id = Some(change.cycle_id);
+        self.closing_order_id = None;
+        self.entry = OrderSide::Buy;
+        self.side = PositionSide::Long;
+        self.signed_qty = signed_qty;
+        self.quantity = quantity;
+        self.peak_qty = quantity;
+        self.ts_init = change.ts_init;
+        self.ts_opened = change.ts_event;
+        self.ts_last = change.ts_event;
+        self.ts_closed = None;
+        self.duration_ns = DurationNanos::default();
+        self.avg_px_open = div(change.cost, signed_qty)?;
+        self.avg_px_close = None;
+        self.realized_return = 0.0;
+        self.realized_pnl = None;
+        self.cost_open = change.cost;
+        self.cost_close = Decimal::ZERO;
+        self.qty_closed = Decimal::ZERO;
+        self.realized_pnl_remainder = Decimal::ZERO;
+        Ok(())
+    }
+
+    fn increase_convert_cycle(&mut self, change: PositionConvert) -> CorrectnessResult<()> {
+        check_predicate_true(
+            self.side == PositionSide::Long && self.is_open(),
+            "Convert increases require an open long position",
+        )?;
+        let Some(cycle_id) = self.current_cycle_id() else {
+            return Err(invalid("position has no current cycle"));
+        };
+        check_equal(
+            &cycle_id,
+            &change.cycle_id,
+            "self.cycle_id",
+            "change.cycle_id",
+        )?;
+
+        let qty = qty(change.quantity)?;
+        let signed_qty = add(self.signed_qty, qty)?;
+        let quantity = quantity(signed_qty, self.size_precision)?;
+        self.cost_open = add_rounded(self.cost_open, change.cost)?;
+        self.avg_px_open = div(self.cost_open, signed_qty)?;
+        self.signed_qty = signed_qty;
+        self.quantity = quantity;
+        self.peak_qty = self.peak_qty.max(quantity);
+        self.ts_last = change.ts_event;
+        Ok(())
+    }
+
+    fn decrease_convert_cycle(&mut self, change: PositionConvert) -> CorrectnessResult<()> {
+        check_predicate_true(
+            self.side == PositionSide::Long && self.is_open(),
+            "Convert decreases require an open long position",
+        )?;
+        let Some(cycle_id) = self.current_cycle_id() else {
+            return Err(invalid("position has no current cycle"));
+        };
+        check_equal(
+            &cycle_id,
+            &change.cycle_id,
+            "self.cycle_id",
+            "change.cycle_id",
+        )?;
+
+        let qty = qty(change.quantity)?;
+        let prior_qty = self.signed_qty;
+        check_predicate_true(
+            qty <= prior_qty,
+            "Convert decrease exceeds the position quantity",
+        )?;
+
+        let allocated_cost = if qty == prior_qty {
+            self.cost_open
+        } else {
+            proportion(self.cost_open, qty, prior_qty)?
+        };
+        check_equal(
+            &change.cost,
+            &allocated_cost,
+            "change.cost",
+            "allocated position cost",
+        )?;
+
+        let close_value = add_rounded(change.cost, change.realized_pnl)?;
+        let cost_close = add_rounded(self.cost_close, close_value)?;
+        let qty_closed = add(self.qty_closed, qty)?;
+        let avg_px_close = div(cost_close, qty_closed)?;
+        let signed_qty = sub(prior_qty, qty)?;
+        let quantity = quantity(signed_qty, self.size_precision)?;
+        let realized_return = self.calculate_return(self.avg_px_open, avg_px_close);
+
+        self.cost_open = sub(self.cost_open, change.cost)?;
+        self.cost_close = cost_close;
+        self.qty_closed = qty_closed;
+        self.avg_px_close = Some(avg_px_close);
+        self.realized_return = realized_return;
+        self.accumulate_pnl(change.realized_pnl)?;
+        self.signed_qty = signed_qty;
+        self.quantity = quantity;
+
+        if signed_qty.is_zero() {
+            self.side = PositionSide::Flat;
+            self.closing_order_id = None;
+            self.ts_closed = Some(change.ts_event);
+            self.duration_ns = change.ts_event.saturating_duration_since(self.ts_opened);
+        } else {
+            self.side = PositionSide::Long;
+        }
+
+        self.ts_last = change.ts_event;
+        Ok(())
+    }
+
     /// Returns a copy without stored events, adjustments, replay events, fill voids, or trade IDs.
     ///
     /// # Warning
@@ -271,6 +757,8 @@ impl Position {
             id: self.id,
             account_id: self.account_id,
             opening_order_id: self.opening_order_id,
+            opening_operation_id: self.opening_operation_id,
+            cycle_id: self.cycle_id,
             closing_order_id: self.closing_order_id,
             entry: self.entry,
             side: self.side,
@@ -353,6 +841,26 @@ impl Position {
         self.fill_voids
             .retain(|record| record.event.client_order_id != client_order_id);
 
+        if self
+            .replay_events
+            .iter()
+            .any(|event| matches!(event, PositionReplayEvent::Converted(_)))
+        {
+            let mut next = self.clone();
+            next.rebuild_from_replay()?;
+            *self = next;
+
+            log::info!(
+                "Purged fills for order {} from position {}; recalculated Convert-aware state: qty={}, signed_qty={}, side={:?}",
+                client_order_id,
+                self.id,
+                self.quantity,
+                self.signed_qty,
+                self.side
+            );
+            return Ok(());
+        }
+
         let filtered_events: Vec<OrderFilled> = self
             .events
             .iter()
@@ -391,7 +899,9 @@ impl Position {
         // Use the first remaining event to set opening state
         let first_event = &filtered_events[0];
         self.entry = first_event.order_side;
-        self.opening_order_id = first_event.client_order_id;
+        self.opening_order_id = Some(first_event.client_order_id);
+        self.opening_operation_id = None;
+        self.cycle_id = Some(first_event.event_id);
         self.ts_opened = first_event.ts_event;
         self.ts_init = first_event.ts_init;
         self.closing_order_id = None;
@@ -448,7 +958,7 @@ impl Position {
                 }
 
                 if restatement_indexes.contains(&index) {
-                    self.apply_price_restatement(fill, false)?;
+                    self.apply_price_restatement(fill, false, Some(index))?;
                 } else if let Some(effective) = effective_by_id.get(&fill.event_id) {
                     self.apply_fill(effective, false)?;
                 }
@@ -572,6 +1082,25 @@ impl Position {
                     price(close.close_price)?;
                 }
                 PositionReplayEvent::Adjusted(_) => {}
+                PositionReplayEvent::Converted(change) => {
+                    check_predicate_true(
+                        !self.is_inverse,
+                        "Convert accounting does not support inverse positions",
+                    )?;
+                    Self::check_convert_values(change)?;
+                    check_equal(
+                        &self.instrument_id,
+                        &change.instrument_id,
+                        "self.instrument_id",
+                        "change.instrument_id",
+                    )?;
+                    check_equal(
+                        &self.id,
+                        &change.position_id,
+                        "self.id",
+                        "change.position_id",
+                    )?;
+                }
             }
         }
 
@@ -590,7 +1119,7 @@ impl Position {
 
         if self.is_price_restatement(fill) {
             let mut next = self.clone();
-            next.apply_price_restatement(fill, record_replay)?;
+            next.apply_price_restatement(fill, record_replay, None)?;
             *self = next;
             return Ok(());
         }
@@ -704,7 +1233,9 @@ impl Position {
         self.buy_qty = Quantity::zero(self.size_precision);
         self.sell_qty = Quantity::zero(self.size_precision);
         self.commissions.clear();
-        self.opening_order_id = fill.client_order_id;
+        self.opening_order_id = Some(fill.client_order_id);
+        self.opening_operation_id = None;
+        self.cycle_id = Some(fill.event_id);
         self.closing_order_id = None;
         self.peak_qty = Quantity::zero(self.size_precision);
         self.ts_init = fill.ts_init;
@@ -843,9 +1374,10 @@ impl Position {
         &mut self,
         fill: &OrderFilled,
         record_replay: bool,
+        replay_index: Option<usize>,
     ) -> CorrectnessResult<()> {
         if self.side != PositionSide::Flat && !self.quantity.is_zero() {
-            self.restate_open_average(fill)?;
+            self.restate_open_average(fill, replay_index)?;
         }
 
         self.ts_last = fill.ts_event;
@@ -878,13 +1410,34 @@ impl Position {
         false
     }
 
-    fn restate_open_average(&mut self, fill: &OrderFilled) -> CorrectnessResult<()> {
-        if !self.trade_ids.contains(&fill.trade_id)
-            || fill.order_side != self.entry
-            || !self.extends_current_cycle(fill)?
-        {
+    fn restate_open_average(
+        &mut self,
+        fill: &OrderFilled,
+        replay_index: Option<usize>,
+    ) -> CorrectnessResult<()> {
+        if !self.trade_ids.contains(&fill.trade_id) || fill.order_side != self.entry {
             return Ok(());
         }
+
+        let replay_end = replay_index.unwrap_or(self.replay_events.len());
+        let replay_end = replay_end.min(self.replay_events.len());
+        let has_convert_in_prefix = self.replay_events[..replay_end]
+            .iter()
+            .any(|event| matches!(event, PositionReplayEvent::Converted(_)));
+        let trade_qty = if has_convert_in_prefix {
+            let trade_qty =
+                self.cycle_open_qty_for_trade_from_replay(fill.trade_id, Some(replay_end))?;
+
+            if trade_qty.is_zero() {
+                return Ok(());
+            }
+            trade_qty
+        } else {
+            if !self.extends_current_cycle(fill)? {
+                return Ok(());
+            }
+            self.cycle_open_qty_for_trade(fill.trade_id)?
+        };
 
         let new_px = price(fill.last_px)?;
 
@@ -893,7 +1446,7 @@ impl Position {
         };
 
         let open_qty = qty(self.quantity)?;
-        let trade_qty = self.cycle_open_qty_for_trade(fill.trade_id)?.min(open_qty);
+        let trade_qty = trade_qty.min(open_qty);
         if open_qty.is_zero() || trade_qty.is_zero() {
             return Ok(());
         }
@@ -962,10 +1515,162 @@ impl Position {
             .try_fold(Decimal::ZERO, |total, (_, qty)| add_rounded(total, qty))
     }
 
-    fn reduce_open_lots(
-        remaining: &mut [(TradeId, Decimal)],
-        qty: Decimal,
-    ) -> CorrectnessResult<()> {
+    fn cycle_open_qty_for_trade_from_replay(
+        &self,
+        trade_id: TradeId,
+        replay_index: Option<usize>,
+    ) -> CorrectnessResult<Decimal> {
+        let replay_end = replay_index.unwrap_or(self.replay_events.len());
+        let (restatement_indexes, quantity_removed, _) = self.fill_void_allocations()?;
+        let mut remaining: Vec<(Option<TradeId>, Decimal)> = Vec::new();
+        let mut signed = Decimal::ZERO;
+        let mut entry = OrderSide::Buy;
+
+        for (index, event) in self.replay_events.iter().enumerate().take(replay_end) {
+            match event {
+                PositionReplayEvent::Filled(fill) => {
+                    if restatement_indexes.contains(&index) {
+                        continue;
+                    }
+
+                    let effective_qty = Self::effective_fill_qty(
+                        fill.last_qty,
+                        quantity_removed.get(&index).copied(),
+                    )?;
+
+                    if effective_qty.is_zero() {
+                        continue;
+                    }
+
+                    let fill_qty = qty(effective_qty)?;
+                    let delta = if fill.order_side == OrderSide::Buy {
+                        fill_qty
+                    } else {
+                        -fill_qty
+                    };
+                    let after = add(signed, delta)?;
+
+                    if signed.is_zero() {
+                        remaining.clear();
+                        entry = fill.order_side;
+                        remaining.push((Some(fill.trade_id), fill_qty));
+                    } else if !after.is_zero()
+                        && (after > Decimal::ZERO) != (signed > Decimal::ZERO)
+                    {
+                        remaining.clear();
+                        entry = fill.order_side;
+                        remaining.push((Some(fill.trade_id), after.abs()));
+                    } else if fill.order_side == entry {
+                        remaining.push((Some(fill.trade_id), fill_qty));
+                    } else {
+                        Self::reduce_open_lots(&mut remaining, fill_qty)?;
+                    }
+
+                    signed = after;
+                }
+                PositionReplayEvent::Converted(change) => match change.kind {
+                    PositionConvertKind::Open { .. } => {
+                        check_predicate_true(
+                            signed.is_zero(),
+                            "Convert opening requires a flat position cycle",
+                        )?;
+                        let change_qty = qty(change.quantity)?;
+                        remaining.clear();
+                        remaining.push((None, change_qty));
+                        signed = change_qty;
+                        entry = OrderSide::Buy;
+                    }
+                    PositionConvertKind::Increase => {
+                        check_predicate_true(
+                            signed > Decimal::ZERO,
+                            "Convert increase requires an open long position",
+                        )?;
+                        let change_qty = qty(change.quantity)?;
+                        signed = add(signed, change_qty)?;
+                        remaining.push((None, change_qty));
+                    }
+                    PositionConvertKind::Decrease => {
+                        check_predicate_true(
+                            signed > Decimal::ZERO,
+                            "Convert decrease requires an open long position",
+                        )?;
+                        let change_qty = qty(change.quantity)?;
+                        check_predicate_true(
+                            change_qty <= signed,
+                            "Convert decrease exceeds the position quantity",
+                        )?;
+                        Self::reduce_open_lots(&mut remaining, change_qty)?;
+                        signed = sub(signed, change_qty)?;
+                    }
+                },
+                PositionReplayEvent::Adjusted(adjustment) => {
+                    if let Some(change) = adjustment.quantity_change {
+                        let new_signed = add(signed, change)?;
+                        if new_signed.is_zero() {
+                            remaining.clear();
+                        } else if signed.is_zero()
+                            || (new_signed > Decimal::ZERO) != (signed > Decimal::ZERO)
+                        {
+                            remaining.clear();
+                            remaining.push((None, new_signed.abs()));
+                            entry = if new_signed > Decimal::ZERO {
+                                OrderSide::Buy
+                            } else {
+                                OrderSide::Sell
+                            };
+                        } else {
+                            let factor = div(new_signed.abs(), signed.abs())?;
+                            for (_, lot_qty) in &mut remaining {
+                                *lot_qty = mul_rounded(*lot_qty, factor)?;
+                            }
+                        }
+                        signed = new_signed;
+                    }
+                }
+                PositionReplayEvent::InstrumentClosed(_) => {
+                    remaining.clear();
+                    signed = Decimal::ZERO;
+                }
+            }
+        }
+
+        remaining
+            .into_iter()
+            .filter(|(lot_trade_id, _)| *lot_trade_id == Some(trade_id))
+            .try_fold(Decimal::ZERO, |total, (_, lot_qty)| {
+                add_rounded(total, lot_qty)
+            })
+    }
+
+    fn effective_fill_qty(
+        fill_qty: Quantity,
+        removed: Option<Quantity>,
+    ) -> CorrectnessResult<Quantity> {
+        match removed {
+            Some(removed) => quantity_sub(fill_qty, removed, fill_qty.precision),
+            None => Ok(fill_qty),
+        }
+    }
+
+    fn fill_void_allocations(&self) -> CorrectnessResult<FillVoidAllocations> {
+        let restatement_indexes = Self::price_restatement_indexes(&self.replay_events);
+        let mut quantity_removed = AHashMap::<usize, Quantity>::new();
+        let mut commission_removed = AHashMap::<usize, Money>::new();
+
+        for correction in self.latest_fill_voids() {
+            Self::allocate_fill_void(
+                &self.replay_events,
+                correction,
+                &restatement_indexes,
+                &mut quantity_removed,
+                &mut commission_removed,
+            )?;
+        }
+
+        Ok((restatement_indexes, quantity_removed, commission_removed))
+    }
+
+    fn reduce_open_lots<K>(remaining: &mut [(K, Decimal)], qty: Decimal) -> CorrectnessResult<()> {
         let open_qty = remaining
             .iter()
             .try_fold(Decimal::ZERO, |total, (_, qty)| add_rounded(total, *qty))?;
@@ -1577,43 +2282,30 @@ impl Position {
             .collect()
     }
 
-    // The banked total assumes `replay_events` spans every cycle this position archived, since
-    // settling replaces all of its frames with one worth that total. Bounding the log has to
-    // preserve it at trim time; `Cache::settle_position_snapshots` documents the two ways.
+    // The banked total covers only closed cycles in the retained replay journal
     fn rebuild_from_replay(&mut self) -> CorrectnessResult<Option<Money>> {
         let replay_events = self.replay_events.clone();
-        let restatement_indexes = Self::price_restatement_indexes(&replay_events);
-        let mut quantity_removed = AHashMap::<usize, Quantity>::new();
-        let mut commission_removed = AHashMap::<usize, Money>::new();
-
-        for correction in self.latest_fill_voids() {
-            Self::allocate_fill_void(
-                &replay_events,
-                correction,
-                &restatement_indexes,
-                &mut quantity_removed,
-                &mut commission_removed,
-            )?;
-        }
+        let (restatement_indexes, quantity_removed, commission_removed) =
+            self.fill_void_allocations()?;
 
         self.reset_derived_state();
+        self.cycle_id = None;
 
         let mut closed_cycles_pnl: Option<Money> = None;
+        let mut had_formal_close = false;
 
         for (index, replay_event) in replay_events.iter().enumerate() {
             match replay_event {
                 PositionReplayEvent::Filled(fill) => {
                     if restatement_indexes.contains(&index) {
-                        self.apply_price_restatement(fill, false)?;
+                        self.apply_price_restatement(fill, false, Some(index))?;
                         continue;
                     }
 
-                    let removed = quantity_removed
-                        .get(&index)
-                        .copied()
-                        .unwrap_or_else(|| Quantity::zero(fill.last_qty.precision));
-                    let effective_qty =
-                        quantity_sub(fill.last_qty, removed, fill.last_qty.precision)?;
+                    let effective_qty = Self::effective_fill_qty(
+                        fill.last_qty,
+                        quantity_removed.get(&index).copied(),
+                    )?;
 
                     let effective_commission =
                         match (fill.commission, commission_removed.get(&index).copied()) {
@@ -1632,9 +2324,30 @@ impl Position {
                 PositionReplayEvent::Adjusted(adjustment) => {
                     self.apply_adjustment_state(*adjustment, false)?;
                 }
+                PositionReplayEvent::Converted(change) => {
+                    if let PositionConvertKind::Open { .. } = change.kind {
+                        if had_formal_close {
+                            return Err(invalid(
+                                "Convert opening cannot follow a formal instrument close",
+                            ));
+                        }
+
+                        if self.side == PositionSide::Flat
+                            && let Some(realized_pnl) = self.realized_pnl
+                        {
+                            closed_cycles_pnl = Some(Self::bank_closed_cycle_pnl(
+                                closed_cycles_pnl,
+                                realized_pnl,
+                            )?);
+                        }
+                    }
+
+                    self.apply_convert_state(*change, false)?;
+                }
                 PositionReplayEvent::InstrumentClosed(close) => {
                     self.apply_instrument_close_state(*close, false)
                         .map_err(|e| invalid(&e.to_string()))?;
+                    had_formal_close = true;
                 }
             }
         }
@@ -2187,6 +2900,10 @@ impl Position {
         // A price restatement is stored only in replay, so equal lengths cannot contain one
         !self.fill_voids.is_empty()
             || self.is_settled()
+            || self
+                .replay_events
+                .iter()
+                .any(|event| matches!(event, PositionReplayEvent::Converted(_)))
             || (self.replay_events.len() > self.events.len() && self.has_replay_price_restatement())
             || (self.id.is_virtual() && self.replay_events.len() > self.events.len())
     }
@@ -4478,7 +5195,7 @@ mod tests {
 
         assert_eq!(position.side, PositionSide::Long);
         assert_eq!(position.quantity, Quantity::from(5));
-        assert_eq!(position.opening_order_id, ClientOrderId::from("O-3"));
+        assert_eq!(position.opening_order_id, Some(ClientOrderId::from("O-3")));
         assert_eq!(position.events, vec![fill_reopen.clone()]);
         assert_eq!(position.replay_events.len(), 3);
         assert_eq!(position.trade_ids.len(), 1);
@@ -4490,7 +5207,7 @@ mod tests {
 
         assert_eq!(position.side, PositionSide::Long);
         assert_eq!(position.quantity, Quantity::from(15));
-        assert_eq!(position.opening_order_id, ClientOrderId::from("O-1"));
+        assert_eq!(position.opening_order_id, Some(ClientOrderId::from("O-1")));
         assert_eq!(position.closing_order_id, None);
         assert_eq!(position.avg_px_open, dec!(1.0));
         assert_eq!(position.buy_qty, Quantity::from(15));
@@ -5341,7 +6058,7 @@ mod tests {
         assert_eq!(position.quantity, Quantity::from(150_000));
         assert_eq!(position.peak_qty, Quantity::from(150_000));
         assert_eq!(position.side, PositionSide::Long);
-        assert_eq!(position.opening_order_id, fill3.client_order_id);
+        assert_eq!(position.opening_order_id, Some(fill3.client_order_id));
         assert_eq!(position.closing_order_id, None);
         assert_eq!(position.ts_opened, 3_000_000_000);
         assert_eq!(position.duration_ns, DurationNanos::default());
@@ -5618,7 +6335,10 @@ mod tests {
 
         assert_eq!(position.side, PositionSide::Long);
         assert_eq!(position.quantity, Quantity::from(10));
-        assert_eq!(position.opening_order_id, ClientOrderId::from("O-OPEN"));
+        assert_eq!(
+            position.opening_order_id,
+            Some(ClientOrderId::from("O-OPEN"))
+        );
         assert_eq!(position.buy_qty, Quantity::from(15));
         assert_eq!(position.sell_qty, Quantity::from(5));
         assert_eq!(position.commissions(), vec![Money::from("2.50 USD")]);
@@ -5711,6 +6431,525 @@ mod tests {
         )
     }
 
+    fn convert_opening(instrument: &InstrumentAny) -> PositionConvert {
+        let operation_id = UUID4::new();
+        PositionConvert {
+            operation_id,
+            trader_id: TraderId::from("TRADER-001"),
+            strategy_id: StrategyId::from("STRATEGY-001"),
+            instrument_id: instrument.id(),
+            position_id: PositionId::from("P-BINARY"),
+            account_id: AccountId::from("POLYMARKET-001"),
+            cycle_id: operation_id,
+            kind: PositionConvertKind::Open {
+                previous_cycle_id: None,
+            },
+            quantity: Quantity::from("100.00"),
+            cost: dec!(50),
+            realized_pnl: Decimal::ZERO,
+            ts_event: UnixNanos::from(100),
+            ts_init: UnixNanos::from(101),
+        }
+    }
+
+    #[rstest]
+    fn test_convert_position_lifecycle(binary_option: BinaryOption) {
+        let instrument = InstrumentAny::BinaryOption(binary_option);
+        let opening = convert_opening(&instrument);
+        let addition = PositionConvert {
+            operation_id: UUID4::new(),
+            kind: PositionConvertKind::Increase,
+            quantity: Quantity::from("20.00"),
+            cost: dec!(10),
+            ..opening
+        };
+        let reduction = PositionConvert {
+            operation_id: UUID4::new(),
+            kind: PositionConvertKind::Decrease,
+            quantity: Quantity::from("30.00"),
+            cost: dec!(15),
+            realized_pnl: dec!(3),
+            ..opening
+        };
+        let closing = PositionConvert {
+            operation_id: UUID4::new(),
+            quantity: Quantity::from("90.00"),
+            cost: dec!(45),
+            realized_pnl: dec!(-2),
+            ..reduction
+        };
+        let mut position = Position::new_from_convert(&instrument, opening).unwrap();
+        let PositionEvent::PositionOpened(opened) = PositionEvent::from_convert(&position, opening)
+        else {
+            panic!("expected an opening notification");
+        };
+        let Some(PositionEvent::PositionChanged(increased)) =
+            position.apply_convert(addition).unwrap()
+        else {
+            panic!("expected an increase notification");
+        };
+        let Some(PositionEvent::PositionChanged(decreased)) =
+            position.apply_convert(reduction).unwrap()
+        else {
+            panic!("expected a reduction notification");
+        };
+        let Some(PositionEvent::PositionClosed(closed)) = position.apply_convert(closing).unwrap()
+        else {
+            panic!("expected a closing notification");
+        };
+
+        assert_eq!(opened.opening_order_id, None);
+        assert_eq!(opened.opening_operation_id, Some(opening.operation_id));
+        assert_eq!(opened.convert, Some(opening));
+        assert_eq!(opened.last_qty, opening.quantity);
+        assert_eq!(opened.last_px, None);
+        assert_eq!(opened.avg_px_open, dec!(0.5));
+        assert_eq!(increased.convert, Some(addition));
+        assert_eq!(increased.last_qty, addition.quantity);
+        assert_eq!(increased.last_px, None);
+        assert_eq!(increased.quantity, Quantity::from("120.00"));
+        assert_eq!(decreased.convert, Some(reduction));
+        assert_eq!(decreased.last_qty, reduction.quantity);
+        assert_eq!(decreased.last_px, None);
+        assert_eq!(decreased.quantity, Quantity::from("90.00"));
+        assert_eq!(decreased.realized_pnl, Some(Money::from("3.00 USDC")));
+        assert_eq!(closed.convert, Some(closing));
+        assert_eq!(closed.last_qty, closing.quantity);
+        assert_eq!(closed.last_px, None);
+        assert_eq!(closed.closing_order_id, None);
+        assert_eq!(closed.realized_pnl, Some(Money::from("1.00 USDC")));
+        assert_eq!(position.cost_open, Decimal::ZERO);
+        assert_eq!(position.cost_close, dec!(61));
+        assert_eq!(position.qty_closed, dec!(120));
+        assert!(position.is_closed());
+        assert!(position.events.is_empty());
+        assert!(position.last_event().is_none());
+        assert!(position.buy_qty.is_zero());
+        assert!(position.sell_qty.is_zero());
+        assert_eq!(position.replay_events.len(), 4);
+    }
+
+    #[rstest]
+    fn test_convert_replay_with_fill_void_adjustment_and_settlement(binary_option: BinaryOption) {
+        let instrument = InstrumentAny::BinaryOption(binary_option);
+        let opening = convert_opening(&instrument);
+        let mut position = Position::new_from_convert(&instrument, opening).unwrap();
+        let mut fill = binary_fill(&instrument, "T-ADD", "30.00", "0.500", 150);
+        fill.trader_id = opening.trader_id;
+        fill.strategy_id = opening.strategy_id;
+        fill.commission = None;
+        position.try_apply(&fill).unwrap();
+        let addition = PositionConvert {
+            operation_id: UUID4::new(),
+            kind: PositionConvertKind::Increase,
+            quantity: Quantity::from("20.00"),
+            cost: dec!(10),
+            ts_event: UnixNanos::from(200),
+            ts_init: UnixNanos::from(201),
+            ..opening
+        };
+        position.apply_convert(addition).unwrap();
+        let adjustment = PositionAdjusted::new(
+            opening.trader_id,
+            opening.strategy_id,
+            opening.instrument_id,
+            opening.position_id,
+            opening.account_id,
+            PositionAdjustmentType::Funding,
+            None,
+            Some(Money::from("1.00 USDC")),
+            None,
+            UUID4::new(),
+            UnixNanos::from(210),
+            UnixNanos::from(211),
+        );
+        position.apply_adjustment(adjustment).unwrap();
+        let reduction = PositionConvert {
+            operation_id: UUID4::new(),
+            kind: PositionConvertKind::Decrease,
+            quantity: Quantity::from("40.00"),
+            cost: dec!(20),
+            realized_pnl: dec!(2),
+            ts_event: UnixNanos::from(250),
+            ts_init: UnixNanos::from(251),
+            ..opening
+        };
+        position.apply_convert(reduction).unwrap();
+        position
+            .apply_instrument_close(contract_expired(&instrument, "1.000"))
+            .unwrap();
+
+        let encoded = serde_json::to_value(&position).unwrap();
+        let mut restored: Position = serde_json::from_value(encoded.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&restored).unwrap(), encoded);
+        let voided_qty = Quantity::from("10.00");
+        restored
+            .apply_fill_void(
+                matching_fill_void(&fill, voided_qty, None),
+                voided_qty,
+                None,
+            )
+            .unwrap();
+
+        assert!(restored.is_settled());
+        assert_eq!(restored.opening_order_id, None);
+        assert_eq!(restored.opening_operation_id, Some(opening.operation_id));
+        assert_eq!(restored.cycle_id, Some(opening.cycle_id));
+        assert_eq!(restored.cost_open, Decimal::ZERO);
+        assert_eq!(restored.qty_closed, dec!(140));
+        assert_eq!(restored.realized_pnl, Some(Money::from("53.00 USDC")));
+        assert_eq!(restored.events.len(), 1);
+        assert_eq!(restored.events[0].trade_id, fill.trade_id);
+        assert_eq!(restored.events[0].last_qty, Quantity::from("20.00"));
+        assert_eq!(restored.adjustments, vec![adjustment]);
+        assert!(matches!(
+            restored.replay_events.as_slice(),
+            [PositionReplayEvent::Converted(first), PositionReplayEvent::Filled(_), PositionReplayEvent::Converted(second), PositionReplayEvent::Adjusted(_), PositionReplayEvent::Converted(third), PositionReplayEvent::InstrumentClosed(_)]
+            if *first == opening && *second == addition && *third == reduction
+        ));
+    }
+
+    #[rstest]
+    #[case::wrong_account(|change| PositionConvert { account_id: AccountId::from("POLYMARKET-002"), ..change })]
+    #[case::wrong_cycle(|change| PositionConvert { cycle_id: UUID4::new(), ..change })]
+    #[case::negative_cost(|change| PositionConvert { cost: dec!(-1), ..change })]
+    #[case::excess_quantity(|change| PositionConvert { quantity: Quantity::from("100.01"), ..change })]
+    #[case::unallocated_remainder(|change| PositionConvert { cost: dec!(49), ..change })]
+    fn test_convert_rejects_invalid_decrease_without_mutation(
+        binary_option: BinaryOption,
+        #[case] corrupt: impl FnOnce(PositionConvert) -> PositionConvert,
+    ) {
+        let instrument = InstrumentAny::BinaryOption(binary_option);
+        let opening = convert_opening(&instrument);
+        let mut position = Position::new_from_convert(&instrument, opening).unwrap();
+        let change = PositionConvert {
+            operation_id: UUID4::new(),
+            kind: PositionConvertKind::Decrease,
+            ..opening
+        };
+        let before = serde_json::to_value(&position).unwrap();
+
+        let result = position.apply_convert(corrupt(change));
+
+        assert!(result.is_err());
+        assert_eq!(serde_json::to_value(&position).unwrap(), before);
+    }
+
+    #[cfg(feature = "python")]
+    #[rstest]
+    fn test_convert_position_python_round_trip(binary_option: BinaryOption) {
+        use pyo3::{Py, Python, prelude::*, types::PyDict};
+
+        use crate::events::PositionSnapshot;
+
+        let instrument = InstrumentAny::BinaryOption(binary_option);
+        let change = convert_opening(&instrument);
+        let position = Position::new_from_convert(&instrument, change).unwrap();
+        let PositionEvent::PositionOpened(event) = PositionEvent::from_convert(&position, change)
+        else {
+            panic!("expected a position opening notification");
+        };
+
+        Python::initialize();
+        Python::attach(|py| {
+            let py_event = Py::new(py, event).unwrap();
+            let py_snapshot = Py::new(py, PositionSnapshot::from(&position, None)).unwrap();
+            let py_position = Py::new(py, position).unwrap();
+            let convert = py_event
+                .bind(py)
+                .getattr("convert")
+                .unwrap()
+                .cast_into::<PyDict>()
+                .unwrap();
+            let values = py_position
+                .bind(py)
+                .call_method0("to_dict")
+                .unwrap()
+                .cast_into::<PyDict>()
+                .unwrap();
+            let restored = Position::py_from_dict(py, values.unbind()).unwrap();
+
+            assert!(
+                py_event
+                    .getattr(py, "opening_order_id")
+                    .unwrap()
+                    .is_none(py)
+            );
+            assert!(py_event.getattr(py, "last_px").unwrap().is_none(py));
+            assert_eq!(
+                convert
+                    .get_item("cost")
+                    .unwrap()
+                    .unwrap()
+                    .extract::<String>()
+                    .unwrap(),
+                change.cost.to_string(),
+            );
+            assert_eq!(
+                py_event
+                    .getattr(py, "opening_operation_id")
+                    .unwrap()
+                    .extract::<UUID4>(py)
+                    .unwrap(),
+                change.operation_id,
+            );
+            assert!(
+                py_snapshot
+                    .getattr(py, "opening_order_id")
+                    .unwrap()
+                    .is_none(py)
+            );
+            assert_eq!(
+                py_snapshot
+                    .getattr(py, "opening_operation_id")
+                    .unwrap()
+                    .extract::<UUID4>(py)
+                    .unwrap(),
+                change.operation_id,
+            );
+            assert!(
+                py_position
+                    .getattr(py, "opening_order_id")
+                    .unwrap()
+                    .is_none(py)
+            );
+            assert_eq!(restored.opening_operation_id, Some(change.operation_id));
+            assert_eq!(restored.cost_open, change.cost);
+            assert!(restored.events.is_empty());
+            assert!(matches!(
+                restored.replay_events.as_slice(),
+                [PositionReplayEvent::Converted(record)] if *record == change
+            ));
+        });
+    }
+
+    #[rstest]
+    fn test_convert_restatement_uses_remaining_real_lot(binary_option: BinaryOption) {
+        let instrument = InstrumentAny::BinaryOption(binary_option);
+        let opening = convert_opening(&instrument);
+        let mut position = Position::new_from_convert(&instrument, opening).unwrap();
+        let mut buy = binary_fill(&instrument, "T-BUY", "100.00", "0.500", 150);
+        buy.trader_id = opening.trader_id;
+        buy.strategy_id = opening.strategy_id;
+        buy.commission = None;
+        position.try_apply(&buy).unwrap();
+        position
+            .apply_convert(PositionConvert {
+                operation_id: UUID4::new(),
+                kind: PositionConvertKind::Decrease,
+                quantity: Quantity::from("100.00"),
+                cost: dec!(50),
+                ts_event: UnixNanos::from(200),
+                ts_init: UnixNanos::from(201),
+                ..opening
+            })
+            .unwrap();
+
+        let mut restatement = buy.clone();
+        restatement.event_id = UUID4::new();
+        restatement.last_px = Price::from("0.700");
+        restatement.ts_event = UnixNanos::from(210);
+        restatement.ts_init = UnixNanos::from(211);
+        position.try_apply(&restatement).unwrap();
+
+        assert_eq!(position.quantity, Quantity::from("100.00"));
+        assert_eq!(position.cost_open, dec!(60));
+        assert_eq!(position.avg_px_open, dec!(0.6));
+        assert_eq!(position.events, vec![buy]);
+        assert_eq!(position.replay_events.len(), 4);
+    }
+
+    #[rstest]
+    fn test_convert_restatement_uses_replay_cycle_after_sell(binary_option: BinaryOption) {
+        let instrument = InstrumentAny::BinaryOption(binary_option);
+        let opening = convert_opening(&instrument);
+        let mut position = Position::new_from_convert(&instrument, opening).unwrap();
+        let mut sell = binary_fill(&instrument, "T-SELL", "60.00", "0.700", 150);
+        sell.trader_id = opening.trader_id;
+        sell.strategy_id = opening.strategy_id;
+        sell.order_side = OrderSide::Sell;
+        sell.commission = None;
+        position.try_apply(&sell).unwrap();
+        let mut buy = binary_fill(&instrument, "T-BUY", "30.00", "0.500", 200);
+        buy.trader_id = opening.trader_id;
+        buy.strategy_id = opening.strategy_id;
+        buy.commission = None;
+        position.try_apply(&buy).unwrap();
+
+        let mut restatement = buy.clone();
+        restatement.event_id = UUID4::new();
+        restatement.last_px = Price::from("0.700");
+        restatement.ts_event = UnixNanos::from(210);
+        restatement.ts_init = UnixNanos::from(211);
+        position.try_apply(&restatement).unwrap();
+
+        assert_eq!(position.quantity, Quantity::from("70.00"));
+        assert_eq!(position.cost_open, dec!(41));
+        assert_eq!(position.avg_px_open, div(dec!(41), dec!(70)).unwrap());
+        assert_eq!(position.realized_pnl, Some(Money::from("12.00 USDC")));
+        assert_eq!(position.events.len(), 2);
+    }
+
+    #[rstest]
+    fn test_convert_restatement_rebuild_ignores_future_replay_entries(binary_option: BinaryOption) {
+        let instrument = InstrumentAny::BinaryOption(binary_option);
+        let opening = convert_opening(&instrument);
+        let mut position = Position::new_from_convert(&instrument, opening).unwrap();
+        let mut buy = binary_fill(&instrument, "T-BUY", "100.00", "0.500", 150);
+        buy.trader_id = opening.trader_id;
+        buy.strategy_id = opening.strategy_id;
+        buy.commission = None;
+        position.try_apply(&buy).unwrap();
+        let mut restatement = buy.clone();
+        restatement.event_id = UUID4::new();
+        restatement.last_px = Price::from("0.700");
+        restatement.ts_event = UnixNanos::from(160);
+        restatement.ts_init = UnixNanos::from(161);
+        position.try_apply(&restatement).unwrap();
+        position
+            .apply_convert(PositionConvert {
+                operation_id: UUID4::new(),
+                kind: PositionConvertKind::Decrease,
+                quantity: Quantity::from("100.00"),
+                cost: dec!(60),
+                ts_event: UnixNanos::from(200),
+                ts_init: UnixNanos::from(201),
+                ..opening
+            })
+            .unwrap();
+        let mut later_buy = binary_fill(&instrument, "T-LATER", "50.00", "0.500", 250);
+        later_buy.trader_id = opening.trader_id;
+        later_buy.strategy_id = opening.strategy_id;
+        later_buy.commission = None;
+        position.try_apply(&later_buy).unwrap();
+
+        let voided_qty = later_buy.last_qty;
+        position
+            .apply_fill_void(
+                matching_fill_void(&later_buy, voided_qty, None),
+                voided_qty,
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(position.quantity, Quantity::from("100.00"));
+        assert_eq!(position.cost_open, dec!(60));
+        assert_eq!(position.avg_px_open, dec!(0.6));
+        assert_eq!(position.events.len(), 1);
+        assert_eq!(position.replay_events.len(), 5);
+    }
+
+    #[rstest]
+    fn test_convert_fill_void_conflict_leaves_position_unchanged(binary_option: BinaryOption) {
+        let instrument = InstrumentAny::BinaryOption(binary_option);
+        let opening = convert_opening(&instrument);
+        let mut position = Position::new_from_convert(&instrument, opening).unwrap();
+        let mut buy = binary_fill(&instrument, "T-BUY", "100.00", "0.600", 150);
+        buy.trader_id = opening.trader_id;
+        buy.strategy_id = opening.strategy_id;
+        buy.commission = None;
+        position.try_apply(&buy).unwrap();
+        position
+            .apply_convert(PositionConvert {
+                operation_id: UUID4::new(),
+                kind: PositionConvertKind::Decrease,
+                quantity: Quantity::from("100.00"),
+                cost: dec!(55),
+                ts_event: UnixNanos::from(200),
+                ts_init: UnixNanos::from(201),
+                ..opening
+            })
+            .unwrap();
+        let before = serde_json::to_value(&position).unwrap();
+        let voided_qty = Quantity::from("50.00");
+
+        let result =
+            position.apply_fill_void(matching_fill_void(&buy, voided_qty, None), voided_qty, None);
+
+        assert!(result.is_err());
+        assert_eq!(serde_json::to_value(&position).unwrap(), before);
+    }
+
+    #[rstest]
+    fn test_convert_rebuild_requires_fully_voided_previous_cycle(binary_option: BinaryOption) {
+        let instrument = InstrumentAny::BinaryOption(binary_option);
+        let opening = convert_opening(&instrument);
+        let mut prior_fill = binary_fill(&instrument, "T-PRIOR", "10.00", "0.500", 100);
+        prior_fill.trader_id = opening.trader_id;
+        prior_fill.strategy_id = opening.strategy_id;
+        prior_fill.commission = None;
+        let mut prior = Position::new(&instrument, prior_fill.clone());
+        let prior_qty = prior_fill.last_qty;
+        prior
+            .apply_fill_void(
+                matching_fill_void(&prior_fill, prior_qty, None),
+                prior_qty,
+                None,
+            )
+            .unwrap();
+        let cycle_id = UUID4::new();
+        let mut position = Position::new_from_convert(
+            &instrument,
+            PositionConvert {
+                operation_id: cycle_id,
+                cycle_id,
+                kind: PositionConvertKind::Open {
+                    previous_cycle_id: Some(prior_fill.event_id),
+                },
+                quantity: Quantity::from("10.00"),
+                cost: dec!(5),
+                ts_event: UnixNanos::from(150),
+                ts_init: UnixNanos::from(151),
+                ..opening
+            },
+        )
+        .unwrap();
+        position.transfer_replay_state_from(&mut prior);
+
+        let mut later_fill = binary_fill(&instrument, "T-LATER", "5.00", "0.500", 200);
+        later_fill.trader_id = opening.trader_id;
+        later_fill.strategy_id = opening.strategy_id;
+        later_fill.commission = None;
+        position.try_apply(&later_fill).unwrap();
+        let before = serde_json::to_value(&position).unwrap();
+        let voided_qty = later_fill.last_qty;
+
+        let result = position.apply_fill_void(
+            matching_fill_void(&later_fill, voided_qty, None),
+            voided_qty,
+            None,
+        );
+
+        assert!(result.is_err());
+        assert_eq!(serde_json::to_value(&position).unwrap(), before);
+    }
+
+    #[rstest]
+    fn test_convert_rejects_inverse_instrument(btcusd_bybit: CryptoPerpetual) {
+        let instrument = InstrumentAny::CryptoPerpetual(btcusd_bybit);
+        assert!(instrument.is_inverse());
+        let operation_id = UUID4::new();
+        let change = PositionConvert {
+            operation_id,
+            trader_id: TraderId::from("TRADER-001"),
+            strategy_id: StrategyId::from("STRATEGY-001"),
+            instrument_id: instrument.id(),
+            position_id: PositionId::from("P-INVERSE"),
+            account_id: AccountId::from("POLYMARKET-001"),
+            cycle_id: operation_id,
+            kind: PositionConvertKind::Open {
+                previous_cycle_id: None,
+            },
+            quantity: Quantity::from(1),
+            cost: dec!(1),
+            realized_pnl: Decimal::ZERO,
+            ts_event: UnixNanos::from(1),
+            ts_init: UnixNanos::from(2),
+        };
+
+        assert!(Position::new_from_convert(&instrument, change).is_err());
+    }
+
     #[rstest]
     #[case::winner("1.000", dec!(5.90), 1.5)]
     #[case::loser("0.000", dec!(-4.10), -1.0)]
@@ -5740,7 +6979,7 @@ mod tests {
         assert_eq!(position.peak_qty, Quantity::from("10.00"));
         assert_eq!(position.buy_qty, Quantity::from("10.00"));
         assert_eq!(position.sell_qty, Quantity::from("0.00"));
-        assert_eq!(position.opening_order_id, fill.client_order_id);
+        assert_eq!(position.opening_order_id, Some(fill.client_order_id));
         assert_eq!(position.closing_order_id, None);
         assert_eq!(position.events, vec![fill]);
         assert_eq!(position.commissions(), vec![Money::from("0.10 USDC")]);
@@ -6035,7 +7274,10 @@ mod tests {
             PositionAdjustmentType::Commission
         );
         assert_eq!(position.adjustments[0].quantity_change, Some(dec!(-0.001)));
-        assert_eq!(position.opening_order_id, ClientOrderId::from("O-BASE-FEE"));
+        assert_eq!(
+            position.opening_order_id,
+            Some(ClientOrderId::from("O-BASE-FEE"))
+        );
         assert_eq!(position.closing_order_id, None);
         assert_eq!(position.ts_init, UnixNanos::from(1_900));
         assert_eq!(position.ts_opened, UnixNanos::from(2_000));
@@ -6099,7 +7341,7 @@ mod tests {
         assert_eq!(position.adjustments.len(), 1);
         assert_eq!(
             position.opening_order_id,
-            ClientOrderId::from("O-BASE-OPEN")
+            Some(ClientOrderId::from("O-BASE-OPEN"))
         );
         assert_eq!(
             position.closing_order_id,
@@ -6175,7 +7417,10 @@ mod tests {
         assert_eq!(position.commissions(), vec![Money::from("0.00100000 BTC")]);
         assert!(position.events.is_empty());
         assert_eq!(position.adjustments.len(), 1);
-        assert_eq!(position.opening_order_id, ClientOrderId::from("O-REOPEN"));
+        assert_eq!(
+            position.opening_order_id,
+            Some(ClientOrderId::from("O-REOPEN"))
+        );
         assert_eq!(position.closing_order_id, None);
         assert_eq!(position.ts_init, UnixNanos::from(2_900));
         assert_eq!(position.ts_opened, UnixNanos::from(3_000));
@@ -6238,7 +7483,7 @@ mod tests {
         assert_eq!(position.adjustments.len(), 1);
         assert_eq!(
             position.opening_order_id,
-            ClientOrderId::from("O-BASE-OPEN")
+            Some(ClientOrderId::from("O-BASE-OPEN"))
         );
         assert_eq!(position.closing_order_id, None);
         assert_eq!(position.ts_init, UnixNanos::from(900));
@@ -7481,7 +8726,10 @@ mod tests {
 
         assert_eq!(position.peak_qty, Quantity::from(7));
         assert_eq!(position.avg_px_open, dec!(1.23456));
-        assert_eq!(position.opening_order_id, ClientOrderId::from("O-PURGE"));
+        assert_eq!(
+            position.opening_order_id,
+            Some(ClientOrderId::from("O-PURGE"))
+        );
         assert_eq!(
             position.closing_order_id,
             Some(ClientOrderId::from("O-PURGE"))
@@ -9616,7 +10864,10 @@ mod tests {
         assert_eq!(position.realized_return, 0.133_884_297_520_661_17);
         assert_eq!(position.realized_pnl, Some(Money::from("14.17500000 USDT")));
         assert_eq!(position.commissions(), vec![Money::from("0 USDT")]);
-        assert_eq!(position.opening_order_id, ClientOrderId::new("O-OPEN"));
+        assert_eq!(
+            position.opening_order_id,
+            Some(ClientOrderId::new("O-OPEN"))
+        );
         assert_eq!(
             position.closing_order_id,
             Some(ClientOrderId::new("O-CLOSE-2"))
@@ -9732,7 +10983,7 @@ mod tests {
         assert_eq!(position.commissions(), vec![Money::from("0 USDT")]);
         assert_eq!(
             position.opening_order_id,
-            ClientOrderId::new("O-REVERSAL-OPEN")
+            Some(ClientOrderId::new("O-REVERSAL-OPEN"))
         );
         assert_eq!(position.closing_order_id, None);
         assert_eq!(position.ts_opened, UnixNanos::from(2_000));
@@ -10285,7 +11536,7 @@ mod tests {
         // Should not panic; ts_opened and opening_order_id stay unchanged
         position.apply(&fill2.into());
         assert_eq!(position.ts_opened, UnixNanos::from(2_000u64));
-        assert_eq!(position.opening_order_id, order1.client_order_id());
+        assert_eq!(position.opening_order_id, Some(order1.client_order_id()));
         assert_eq!(position.events.len(), 2);
     }
 

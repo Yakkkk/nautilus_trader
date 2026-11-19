@@ -13,10 +13,13 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-use nautilus_core::python::{IntoPyObjectNautilusExt, serialization::from_dict_pyo3};
+use nautilus_core::{
+    UUID4,
+    python::{IntoPyObjectNautilusExt, serialization::from_dict_pyo3},
+};
 use pyo3::{basic::CompareOp, prelude::*, types::PyDict};
 
-use crate::events::PositionSnapshot;
+use crate::{events::PositionSnapshot, identifiers::ClientOrderId};
 
 #[pymethods]
 #[pyo3_stub_gen::derive::gen_stub_pymethods]
@@ -31,6 +34,20 @@ impl PositionSnapshot {
 
     fn __repr__(&self) -> String {
         format!("{self:?}")
+    }
+
+    /// Returns the client order ID that opened the position, if it was opened by a fill.
+    #[getter]
+    #[pyo3(name = "opening_order_id")]
+    fn py_opening_order_id(&self) -> Option<ClientOrderId> {
+        self.opening_order_id
+    }
+
+    /// Returns the Convert operation that opened the current position cycle, if any.
+    #[getter]
+    #[pyo3(name = "opening_operation_id")]
+    fn py_opening_operation_id(&self) -> Option<UUID4> {
+        self.opening_operation_id
     }
 
     #[staticmethod]

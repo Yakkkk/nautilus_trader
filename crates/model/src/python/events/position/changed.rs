@@ -13,8 +13,11 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-use nautilus_core::{UUID4, python::IntoPyObjectNautilusExt};
-use pyo3::{basic::CompareOp, prelude::*};
+use nautilus_core::{
+    UUID4,
+    python::{IntoPyObjectNautilusExt, serialization::to_dict_pyo3},
+};
+use pyo3::{basic::CompareOp, prelude::*, types::PyDict};
 use rust_decimal::Decimal;
 
 use crate::{
@@ -78,8 +81,24 @@ impl PositionChanged {
 
     #[getter]
     #[pyo3(name = "opening_order_id")]
-    fn py_opening_order_id(&self) -> ClientOrderId {
+    fn py_opening_order_id(&self) -> Option<ClientOrderId> {
         self.opening_order_id
+    }
+
+    #[getter]
+    #[pyo3(name = "opening_operation_id")]
+    fn py_opening_operation_id(&self) -> Option<UUID4> {
+        self.opening_operation_id
+    }
+
+    /// Returns the allocated Convert change, if this event was not produced by a fill.
+    #[getter]
+    #[pyo3(name = "convert")]
+    fn py_convert(&self, py: Python<'_>) -> PyResult<Option<Py<PyDict>>> {
+        self.convert
+            .as_ref()
+            .map(|change| to_dict_pyo3(py, change))
+            .transpose()
     }
 
     #[getter]
@@ -126,7 +145,7 @@ impl PositionChanged {
 
     #[getter]
     #[pyo3(name = "last_px")]
-    fn py_last_px(&self) -> Price {
+    fn py_last_px(&self) -> Option<Price> {
         self.last_px
     }
 

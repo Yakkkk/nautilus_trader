@@ -43,7 +43,7 @@ pub fn position_schema() -> Schema {
         utf8_field("instrument_id", false),
         utf8_field("position_id", false),
         utf8_field("account_id", false),
-        utf8_field("opening_order_id", false),
+        utf8_field("opening_order_id", true),
         utf8_field("closing_order_id", true),
         utf8_field("entry", false),
         utf8_field("side", false),
@@ -75,6 +75,7 @@ pub fn position_schema() -> Schema {
         utf8_field("commissions", false),
         uint32_field("event_count", false),
         uint32_field("adjustment_count", false),
+        utf8_field("opening_operation_id", true),
     ])
 }
 
@@ -150,6 +151,7 @@ pub fn encode_positions(data: &[Position]) -> Result<RecordBatch, ArrowError> {
     let mut commissions = StringBuilder::new();
     let mut event_count = UInt32Builder::with_capacity(data.len());
     let mut adjustment_count = UInt32Builder::with_capacity(data.len());
+    let mut opening_operation_id = StringBuilder::new();
 
     for position in data {
         trader_id.append_value(position.trader_id);
@@ -157,7 +159,7 @@ pub fn encode_positions(data: &[Position]) -> Result<RecordBatch, ArrowError> {
         instrument_id.append_value(position.instrument_id.to_string());
         position_id.append_value(position.id);
         account_id.append_value(position.account_id);
-        opening_order_id.append_value(position.opening_order_id);
+        opening_order_id.append_option(position.opening_order_id.map(|id| id.to_string()));
         closing_order_id.append_option(position.closing_order_id.map(|v| v.to_string()));
         entry.append_value(format!("{}", position.entry));
         side.append_value(format!("{}", position.side));
@@ -189,6 +191,7 @@ pub fn encode_positions(data: &[Position]) -> Result<RecordBatch, ArrowError> {
         commissions.append_value(commissions_to_json(position));
         event_count.append_value(position.events.len() as u32);
         adjustment_count.append_value(position.adjustments.len() as u32);
+        opening_operation_id.append_option(position.opening_operation_id.map(|id| id.to_string()));
     }
 
     RecordBatch::try_new(
@@ -231,6 +234,7 @@ pub fn encode_positions(data: &[Position]) -> Result<RecordBatch, ArrowError> {
             Arc::new(commissions.finish()),
             Arc::new(event_count.finish()),
             Arc::new(adjustment_count.finish()),
+            Arc::new(opening_operation_id.finish()),
         ],
     )
 }
@@ -303,7 +307,7 @@ mod tests {
         let batch = encode_positions(&[]).unwrap();
         let schema = batch.schema();
         let fields = schema.fields();
-        assert_eq!(fields.len(), 37);
+        assert_eq!(fields.len(), 38);
         assert_eq!(fields[0].name(), "trader_id");
         assert_eq!(fields[0].data_type(), &DataType::Utf8);
         assert_eq!(fields[9].name(), "signed_qty");
@@ -321,13 +325,17 @@ mod tests {
         assert_eq!(fields[25].data_type(), &DataType::UInt64);
         assert_eq!(fields[35].name(), "event_count");
         assert_eq!(fields[35].data_type(), &DataType::UInt32);
+        assert_eq!(fields[5].name(), "opening_order_id");
+        assert!(fields[5].is_nullable());
+        assert_eq!(fields[37].name(), "opening_operation_id");
+        assert!(fields[37].is_nullable());
     }
 
     #[rstest]
     fn test_encode_positions_empty() {
         let batch = encode_positions(&[]).unwrap();
         assert_eq!(batch.num_rows(), 0);
-        assert_eq!(batch.schema().fields().len(), 37);
+        assert_eq!(batch.schema().fields().len(), 38);
     }
 
     #[rstest]

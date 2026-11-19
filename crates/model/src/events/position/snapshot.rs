@@ -13,7 +13,7 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-use nautilus_core::{DurationNanos, UnixNanos};
+use nautilus_core::{DurationNanos, UUID4, UnixNanos};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
@@ -46,7 +46,10 @@ pub struct PositionSnapshot {
     /// The account ID associated with the position.
     pub account_id: AccountId,
     /// The client order ID for the order which opened the position.
-    pub opening_order_id: ClientOrderId,
+    pub opening_order_id: Option<ClientOrderId>,
+    /// The operation that opened the position, if not opened by a fill.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opening_operation_id: Option<UUID4>,
     /// The client order ID for the order which closed the position.
     pub closing_order_id: Option<ClientOrderId>,
     /// The entry direction from open.
@@ -65,7 +68,7 @@ pub struct PositionSnapshot {
     pub base_currency: Option<Currency>,
     /// The position settlement currency.
     pub settlement_currency: Currency,
-    /// The average open price.
+    /// The average open price, including the unit cost of any Convert inventory.
     pub avg_px_open: Decimal,
     /// The average closing price.
     pub avg_px_close: Option<Decimal>,
@@ -102,6 +105,7 @@ impl PositionSnapshot {
             position_id: position.id,
             account_id: position.account_id,
             opening_order_id: position.opening_order_id,
+            opening_operation_id: position.opening_operation_id,
             closing_order_id: position.closing_order_id,
             entry: position.entry,
             side: position.side,
@@ -161,7 +165,8 @@ mod tests {
             instrument_id: InstrumentId::from("EURUSD.SIM"),
             position_id: PositionId::from("P-001"),
             account_id: AccountId::from("SIM-001"),
-            opening_order_id: ClientOrderId::from("O-19700101-000000-001-001-1"),
+            opening_order_id: Some(ClientOrderId::from("O-19700101-000000-001-001-1")),
+            opening_operation_id: None,
             closing_order_id: Some(ClientOrderId::from("O-19700101-000000-001-001-2")),
             entry: OrderSide::Buy,
             side: PositionSide::Long,

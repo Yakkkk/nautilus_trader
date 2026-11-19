@@ -15,7 +15,7 @@
 
 use std::str::FromStr;
 
-use nautilus_core::{DurationNanos, UnixNanos};
+use nautilus_core::{DurationNanos, UUID4, UnixNanos};
 use nautilus_model::{
     enums::{OrderSide, PositionSide},
     events::PositionSnapshot,
@@ -46,8 +46,8 @@ impl<'r> FromRow<'r, PgRow> for PositionSnapshotRow {
             .map(InstrumentId::from)?;
         let account_id = row.try_get::<&str, _>("account_id").map(AccountId::from)?;
         let opening_order_id = row
-            .try_get::<&str, _>("opening_order_id")
-            .map(ClientOrderId::from)?;
+            .try_get::<Option<&str>, _>("opening_order_id")?
+            .map(ClientOrderId::from);
         let closing_order_id = row
             .try_get::<Option<&str>, _>("closing_order_id")
             .ok()
@@ -109,6 +109,11 @@ impl<'r> FromRow<'r, PgRow> for PositionSnapshotRow {
         let ts_init = row.try_get::<String, _>("ts_init").map(UnixNanos::from)?;
         let ts_last = row.try_get::<String, _>("ts_last").map(UnixNanos::from)?;
         let replay_state = row.try_get::<Option<serde_json::Value>, _>("replay_state")?;
+        let opening_operation_id = replay_state
+            .as_ref()
+            .and_then(|state| state.get("opening_operation_id"))
+            .and_then(serde_json::Value::as_str)
+            .and_then(|value| value.parse::<UUID4>().ok());
 
         let snapshot = PositionSnapshot {
             trader_id,
@@ -117,6 +122,7 @@ impl<'r> FromRow<'r, PgRow> for PositionSnapshotRow {
             position_id: id,
             account_id,
             opening_order_id,
+            opening_operation_id,
             closing_order_id,
             entry,
             side,

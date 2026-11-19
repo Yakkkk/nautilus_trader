@@ -25,7 +25,7 @@ use crate::{
     enums::{OrderSide, PositionSide},
     events::OrderFilled,
     identifiers::{AccountId, ClientOrderId, InstrumentId, PositionId, StrategyId, TraderId},
-    position::Position,
+    position::{Position, PositionConvert},
     types::{Currency, Money, Price, Quantity},
 };
 
@@ -52,7 +52,13 @@ pub struct PositionClosed {
     /// The account ID associated with the position.
     pub account_id: AccountId,
     /// The client order ID for the order which opened the position.
-    pub opening_order_id: ClientOrderId,
+    pub opening_order_id: Option<ClientOrderId>,
+    /// The operation that opened the position, if not opened by a fill.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opening_operation_id: Option<UUID4>,
+    /// The allocated Convert change, when this event was not produced by a fill.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub convert: Option<PositionConvert>,
     /// The client order ID for the order which closed the position.
     pub closing_order_id: Option<ClientOrderId>,
     /// The position entry order side.
@@ -65,13 +71,13 @@ pub struct PositionClosed {
     pub quantity: Quantity,
     /// The peak directional quantity reached by the position.
     pub peak_quantity: Quantity,
-    /// The last fill quantity for the position.
+    /// The quantity filled, converted, or settled.
     pub last_qty: Quantity,
-    /// The last fill price for the position.
-    pub last_px: Price,
+    /// The fill or settlement price, absent for Convert.
+    pub last_px: Option<Price>,
     /// The position quote currency.
     pub currency: Currency,
-    /// The average open price.
+    /// The average open price, including the unit cost of any Convert inventory.
     pub avg_px_open: Decimal,
     /// The average closing price.
     pub avg_px_close: Option<Decimal>,
@@ -96,6 +102,40 @@ pub struct PositionClosed {
 }
 
 impl PositionClosed {
+    /// Projects an applied Convert decrease that closes the position onto the lifecycle notification.
+    pub(crate) fn from_convert(position: &Position, change: PositionConvert) -> Self {
+        Self {
+            trader_id: position.trader_id,
+            strategy_id: position.strategy_id,
+            instrument_id: position.instrument_id,
+            position_id: position.id,
+            account_id: position.account_id,
+            opening_order_id: position.opening_order_id,
+            opening_operation_id: position.opening_operation_id,
+            convert: Some(change),
+            closing_order_id: position.closing_order_id,
+            entry: position.entry,
+            side: position.side,
+            signed_qty: position.signed_qty,
+            quantity: position.quantity,
+            peak_quantity: position.peak_qty,
+            last_qty: change.quantity,
+            last_px: None,
+            currency: position.quote_currency,
+            avg_px_open: position.avg_px_open,
+            avg_px_close: position.avg_px_close,
+            realized_return: position.realized_return,
+            realized_pnl: position.realized_pnl,
+            unrealized_pnl: Money::zero(position.quote_currency),
+            duration: position.duration_ns,
+            event_id: UUID4::new(),
+            ts_opened: position.ts_opened,
+            ts_closed: position.ts_closed,
+            ts_event: change.ts_event,
+            ts_init: change.ts_init,
+        }
+    }
+
     #[must_use]
     pub fn create(
         position: &Position,
@@ -110,6 +150,8 @@ impl PositionClosed {
             position_id: position.id,
             account_id: position.account_id,
             opening_order_id: position.opening_order_id,
+            opening_operation_id: position.opening_operation_id,
+            convert: None,
             closing_order_id: position.closing_order_id,
             entry: position.entry,
             side: position.side,
@@ -117,7 +159,7 @@ impl PositionClosed {
             quantity: position.quantity,
             peak_quantity: position.peak_qty,
             last_qty: fill.last_qty,
-            last_px: fill.last_px,
+            last_px: Some(fill.last_px),
             currency: position.quote_currency,
             avg_px_open: position.avg_px_open,
             avg_px_close: position.avg_px_close,
@@ -148,6 +190,8 @@ impl PositionClosed {
             position_id: position.id,
             account_id: position.account_id,
             opening_order_id: position.opening_order_id,
+            opening_operation_id: position.opening_operation_id,
+            convert: None,
             closing_order_id: None,
             entry: position.entry,
             side: position.side,
@@ -155,7 +199,7 @@ impl PositionClosed {
             quantity: position.quantity,
             peak_quantity: position.peak_qty,
             last_qty,
-            last_px: close.close_price,
+            last_px: Some(close.close_price),
             currency: position.quote_currency,
             avg_px_open: position.avg_px_open,
             avg_px_close: position.avg_px_close,
@@ -198,7 +242,9 @@ mod tests {
             instrument_id: InstrumentId::from("EURUSD.SIM"),
             position_id: PositionId::from("P-001"),
             account_id: AccountId::from("SIM-001"),
-            opening_order_id: ClientOrderId::from("O-19700101-000000-001-001-1"),
+            opening_order_id: Some(ClientOrderId::from("O-19700101-000000-001-001-1")),
+            opening_operation_id: None,
+            convert: None,
             closing_order_id: Some(ClientOrderId::from("O-19700101-000000-001-001-2")),
             entry: OrderSide::Buy,
             side: PositionSide::Flat,
@@ -206,7 +252,7 @@ mod tests {
             quantity: Quantity::from("0"),
             peak_quantity: Quantity::from("150"),
             last_qty: Quantity::from("150"),
-            last_px: Price::from("1.0600"),
+            last_px: Some(Price::from("1.0600")),
             currency: Currency::USD(),
             avg_px_open: dec!(1.0525),
             avg_px_close: Some(dec!(1.0600)),
@@ -276,7 +322,7 @@ mod tests {
         assert_eq!(position_closed.quantity, position.quantity);
         assert_eq!(position_closed.peak_quantity, position.peak_qty);
         assert_eq!(position_closed.last_qty, closing_fill.last_qty);
-        assert_eq!(position_closed.last_px, closing_fill.last_px);
+        assert_eq!(position_closed.last_px, Some(closing_fill.last_px));
         assert_eq!(position_closed.currency, position.quote_currency);
         assert_eq!(position_closed.avg_px_open, position.avg_px_open);
         assert_eq!(position_closed.avg_px_close, position.avg_px_close);

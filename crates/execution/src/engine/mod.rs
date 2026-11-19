@@ -85,7 +85,7 @@ use nautilus_model::{
     instruments::{Instrument, InstrumentAny},
     orderbook::own::{OwnBookOrder, OwnOrderBook, should_handle_own_book_order},
     orders::{FILL_REPORT_ORDER_TAG, Order, OrderAny, OrderError},
-    position::{Position, PositionReplayEvent},
+    position::{Position, PositionConvert, PositionReplayEvent},
     reports::{ExecutionMassStatus, FillReport, OrderStatusReport, PositionStatusReport},
     types::{Money, Quantity},
 };
@@ -3628,7 +3628,7 @@ impl ExecutionEngine {
                 None,
             )
             .iter()
-            .filter(|position| position.opening_order_id == fill.client_order_id)
+            .filter(|position| position.opening_order_id == Some(fill.client_order_id()))
             .map(|position| position.id)
             .collect();
 
@@ -4703,6 +4703,8 @@ impl ExecutionEngine {
                 position_id: position.id,
                 account_id: position.account_id,
                 opening_order_id: position.opening_order_id,
+                opening_operation_id: position.opening_operation_id,
+                convert: None,
                 closing_order_id: position.closing_order_id,
                 entry: position.entry,
                 side: position.side,
@@ -4710,7 +4712,7 @@ impl ExecutionEngine {
                 quantity: position.quantity,
                 peak_quantity: position.peak_qty,
                 last_qty: corrected_qty,
-                last_px: fill_voided.last_px,
+                last_px: Some(fill_voided.last_px),
                 currency: position.quote_currency,
                 avg_px_open: position.avg_px_open,
                 avg_px_close: position.avg_px_close,
@@ -4732,13 +4734,15 @@ impl ExecutionEngine {
                 position_id: position.id,
                 account_id: position.account_id,
                 opening_order_id: position.opening_order_id,
+                opening_operation_id: position.opening_operation_id,
+                convert: None,
                 entry: position.entry,
                 side: position.side,
                 signed_qty: position.signed_qty,
                 quantity: position.quantity,
                 peak_quantity: position.peak_qty,
                 last_qty: corrected_qty,
-                last_px: fill_voided.last_px,
+                last_px: Some(fill_voided.last_px),
                 currency: position.quote_currency,
                 avg_px_open: position.avg_px_open,
                 avg_px_close: position.avg_px_close,
@@ -4803,7 +4807,7 @@ impl ExecutionEngine {
                 let instrument_id = fill.instrument_id;
                 let trade_id = fill.trade_id;
 
-                self.open_position(instrument, None, true, fill, oms_type)
+                self.open_position(instrument, None, true, fill, oms_type, UUID4::new())
                     .unwrap_or_else(|e| {
                         log::error!(
                             "Failed to open position {position_id} for instrument \
@@ -4820,14 +4824,21 @@ impl ExecutionEngine {
                 let instrument_id = fill.instrument_id;
                 let trade_id = fill.trade_id;
 
-                self.open_position(instrument, Some(position_id), true, fill, oms_type)
-                    .unwrap_or_else(|e| {
-                        log::error!(
-                            "Failed to reopen position {position_id} for instrument \
+                self.open_position(
+                    instrument,
+                    Some(position_id),
+                    true,
+                    fill,
+                    oms_type,
+                    UUID4::new(),
+                )
+                .unwrap_or_else(|e| {
+                    log::error!(
+                        "Failed to reopen position {position_id} for instrument \
                              {instrument_id} from fill {trade_id}: {e:?}"
-                        );
-                        Vec::new()
-                    })
+                    );
+                    Vec::new()
+                })
             }
             Action::Flip(mut position) => {
                 self.flip_position(instrument, &mut position, &fill, oms_type)
@@ -4891,6 +4902,7 @@ impl ExecutionEngine {
         archive_prior: bool,
         fill: OrderFilled,
         oms_type: OmsType,
+        opening_event_id: UUID4,
     ) -> anyhow::Result<Vec<PositionEvent>> {
         let position = Position::new_checked(instrument, fill.clone())?;
 
@@ -4921,8 +4933,12 @@ impl ExecutionEngine {
             }
         }
 
-        let is_orderless_leg = self.is_leg_fill(&fill)
-            && !self.cache.borrow().order_exists(&position.opening_order_id);
+        let has_opening_order = position
+            .opening_order_id
+            .as_ref()
+            .is_some_and(|order_id| self.cache.borrow().order_exists(order_id));
+        let is_orderless_leg = self.is_leg_fill(&fill) && !has_opening_order;
+
         if let Some(position_id) = prior_position_id {
             debug_assert_eq!(position_id, position.id);
 
@@ -4957,7 +4973,7 @@ impl ExecutionEngine {
         }
 
         let ts_init = self.clock.borrow().timestamp_ns();
-        let event = PositionOpened::create(&position, &fill, UUID4::new(), ts_init);
+        let event = PositionOpened::create(&position, &fill, opening_event_id, ts_init);
 
         Ok(vec![PositionEvent::PositionOpened(event)])
     }
@@ -5112,6 +5128,44 @@ impl ExecutionEngine {
         }
     }
 
+    /// Applies one allocated Convert position change through the cache and publishes the
+    /// resulting lifecycle event.
+    ///
+    /// This is the internal core integration entry point for a single already allocated
+    /// change. It does not expose a strategy command, public Python Convert API, or
+    /// cross-position accounting. The change targets the same NETTING position ID as an
+    /// ordinary fill for the instrument and strategy.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the change cannot be applied to the cached position.
+    pub fn apply_position_convert(
+        &mut self,
+        instrument: &InstrumentAny,
+        change: PositionConvert,
+    ) -> anyhow::Result<Option<PositionEvent>> {
+        let event = self
+            .cache
+            .borrow_mut()
+            .apply_position_convert(instrument, change)?;
+
+        if let Some(event) = event.as_ref() {
+            let snapshot_position = self
+                .config
+                .snapshot_positions
+                .then(|| self.cache.borrow().position_owned(&change.position_id))
+                .flatten();
+
+            if let Some(position) = snapshot_position {
+                self.create_position_state_snapshot(&position, false);
+            }
+
+            self.publish_position_events(vec![event.clone()]);
+        }
+
+        Ok(event)
+    }
+
     fn settle_instrument_close(&self, close: &InstrumentClose) {
         let instrument_id = close.instrument_id;
 
@@ -5236,14 +5290,18 @@ impl ExecutionEngine {
             fill.position_id
         };
 
-        let (fill_split1, fill_split2) =
-            match fill.split_for_position_flip(position.quantity, position_id_flip, UUID4::new()) {
-                Ok(fills) => fills,
-                Err(e) => {
-                    log::error!("Failed to split position flip: {e}");
-                    return position_events;
-                }
-            };
+        let opening_event_id = UUID4::new();
+        let (fill_split1, fill_split2) = match fill.split_for_position_flip(
+            position.quantity,
+            position_id_flip,
+            opening_event_id,
+        ) {
+            Ok(fills) => fills,
+            Err(e) => {
+                log::error!("Failed to split position flip: {e}");
+                return position_events;
+            }
+        };
 
         if let Err(e) = Position::new_checked(instrument, fill_split2.clone()) {
             log::error!("Failed to validate flipped position: {e}");
@@ -5280,7 +5338,14 @@ impl ExecutionEngine {
         let prior_position_id =
             (fill_split2.position_id == Some(position.id)).then_some(position.id);
 
-        match self.open_position(instrument, prior_position_id, false, fill_split2, oms_type) {
+        match self.open_position(
+            instrument,
+            prior_position_id,
+            false,
+            fill_split2,
+            oms_type,
+            opening_event_id,
+        ) {
             Ok(opened_events) => position_events.extend(opened_events),
             Err(e) => log::error!("Failed to open flipped position: {e:?}"),
         }
@@ -5481,10 +5546,13 @@ mod tests {
             OrderFillVoided,
             order::spec::{OrderCanceledSpec, OrderFillVoidedSpec, OrderFilledSpec},
         },
-        identifiers::{AccountId, ClientOrderId, TradeId, VenueOrderId},
-        instruments::{InstrumentAny, stubs::audusd_sim},
+        identifiers::{AccountId, ClientOrderId, TradeId, TraderId, VenueOrderId},
+        instruments::{
+            InstrumentAny,
+            stubs::{audusd_sim, binary_option},
+        },
         orders::{builder::OrderTestBuilder, stubs::TestOrderEventStubs},
-        position::PositionFillVoid,
+        position::{PositionConvertKind, PositionFillVoid},
         types::Price,
     };
     use rstest::*;
@@ -5510,7 +5578,14 @@ mod tests {
             .last_px(Price::from("0.0000000000000001"))
             .build();
 
-        let result = engine.open_position(&instrument, None, false, fill, OmsType::Netting);
+        let result = engine.open_position(
+            &instrument,
+            None,
+            false,
+            fill,
+            OmsType::Netting,
+            UUID4::new(),
+        );
 
         assert_eq!(
             result.unwrap_err().to_string(),
@@ -5578,6 +5653,68 @@ mod tests {
         );
         assert!(cache.borrow().is_position_open(&position.id));
         assert!(!cache.borrow().is_position_closed(&position.id));
+    }
+
+    #[rstest]
+    fn flip_reopen_shares_position_opened_event_with_cycle_identity() {
+        let cache = Rc::new(RefCell::new(Cache::default()));
+        let mut engine = ExecutionEngine::new(
+            Rc::new(RefCell::new(VirtualClock::new())),
+            Rc::clone(&cache),
+            None,
+        );
+        let instrument = InstrumentAny::CurrencyPair(audusd_sim());
+        let strategy_id = StrategyId::from("S-FLIP-CYCLE");
+        let position_id = PositionId::new(format!("{}-{}", instrument.id(), strategy_id));
+        let opening = OrderFilledSpec::builder()
+            .strategy_id(strategy_id)
+            .instrument_id(instrument.id())
+            .client_order_id(ClientOrderId::from("O-FLIP-CYCLE-OPEN"))
+            .venue_order_id(VenueOrderId::from("V-FLIP-CYCLE-OPEN"))
+            .trade_id(TradeId::from("T-FLIP-CYCLE-OPEN"))
+            .order_side(OrderSide::Buy)
+            .last_qty(Quantity::from("10.00"))
+            .last_px(Price::from("1.00000"))
+            .position_id(position_id)
+            .build();
+        let mut position = Position::new(&instrument, opening.clone());
+        cache
+            .borrow_mut()
+            .add_position(&position, OmsType::Netting)
+            .unwrap();
+        let mut reversal = opening;
+        reversal.trade_id = TradeId::from("T-FLIP-CYCLE-REVERSE");
+        reversal.event_id = UUID4::new();
+        reversal.order_side = OrderSide::Sell;
+        reversal.last_qty = Quantity::from("15.00");
+        reversal.last_px = Price::from("2.00000");
+
+        let events = engine.flip_position(&instrument, &mut position, &reversal, OmsType::Netting);
+        let [
+            PositionEvent::PositionClosed(_),
+            PositionEvent::PositionOpened(opened),
+        ] = events.as_slice()
+        else {
+            panic!("expected close and open notifications, found {events:?}");
+        };
+        let cache = cache.borrow();
+        let replayed = cache.position(&position_id).unwrap();
+        assert_eq!(replayed.current_cycle_id(), Some(opened.event_id));
+        assert_eq!(replayed.quantity, Quantity::from("5.00"));
+        let opening_fill = replayed
+            .replay_events
+            .iter()
+            .find_map(|event| match event {
+                PositionReplayEvent::Filled(fill)
+                    if fill.client_order_id == reversal.client_order_id =>
+                {
+                    Some(fill)
+                }
+                _ => None,
+            })
+            .expect("flipped opening fill");
+        assert_eq!(opening_fill.event_id, opened.event_id);
+        assert_eq!(opening_fill.causation_id, Some(reversal.event_id));
     }
 
     #[rstest]
@@ -5884,7 +6021,14 @@ mod tests {
         );
 
         let events = engine
-            .open_position(&instrument, None, true, fill.clone(), OmsType::Netting)
+            .open_position(
+                &instrument,
+                None,
+                true,
+                fill.clone(),
+                OmsType::Netting,
+                UUID4::new(),
+            )
             .unwrap();
 
         assert_eq!(
@@ -5895,9 +6039,117 @@ mod tests {
             panic!("Expected one position-opened event");
         };
         assert_eq!(opened.position_id, position_id);
-        assert_eq!(opened.opening_order_id, fill.client_order_id);
+        assert_eq!(opened.opening_order_id, Some(fill.client_order_id));
         assert_eq!(opened.quantity, fill.last_qty);
-        assert_eq!(opened.last_px, fill.last_px);
+        assert_eq!(opened.last_px, Some(fill.last_px));
+    }
+
+    #[rstest]
+    fn convert_apply_publishes_state_snapshots_for_applied_changes() {
+        let instrument = InstrumentAny::BinaryOption(binary_option());
+        let strategy_id = StrategyId::from("S-CONVERT-SNAPSHOT");
+        let position_id = PositionId::new(format!("{}-{}", instrument.id(), strategy_id));
+        let cache = Rc::new(RefCell::new(Cache::default()));
+        cache
+            .borrow_mut()
+            .add_instrument(instrument.clone())
+            .unwrap();
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
+        clock.borrow_mut().set_time(UnixNanos::from(10));
+        let config = ExecutionEngineConfig::builder()
+            .snapshot_positions(true)
+            .build()
+            .unwrap();
+        let mut engine = ExecutionEngine::new(clock, Rc::clone(&cache), Some(config));
+        set_message_bus(Rc::new(RefCell::new(MessageBus::default())));
+        let snapshots = Rc::new(RefCell::new(Vec::new()));
+        let captured = Rc::clone(&snapshots);
+        let topic = switchboard::get_snapshot_position_topic(position_id);
+        msgbus::subscribe_any(
+            topic.as_str().into(),
+            TypedHandler::from_typed::<PositionStateSnapshot, _>(move |snapshot| {
+                captured.borrow_mut().push((
+                    snapshot.position.id,
+                    snapshot.position.quantity,
+                    snapshot.position.is_closed(),
+                ));
+            }),
+            None,
+        );
+
+        let operation_id = UUID4::new();
+        let opening = PositionConvert {
+            operation_id,
+            trader_id: TraderId::from("TRADER-001"),
+            strategy_id,
+            instrument_id: instrument.id(),
+            position_id,
+            account_id: AccountId::from("POLYMARKET-001"),
+            cycle_id: operation_id,
+            kind: PositionConvertKind::Open {
+                previous_cycle_id: None,
+            },
+            quantity: Quantity::from("100.00"),
+            cost: 50.into(),
+            realized_pnl: 0.into(),
+            ts_event: UnixNanos::from(1),
+            ts_init: UnixNanos::from(1),
+        };
+        let applied = engine
+            .apply_position_convert(&instrument, opening)
+            .unwrap()
+            .expect("opening applied");
+        assert!(matches!(applied, PositionEvent::PositionOpened(_)));
+        assert_eq!(snapshots.borrow().len(), 1);
+
+        let after_open = snapshots.borrow().len();
+        assert!(
+            engine
+                .apply_position_convert(&instrument, opening)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(snapshots.borrow().len(), after_open);
+
+        let increase = PositionConvert {
+            operation_id: UUID4::new(),
+            kind: PositionConvertKind::Increase,
+            quantity: Quantity::from("20.00"),
+            cost: 10.into(),
+            ..opening
+        };
+        let applied = engine
+            .apply_position_convert(&instrument, increase)
+            .unwrap()
+            .expect("increase applied");
+        assert!(matches!(applied, PositionEvent::PositionChanged(_)));
+
+        let closing = PositionConvert {
+            operation_id: UUID4::new(),
+            kind: PositionConvertKind::Decrease,
+            quantity: Quantity::from("120.00"),
+            cost: 60.into(),
+            realized_pnl: 5.into(),
+            ts_event: UnixNanos::from(3),
+            ts_init: UnixNanos::from(3),
+            ..increase
+        };
+        let applied = engine
+            .apply_position_convert(&instrument, closing)
+            .unwrap()
+            .expect("closing applied");
+        assert!(matches!(applied, PositionEvent::PositionClosed(_)));
+
+        let snapshots = snapshots.borrow();
+        assert_eq!(snapshots.len(), 3);
+        assert_eq!(
+            snapshots.as_slice(),
+            &[
+                (position_id, Quantity::from("100.00"), false),
+                (position_id, Quantity::from("120.00"), false),
+                (position_id, Quantity::from("0.00"), true),
+            ],
+        );
     }
 
     fn position_fill(
