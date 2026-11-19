@@ -291,7 +291,7 @@ pub enum DatabaseQuery {
     AddInstrumentClose(InstrumentClose),
     AddOrder(OrderInitialized, Option<ClientId>),
     AddOrderSnapshot(OrderSnapshot),
-    AddPosition(PositionId, OrderFilled),
+    AddPosition(PositionId, TraderId, Option<OrderFilled>),
     AddPositionSnapshot(PositionSnapshot),
     AddAccount(AccountState, bool),
     AddSignal(Signal),
@@ -505,7 +505,11 @@ async fn check_schema_migrated(pool: &PgPool) -> Result<(), sqlx::Error> {
     }
 
     check_trader_keys(pool).await?;
+    check_schema_columns(pool).await?;
+    check_position_opening_order_nullable(pool).await
+}
 
+async fn check_schema_columns(pool: &PgPool) -> Result<(), sqlx::Error> {
     let missing: Vec<String> = sqlx::query_scalar(
         "SELECT required.table_name || '.' || required.column_name
         FROM (VALUES
@@ -530,7 +534,9 @@ async fn check_schema_migrated(pool: &PgPool) -> Result<(), sqlx::Error> {
             ('order_event', 'causation_id'),
             ('position_event', 'reconciliation'),
             ('position_event', 'info'),
-            ('position_event', 'causation_id')
+            ('position_event', 'causation_id'),
+            ('position', 'opening_order_id'),
+            ('position', 'opening_operation_id')
             UNION ALL
             SELECT * FROM (VALUES
                 ('instrument', 'defi_currency_codes'),
@@ -562,6 +568,33 @@ async fn check_schema_migrated(pool: &PgPool) -> Result<(), sqlx::Error> {
         )
         .into(),
     ))
+}
+
+async fn check_position_opening_order_nullable(pool: &PgPool) -> Result<(), sqlx::Error> {
+    let not_null: bool = sqlx::query_scalar(
+        "SELECT EXISTS (
+            SELECT 1
+            FROM information_schema.columns
+            WHERE table_schema = current_schema()
+              AND table_name = 'position'
+              AND column_name = 'opening_order_id'
+              AND is_nullable = 'NO'
+        )",
+    )
+    .fetch_one(pool)
+    .await?;
+
+    if not_null {
+        return Err(sqlx::Error::Configuration(
+            format!(
+                "Postgres schema is out of date, position.opening_order_id must be nullable: \
+                 {SCHEMA_MIGRATION_COMMAND}"
+            )
+            .into(),
+        ));
+    }
+
+    Ok(())
 }
 
 // Client order and position IDs are only unique per trader, so the snapshot and index keys must be
@@ -1264,8 +1297,13 @@ impl CacheDatabaseAdapter for PostgresCacheDatabase {
     }
 
     fn add_position(&self, position: &Position) -> anyhow::Result<()> {
-        let event = position_last_event(position)?;
-        let query = DatabaseQuery::AddPosition(position.id, event);
+        let event = position.last_event();
+
+        if event.is_none() && !position.requires_replay_state() {
+            anyhow::bail!("Cannot persist position with no events: {}", position.id);
+        }
+
+        let query = DatabaseQuery::AddPosition(position.id, position.trader_id, event);
         self.tx.send(query).map_err(|e| {
             anyhow::anyhow!("Failed to send query add_position to database message handler: {e}")
         })?;
@@ -1740,8 +1778,9 @@ async fn drain_buffer(pool: &PgPool, trader_id: &TraderId, buffer: &mut VecDeque
             DatabaseQuery::AddOrderSnapshot(snapshot) => {
                 DatabaseQueries::add_order_snapshot(pool, snapshot).await
             }
-            DatabaseQuery::AddPosition(position_id, event) => {
-                DatabaseQueries::add_position(pool, position_id, &event).await
+            DatabaseQuery::AddPosition(position_id, trader_id, event) => {
+                DatabaseQueries::replace_position(pool, position_id, trader_id, event.as_ref())
+                    .await
             }
             DatabaseQuery::AddPositionSnapshot(snapshot) => {
                 DatabaseQueries::add_position_snapshot(pool, snapshot).await

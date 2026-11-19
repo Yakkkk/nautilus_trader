@@ -109,11 +109,31 @@ impl<'r> FromRow<'r, PgRow> for PositionSnapshotRow {
         let ts_init = row.try_get::<String, _>("ts_init").map(UnixNanos::from)?;
         let ts_last = row.try_get::<String, _>("ts_last").map(UnixNanos::from)?;
         let replay_state = row.try_get::<Option<serde_json::Value>, _>("replay_state")?;
-        let opening_operation_id = replay_state
-            .as_ref()
-            .and_then(|state| state.get("opening_operation_id"))
-            .and_then(serde_json::Value::as_str)
-            .and_then(|value| value.parse::<UUID4>().ok());
+        let opening_operation_id = match row.try_get::<Option<&str>, _>("opening_operation_id")? {
+            Some(value) => Some(
+                value
+                    .parse::<UUID4>()
+                    .map_err(|e| decode_error("opening_operation_id", value, e))?,
+            ),
+            None => match replay_state
+                .as_ref()
+                .and_then(|state| state.get("opening_operation_id"))
+            {
+                Some(serde_json::Value::String(value)) => Some(
+                    value
+                        .parse::<UUID4>()
+                        .map_err(|e| decode_error("opening_operation_id", value, e))?,
+                ),
+                Some(serde_json::Value::Null) | None => None,
+                Some(value) => {
+                    return Err(decode_error(
+                        "opening_operation_id",
+                        value,
+                        "expected a string",
+                    ));
+                }
+            },
+        };
 
         let snapshot = PositionSnapshot {
             trader_id,

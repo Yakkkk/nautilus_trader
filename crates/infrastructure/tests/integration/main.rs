@@ -24,4 +24,6 @@ mod test_redis_queries;
 mod defi_currency;
 
 #[cfg(all(target_os = "linux", any(feature = "redis", feature = "postgres")))]
+mod position_convert;
+#[cfg(all(target_os = "linux", any(feature = "redis", feature = "postgres")))]
 mod position_flip;

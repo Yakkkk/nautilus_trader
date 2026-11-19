@@ -2892,8 +2892,8 @@ impl Position {
 
     /// Returns whether replaying the position's fills alone cannot rebuild its state.
     ///
-    /// Fill voids, settlements, and price restatements change state without a new
-    /// quantity-bearing fill, so persistence must store the complete replay state.
+    /// Convert operations, fill voids, settlements, and price restatements change state without
+    /// a new quantity-bearing fill, so persistence must store the complete replay state.
     /// Retained virtual position cycles also require the complete replay state.
     #[must_use]
     pub fn requires_replay_state(&self) -> bool {

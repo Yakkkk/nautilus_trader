@@ -15,7 +15,7 @@
 
 use std::{collections::HashMap, str::FromStr};
 
-use ahash::AHashMap;
+use ahash::{AHashMap, AHashSet};
 use bytes::Bytes;
 use futures::future::join_all;
 #[cfg(feature = "defi")]
@@ -47,9 +47,16 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use ustr::Ustr;
 
-use super::get_index_key;
+use super::{POSITION_REPLAY_PREFIX, get_index_key};
 #[cfg(feature = "defi")]
 use crate::defi::{contract_conflict, integrity_error, redis_read_error, validate_marker};
+
+/// Marks the authoritative position state for a newly written Redis position cycle.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub(crate) enum PositionReplayAuthority {
+    Replay(Box<PositionSnapshot>),
+    FillOnly,
+}
 
 /// Persisted representation of a [`Currency`].
 ///
@@ -811,8 +818,14 @@ impl DatabaseQueries {
 
         match collection {
             INDEX => Self::read_index(&mut con, &full_key).await,
-            GENERAL | CURRENCIES | INSTRUMENTS | INSTRUMENT_CLOSES | SYNTHETICS | ACTORS
-            | STRATEGIES => Self::read_string(&mut con, &full_key).await,
+            GENERAL
+            | CURRENCIES
+            | INSTRUMENTS
+            | INSTRUMENT_CLOSES
+            | SYNTHETICS
+            | ACTORS
+            | STRATEGIES
+            | POSITION_REPLAY_PREFIX => Self::read_string(&mut con, &full_key).await,
             ACCOUNTS | ORDERS | POSITIONS | SNAPSHOTS => Self::read_list(&mut con, &full_key).await,
             _ => anyhow::bail!("Unsupported operation: `read` for collection '{collection}'"),
         }
@@ -1294,10 +1307,8 @@ impl DatabaseQueries {
 
     /// Loads all positions for `trader_key` using the specified `encoding`.
     ///
-    /// # Errors
-    ///
-    /// Returns an error if scanning keys or reading position data fails.
-    /// Loads all positions for `trader_key` using the specified `encoding`.
+    /// The legacy fill keys remain the discovery source for existing CLOB positions, while
+    /// position snapshot keys also find positions persisted only as replay snapshots.
     ///
     /// # Errors
     ///
@@ -1308,24 +1319,45 @@ impl DatabaseQueries {
         encoding: SerializationEncoding,
     ) -> anyhow::Result<AHashMap<PositionId, Position>> {
         let mut positions = AHashMap::new();
-        let pattern = format!("{trader_key}{REDIS_DELIMITER}{POSITIONS}*");
+        let position_prefix = format!("{trader_key}{REDIS_DELIMITER}{POSITIONS}{REDIS_DELIMITER}");
+        let pattern = format!("{position_prefix}*");
         log::debug!("Loading {pattern}");
 
         let mut con = con.clone();
         let keys = Self::scan_keys(&mut con, pattern).await?;
+        let snapshot_prefix = format!(
+            "{trader_key}{REDIS_DELIMITER}{SNAPSHOTS}{REDIS_DELIMITER}{POSITIONS}{REDIS_DELIMITER}"
+        );
+        let snapshot_pattern = format!("{snapshot_prefix}*");
+        let snapshot_keys = Self::scan_keys(&mut con, snapshot_pattern).await?;
+        let mut position_ids = AHashSet::new();
 
-        let futures: Vec<_> = keys
+        for (key, prefix) in keys
             .iter()
-            .map(|key| {
+            .map(|key| (key.as_str(), position_prefix.as_str()))
+            .chain(
+                snapshot_keys
+                    .iter()
+                    .map(|key| (key.as_str(), snapshot_prefix.as_str())),
+            )
+        {
+            let Some(code) = key.strip_prefix(prefix) else {
+                log::error!("Invalid key format: {key}");
+                continue;
+            };
+
+            if code.is_empty() {
+                log::error!("Invalid position key: {key}");
+            } else {
+                position_ids.insert(PositionId::from(code));
+            }
+        }
+
+        let futures: Vec<_> = position_ids
+            .into_iter()
+            .map(|position_id| {
                 let con = con.clone();
                 async move {
-                    let position_id = if let Some(code) = key.as_str().rsplit(':').next() {
-                        PositionId::from(code)
-                    } else {
-                        log::error!("Invalid key format: {key}");
-                        return None;
-                    };
-
                     match Self::load_position(&con, trader_key, &position_id, encoding).await {
                         Ok(Some(position)) => Some((position_id, position)),
                         Ok(None) => {
@@ -1654,6 +1686,10 @@ impl DatabaseQueries {
 
     /// Loads a single position for `trader_key` and `position_id` using the specified `encoding`.
     ///
+    /// Newly written positions carry an authority record under `position-replay:<id>` that selects
+    /// the current replay snapshot or explicitly marks a fill-only cycle. Missing authority means
+    /// legacy data and uses the baseline snapshot-first, fill-log fallback.
+    ///
     /// # Errors
     ///
     /// Returns an error if the underlying read or deserialization fails.
@@ -1663,6 +1699,35 @@ impl DatabaseQueries {
         position_id: &PositionId,
         encoding: SerializationEncoding,
     ) -> anyhow::Result<Option<Position>> {
+        let authority_key = format!("{POSITION_REPLAY_PREFIX}{REDIS_DELIMITER}{position_id}");
+        let authority = Self::read(con, trader_key, &authority_key).await?;
+        if let Some(payload) = authority.first() {
+            let authority: PositionReplayAuthority = Self::deserialize_payload(encoding, payload)?;
+
+            match authority {
+                PositionReplayAuthority::Replay(snapshot) => {
+                    let snapshot = *snapshot;
+                    anyhow::ensure!(
+                        snapshot.position_id == *position_id,
+                        "Position replay authority for {position_id} contained {}",
+                        snapshot.position_id,
+                    );
+                    let replay_state = snapshot.replay_state.ok_or_else(|| {
+                        anyhow::anyhow!("Position replay authority for {position_id} has no replay")
+                    })?;
+                    let position: Position = serde_json::from_value(replay_state).map_err(|e| {
+                        anyhow::anyhow!("Failed to decode position replay state: {e}")
+                    })?;
+                    position.check_accounting()?;
+                    return Ok(Some(position));
+                }
+                PositionReplayAuthority::FillOnly => {
+                    return Self::load_position_from_fills(con, trader_key, position_id, encoding)
+                        .await;
+                }
+            }
+        }
+
         let snapshot_key =
             format!("{SNAPSHOTS}{REDIS_DELIMITER}{POSITIONS}{REDIS_DELIMITER}{position_id}");
         let snapshots = Self::read(con, trader_key, &snapshot_key).await?;
@@ -1676,6 +1741,15 @@ impl DatabaseQueries {
             }
         }
 
+        Self::load_position_from_fills(con, trader_key, position_id, encoding).await
+    }
+
+    async fn load_position_from_fills(
+        con: &ConnectionManager,
+        trader_key: &str,
+        position_id: &PositionId,
+        encoding: SerializationEncoding,
+    ) -> anyhow::Result<Option<Position>> {
         let key = format!("{POSITIONS}{REDIS_DELIMITER}{position_id}");
         let result = Self::read(con, trader_key, &key).await?;
         if result.is_empty() {

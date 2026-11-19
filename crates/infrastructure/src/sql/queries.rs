@@ -1297,20 +1297,20 @@ impl DatabaseQueries {
 
         sqlx::query(r#"
             INSERT INTO "position" (
-                id, trader_id, strategy_id, instrument_id, account_id, opening_order_id, closing_order_id, entry, side, signed_qty, quantity, peak_qty,
+                id, trader_id, strategy_id, instrument_id, account_id, opening_order_id, opening_operation_id, closing_order_id, entry, side, signed_qty, quantity, peak_qty,
                 quote_currency, base_currency, settlement_currency, avg_px_open, avg_px_close, realized_return, realized_pnl, unrealized_pnl, commissions,
                 duration_ns, ts_opened, ts_closed, ts_init, ts_last, replay_state, created_at, updated_at
             ) VALUES (
                 $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20,
-                $21, $22, $23, $24, $25, $26, $27, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+                $21, $22, $23, $24, $25, $26, $27, $28, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
             )
             ON CONFLICT (trader_id, id)
             DO UPDATE
             SET
-                strategy_id = $3, instrument_id = $4, account_id = $5, opening_order_id = $6, closing_order_id = $7, entry = $8, side = $9, signed_qty = $10, quantity = $11,
-                peak_qty = $12, quote_currency = $13, base_currency = $14, settlement_currency = $15, avg_px_open = $16, avg_px_close = $17, realized_return = $18, realized_pnl = $19, unrealized_pnl = $20,
-                commissions = $21, duration_ns = $22, ts_opened = $23, ts_closed = $24, ts_init = $25, ts_last = $26,
-                replay_state = $27, updated_at = CURRENT_TIMESTAMP
+                strategy_id = $3, instrument_id = $4, account_id = $5, opening_order_id = $6, opening_operation_id = $7, closing_order_id = $8, entry = $9, side = $10, signed_qty = $11, quantity = $12,
+                peak_qty = $13, quote_currency = $14, base_currency = $15, settlement_currency = $16, avg_px_open = $17, avg_px_close = $18, realized_return = $19, realized_pnl = $20, unrealized_pnl = $21,
+                commissions = $22, duration_ns = $23, ts_opened = $24, ts_closed = $25, ts_init = $26, ts_last = $27,
+                replay_state = $28, updated_at = CURRENT_TIMESTAMP
         "#)
             .bind(snapshot.position_id.to_string())
             .bind(snapshot.trader_id.to_string())
@@ -1318,6 +1318,11 @@ impl DatabaseQueries {
             .bind(snapshot.instrument_id.to_string())
             .bind(snapshot.account_id.to_string())
             .bind(snapshot.opening_order_id.map(|order_id| order_id.to_string()))
+            .bind(
+                snapshot
+                    .opening_operation_id
+                    .map(|operation_id| operation_id.to_string()),
+            )
             .bind(snapshot.closing_order_id.map(|x| x.to_string()))
             .bind(snapshot.entry.to_string())
             .bind(snapshot.side.to_string())
@@ -1676,6 +1681,10 @@ impl DatabaseQueries {
 
     /// Replaces the fill event log for a `position_id` via the provided `pool`.
     ///
+    /// Starting a position cycle clears any replay snapshot for the same position, so state from
+    /// an earlier cycle cannot be revived when the ID is reused. Non-replay routine snapshots
+    /// remain available as historical state.
+    ///
     /// # Errors
     ///
     /// Returns an error if the fill is invalid or if the SQL operations fail.
@@ -1684,29 +1693,70 @@ impl DatabaseQueries {
         position_id: PositionId,
         event: &OrderFilled,
     ) -> anyhow::Result<()> {
-        let event_position_id = Self::event_position_id(event)?;
-        if event_position_id != position_id {
-            anyhow::bail!(
-                "Cannot persist position event {} for mismatched position_id: expected {}, was {}",
-                event.event_id,
-                position_id,
-                event_position_id
-            );
+        Self::replace_position(pool, position_id, event.trader_id, Some(event)).await
+    }
+
+    /// Replaces the position fill log and clears prior replay snapshot state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the event targets another position or trader, or if the SQL operations
+    /// fail.
+    pub(super) async fn replace_position(
+        pool: &PgPool,
+        position_id: PositionId,
+        trader_id: TraderId,
+        event: Option<&OrderFilled>,
+    ) -> anyhow::Result<()> {
+        if let Some(event) = event {
+            let event_position_id = Self::event_position_id(event)?;
+            if event_position_id != position_id {
+                anyhow::bail!(
+                    "Cannot persist position event {} for mismatched position_id: expected {}, was {}",
+                    event.event_id,
+                    position_id,
+                    event_position_id
+                );
+            }
+
+            if event.trader_id != trader_id {
+                anyhow::bail!(
+                    "Cannot persist position event {} for another trader: expected {}, was {}",
+                    event.event_id,
+                    trader_id,
+                    event.trader_id
+                );
+            }
         }
 
         let mut transaction = pool.begin().await?;
+
+        // A direct add starts a fresh position cycle. Clear only replay-bearing snapshot rows so
+        // an earlier cycle cannot mask the new fill log, while routine snapshots remain readable.
+        sqlx::query(
+            r#"DELETE FROM "position" WHERE id = $1 AND trader_id = $2 AND replay_state IS NOT NULL"#,
+        )
+            .bind(position_id.to_string())
+            .bind(trader_id.to_string())
+            .execute(&mut *transaction)
+            .await
+            .map(|_| ())
+            .map_err(|e| anyhow::anyhow!("Failed to delete position replay snapshot row: {e}"))?;
 
         // Position IDs are only unique per trader (NETTING IDs are `{instrument_id}-{strategy_id}`),
         // so the replaced event log is the fill trader's alone
         sqlx::query(r#"DELETE FROM "position_event" WHERE position_id = $1 AND trader_id = $2"#)
             .bind(position_id.to_string())
-            .bind(event.trader_id.to_string())
+            .bind(trader_id.to_string())
             .execute(&mut *transaction)
             .await
             .map(|_| ())
             .map_err(|e| anyhow::anyhow!("Failed to delete position_event rows: {e}"))?;
 
-        Self::insert_position_event(&mut transaction, event).await?;
+        if let Some(event) = event {
+            Self::insert_position_event(&mut transaction, event).await?;
+        }
+
         transaction
             .commit()
             .await
@@ -1828,9 +1878,13 @@ impl DatabaseQueries {
     ) -> anyhow::Result<Vec<Position>> {
         let position_ids: Vec<PositionId> = sqlx::query(
             r#"
-            SELECT DISTINCT position_id
+            SELECT position_id
             FROM "position_event"
             WHERE trader_id = $1
+            UNION
+            SELECT id AS position_id
+            FROM "position"
+            WHERE trader_id = $1 AND replay_state IS NOT NULL
             ORDER BY position_id ASC
         "#,
         )
