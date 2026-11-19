@@ -30,6 +30,7 @@ pub mod equity;
 pub mod futures_contract;
 pub mod futures_spread;
 pub mod index_instrument;
+pub mod neg_risk;
 pub mod option_contract;
 pub mod option_spread;
 pub mod perpetual_contract;
