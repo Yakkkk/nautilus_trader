@@ -6348,6 +6348,7 @@ dependencies = [
  "nautilus-common",
  "nautilus-core",
  "nautilus-model",
+ "nautilus-portfolio",
  "parking_lot 0.13.0",
  "proptest",
  "pyo3",

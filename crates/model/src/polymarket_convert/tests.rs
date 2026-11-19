@@ -13,6 +13,8 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
+use std::str::FromStr;
+
 use proptest::prelude::*;
 use rstest::rstest;
 use rust_decimal_macros::dec;
@@ -261,6 +263,85 @@ fn test_total_cost_does_not_round_intermediate_sums() {
         ],
     );
     assert_conservation(Decimal::MAX, Decimal::MAX, &result);
+}
+
+#[rstest]
+fn test_precise_allocation_preserves_fractional_released_cost() {
+    let released = Decimal::from_str("0.2333333333333333333333333333").unwrap();
+    let inputs = [input(NO_A, dec!(1), released)];
+    let outputs = [output(YES_A, dec!(1)), output(YES_B, dec!(2))];
+    let result =
+        allocate_convert_costs_precise(&inputs, &outputs, dec!(0), Currency::pUSD()).unwrap();
+
+    assert_eq!(
+        result.output_costs,
+        [
+            allocation(
+                YES_A,
+                Decimal::from_str("0.0777777777777777777777777777").unwrap()
+            ),
+            allocation(
+                YES_B,
+                Decimal::from_str("0.1555555555555555555555555556").unwrap()
+            ),
+        ],
+    );
+    assert_eq!(result.input_pnl, [allocation(NO_A, Decimal::ZERO)]);
+    assert_conservation(released, dec!(0), &result);
+}
+
+#[rstest]
+fn test_precise_allocation_conserves_multiple_fractional_costs() {
+    let first = Decimal::from_str("0.2333333333333333333333333333").unwrap();
+    let second = Decimal::from_str("0.4666666666666666666666666667").unwrap();
+    let inputs = [input(NO_A, dec!(1), first), input(NO_B, dec!(2), second)];
+    let outputs = [output(YES_C, dec!(3))];
+    let result =
+        allocate_convert_costs_precise(&inputs, &outputs, dec!(0.1), Currency::pUSD()).unwrap();
+
+    let total = first + second;
+    assert_eq!(result.output_costs, [allocation(YES_C, total - dec!(0.1))]);
+    assert_conservation(total, dec!(0.1), &result);
+    assert_eq!(
+        result
+            .output_costs
+            .iter()
+            .map(|(_, amount)| *amount)
+            .sum::<Decimal>(),
+        total - dec!(0.1),
+    );
+}
+
+#[rstest]
+fn test_precise_allocation_keeps_currency_contract_for_integral_costs() {
+    let inputs = [input(NO_A, dec!(1), dec!(2)), input(NO_B, dec!(2), dec!(3))];
+    let outputs = [output(YES_A, dec!(1)), output(YES_B, dec!(2))];
+    let precise =
+        allocate_convert_costs_precise(&inputs, &outputs, dec!(1), Currency::pUSD()).unwrap();
+    let ordinary = allocate_convert_costs(&inputs, &outputs, dec!(1), Currency::pUSD()).unwrap();
+
+    assert_eq!(precise, ordinary);
+}
+
+#[rstest]
+fn test_precise_allocation_does_not_require_a_decimal_total_cost() {
+    let fractional = Decimal::from_str("0.2333333333333333333333333333").unwrap();
+    let inputs = [
+        input(NO_A, dec!(100), fractional),
+        input(NO_B, dec!(100), dec!(80)),
+    ];
+    let outputs = [output(YES_C, dec!(100))];
+    let result =
+        allocate_convert_costs_precise(&inputs, &outputs, dec!(80), Currency::pUSD()).unwrap();
+
+    assert_eq!(
+        result.input_pnl,
+        [
+            allocation(NO_A, Decimal::ZERO),
+            allocation(NO_B, Decimal::ZERO),
+        ]
+    );
+    assert_eq!(result.output_costs, [allocation(YES_C, fractional)]);
 }
 
 proptest! {

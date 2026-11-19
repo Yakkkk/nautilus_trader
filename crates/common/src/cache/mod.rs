@@ -3920,29 +3920,17 @@ impl Cache {
 
     fn add_position_inner(
         &mut self,
-        mut position: Position,
+        position: Position,
         oms_type: OmsType,
         index_order: bool,
         carry_replay_state: bool,
     ) -> anyhow::Result<()> {
-        let oms_type = resolve_position_oms(&position, oms_type);
+        let entry = prepare_position_entry(&position, oms_type, index_order, carry_replay_state)?;
+        self.commit_position_entry(position, &entry);
+        self.persist_position_entry(&entry)
+    }
 
-        if index_order && position.opening_order_id.is_none() {
-            anyhow::bail!(
-                "Cannot index an opening order for position {}: the position has no opening order",
-                position.id,
-            );
-        }
-
-        // Validate and serialize the OMS entry up front: both are construction failures, and
-        // committing the position before they run would leave the cache mutated by one.
-        // The key embeds the position ID, which embeds the instrument ID and venue
-        // symbol, and exchange symbols may contain non-ASCII characters.
-        let key = position_oms_key(position.id);
-        check_valid_string_utf8(&key, stringify!(key))?;
-        let value = Bytes::from(serde_json::to_vec(&oms_type)?);
-        check_predicate_false(value.is_empty(), stringify!(value))?;
-
+    fn commit_position_entry(&mut self, mut position: Position, entry: &PreparedPositionEntry) {
         let position_id = position.id;
         let strategy_id = position.strategy_id;
         let instrument_id = position.instrument_id;
@@ -3952,15 +3940,14 @@ impl Cache {
         log::debug!("Adding {position}");
 
         // Reuse the existing cell on a NETTING reopen so the prior value is replaced in place,
-        // which also lets the carried replay state move out of it instead of being copied. The
-        // transfer and the swap share one borrow, so a failure above cannot strip the prior.
+        // which also lets the carried replay state move out of it instead of being copied.
         let position_cell = if let Some(position_cell) = self.positions.get(&position_id).cloned() {
             let mut prior = position_cell.borrow_mut();
             let prior_has_convert_state = prior
                 .replay_events
                 .iter()
                 .any(|event| matches!(event, PositionReplayEvent::Converted(_)));
-            if carry_replay_state || prior_has_convert_state {
+            if entry.carry_replay_state || prior_has_convert_state {
                 position.transfer_replay_state_from(&mut prior);
             }
             *prior = position;
@@ -3972,13 +3959,13 @@ impl Cache {
             position_cell
         };
 
-        self.index.position_oms.insert(position_id, oms_type);
+        self.index.position_oms.insert(position_id, entry.oms_type);
         self.index.positions.insert(position_id);
         self.refresh_position_indexes(&position_cell.borrow());
         self.index.strategies.insert(strategy_id);
         self.index.strategy_orders.entry(strategy_id).or_default();
 
-        if index_order {
+        if entry.index_order {
             let opening_order_id =
                 opening_order_id.expect("opening order was checked before adding the position");
             self.index_position_id_in_memory(
@@ -3991,7 +3978,6 @@ impl Cache {
             self.index_position(&position_id, &instrument_id.venue, &strategy_id);
         }
 
-        // Index: InstrumentId -> AHashSet
         let instrument_positions = self
             .index
             .instrument_positions
@@ -4002,43 +3988,65 @@ impl Cache {
             .instrument_orders
             .entry(instrument_id)
             .or_default();
-
-        // Index: AccountId -> AHashSet<PositionId>
         self.index
             .account_positions
             .entry(account_id)
             .or_default()
             .insert(position_id);
 
-        log::debug!("Adding general {key}");
-        self.general.insert(key.clone(), value.clone());
+        log::debug!("Adding general {}", entry.key);
+        self.general.insert(entry.key.clone(), entry.value.clone());
+    }
 
-        if index_order {
-            let opening_order_id =
-                opening_order_id.expect("opening order was checked before adding the position");
-            self.persist_position_id(&position_id, &opening_order_id)?;
+    fn persist_position_entry(&mut self, entry: &PreparedPositionEntry) -> anyhow::Result<()> {
+        if entry.index_order {
+            let opening_order_id = entry
+                .opening_order_id
+                .expect("opening order was checked before adding the position");
+            self.persist_position_id(&entry.position_id, &opening_order_id)?;
         }
 
         if let Some(database) = &mut self.database {
+            let position_cell = self.positions.get(&entry.position_id).cloned();
+            if let Some(position_cell) = position_cell {
+                handle_persistence_result(
+                    format_args!("persist position {}", entry.position_id),
+                    database.add_position(&position_cell.borrow()),
+                )?;
+            }
             handle_persistence_result(
-                format_args!("persist position {position_id}"),
-                database.add_position(&position_cell.borrow()),
-            )?;
-            // TODO: Implement position snapshots
-            // if self.snapshot_positions {
-            //     database.snapshot_position_state(
-            //         position,
-            //         position.ts_last,
-            //         self.calculate_unrealized_pnl(&position),
-            //     )?;
-            // }
-            handle_persistence_result(
-                format_args!("persist OMS metadata for position {position_id}"),
-                database.add(key, value),
+                format_args!("persist OMS metadata for position {}", entry.position_id),
+                database.add(entry.key.clone(), entry.value.clone()),
             )?;
         }
 
         Ok(())
+    }
+
+    fn persist_position_entry_best_effort(&mut self, entry: &PreparedPositionEntry) {
+        if let Err(e) = self.persist_position_entry(entry) {
+            log::error!("Failed to persist position {}: {e:#}", entry.position_id);
+        }
+    }
+
+    fn persist_position_update(&mut self, position_id: PositionId) -> anyhow::Result<()> {
+        if let Some(database) = &mut self.database {
+            let position_cell = self.positions.get(&position_id).cloned();
+            if let Some(position_cell) = position_cell {
+                handle_persistence_result(
+                    format_args!("persist position {position_id}"),
+                    database.update_position(&position_cell.borrow()),
+                )?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn persist_position_update_best_effort(&mut self, position_id: PositionId) {
+        if let Err(e) = self.persist_position_update(position_id) {
+            log::error!("Failed to persist position {position_id}: {e:#}");
+        }
     }
 
     /// Updates the `account` in the cache.
@@ -4391,34 +4399,20 @@ impl Cache {
 
         *position_cell.borrow_mut() = position.clone();
 
-        if let Some(database) = &mut self.database {
-            handle_persistence_result(
-                format_args!("persist position {}", position.id),
-                database.update_position(position),
-            )?;
-            // TODO: Implement order snapshots
-            // if self.snapshot_orders {
-            //     database.snapshot_order_state(order)?;
-            // }
-        }
+        self.persist_position_update(position.id)?;
+        // TODO: Implement order snapshots
+        // if self.snapshot_orders {
+        //     database.snapshot_order_state(order)?;
+        // }
 
         Ok(())
     }
 
-    /// Applies one Convert change to a NETTING position and returns its lifecycle notification.
-    ///
-    /// Returns `None` for a repeated change matching the recorded contents.
-    /// New positions are cached as NETTING using the supplied `position_id`; callers should pass
-    /// the canonical `{instrument_id}-{strategy_id}` ID for NETTING fill routing.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the position, target cycle, or accounting values are invalid.
-    pub fn apply_position_convert(
-        &mut self,
+    fn prepare_position_convert_inner(
+        &self,
         instrument: &InstrumentAny,
         change: PositionConvert,
-    ) -> anyhow::Result<Option<PositionEvent>> {
+    ) -> anyhow::Result<Option<Position>> {
         anyhow::ensure!(
             instrument.id() == change.instrument_id,
             "instrument {} does not match Convert change instrument {}",
@@ -4460,10 +4454,7 @@ impl Cache {
                 change.position_id,
             );
 
-            let position = Position::new_from_convert(instrument, change)?;
-            self.add_position_without_order(&position, OmsType::Netting)?;
-
-            return Ok(Some(PositionEvent::from_convert(&position, change)));
+            return Ok(Some(Position::new_from_convert(instrument, change)?));
         };
 
         let prior = position_cell.borrow().clone();
@@ -4526,31 +4517,188 @@ impl Cache {
                 prior.id,
             );
 
-            let position = Position::new_from_convert(instrument, change)?;
-            self.snapshot_position(&prior)?;
-            self.replace_position(&position, OmsType::Netting, false, true)?;
-
-            return Ok(Some(PositionEvent::from_convert(&position, change)));
+            return Ok(Some(Position::new_from_convert(instrument, change)?));
         }
 
-        let event = {
-            let mut position = position_cell.borrow_mut();
-            position.apply_convert(change)?
-        };
-        let Some(event) = event else {
+        let mut position = prior;
+        let Some(_event) = position.apply_convert(change)? else {
             return Ok(None);
         };
 
-        self.refresh_position_indexes(&position_cell.borrow());
+        Ok(Some(position))
+    }
 
-        if let Some(database) = &mut self.database {
-            handle_persistence_result(
-                format_args!("persist Convert position {}", prior.id),
-                database.update_position(&position_cell.borrow()),
-            )?;
+    /// Applies Convert changes after validating and preparing every change and archive.
+    ///
+    /// The positions, indexes, and lifecycle notifications are committed only after all changes
+    /// and required position archives have been prepared. Persistence remains best effort.
+    ///
+    /// Returns lifecycle notifications for changes that were applied, in input order. Changes
+    /// already recorded with identical contents are skipped.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any change, target cycle, accounting value, or required archive is
+    /// invalid. No position or index is changed when preparation fails.
+    pub fn apply_position_converts(
+        &mut self,
+        changes: &[PositionConvert],
+    ) -> anyhow::Result<Vec<PositionEvent>> {
+        self.apply_position_converts_inner(changes, None)
+    }
+
+    fn apply_position_converts_inner(
+        &mut self,
+        changes: &[PositionConvert],
+        supplied_instrument: Option<&InstrumentAny>,
+    ) -> anyhow::Result<Vec<PositionEvent>> {
+        let mut prepared: Vec<(PositionConvert, PreparedConvertAction)> =
+            Vec::with_capacity(changes.len());
+        let mut prepared_positions: AHashMap<PositionId, usize> =
+            AHashMap::with_capacity(changes.len());
+
+        for change in changes {
+            if let Some(&index) = prepared_positions.get(&change.position_id) {
+                let prior_change = prepared[index].0;
+                anyhow::ensure!(
+                    convert_changes_equivalent(&prior_change, change),
+                    "Conflicting Convert changes for position {}",
+                    change.position_id,
+                );
+                continue;
+            }
+
+            let instrument = supplied_instrument
+                .filter(|instrument| instrument.id() == change.instrument_id)
+                .cloned()
+                .or_else(|| self.instrument(&change.instrument_id).cloned())
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Cannot apply Convert change {}: instrument {} was not loaded",
+                        change.operation_id,
+                        change.instrument_id
+                    )
+                })?;
+            let Some(position) = self.prepare_position_convert_inner(&instrument, *change)? else {
+                continue;
+            };
+
+            let existing_cell = self.positions.get(&change.position_id).cloned();
+            let action = match (change.kind, existing_cell) {
+                (PositionConvertKind::Open { .. }, Some(_cell)) => {
+                    let entry = prepare_position_entry(&position, OmsType::Netting, false, true)?;
+                    PreparedConvertAction::Reopen {
+                        position: Box::new(position),
+                        entry,
+                    }
+                }
+                (PositionConvertKind::Open { .. }, None) => {
+                    let entry = prepare_position_entry(&position, OmsType::Netting, false, true)?;
+                    PreparedConvertAction::Create {
+                        position: Box::new(position),
+                        entry,
+                    }
+                }
+                (PositionConvertKind::Increase | PositionConvertKind::Decrease, Some(cell)) => {
+                    PreparedConvertAction::Update {
+                        cell,
+                        position: Box::new(position),
+                    }
+                }
+                (PositionConvertKind::Increase | PositionConvertKind::Decrease, None) => {
+                    anyhow::bail!(
+                        "Cannot apply Convert change {}: position {} was not cached",
+                        change.operation_id,
+                        change.position_id
+                    );
+                }
+            };
+
+            prepared_positions.insert(change.position_id, prepared.len());
+            prepared.push((*change, action));
         }
 
-        Ok(Some(event))
+        let mut prepared_snapshots = Vec::new();
+
+        for (change, action) in &prepared {
+            if let PreparedConvertAction::Reopen { .. } = action {
+                let Some(cell) = self.positions.get(&change.position_id) else {
+                    anyhow::bail!(
+                        "Cannot archive position {} for Convert change {}",
+                        change.position_id,
+                        change.operation_id
+                    );
+                };
+                let prepared_snapshot = {
+                    let prior = cell.borrow();
+                    self.prepare_position_snapshot(&prior)
+                };
+                prepared_snapshots.push(prepared_snapshot);
+            }
+        }
+
+        let mut events = Vec::with_capacity(prepared.len());
+        let mut persisted_entries = Vec::new();
+        let mut persisted_updates = Vec::new();
+
+        for (change, action) in prepared {
+            match action {
+                PreparedConvertAction::Create { position, entry } => {
+                    events.push(PositionEvent::from_convert(position.as_ref(), change));
+                    self.commit_position_entry(*position, &entry);
+                    persisted_entries.push(entry);
+                }
+                PreparedConvertAction::Reopen { position, entry } => {
+                    events.push(PositionEvent::from_convert(position.as_ref(), change));
+                    self.commit_position_entry(*position, &entry);
+                    persisted_entries.push(entry);
+                }
+                PreparedConvertAction::Update { cell, position } => {
+                    events.push(PositionEvent::from_convert(position.as_ref(), change));
+                    *cell.borrow_mut() = *position;
+                    self.refresh_position_indexes(&cell.borrow());
+                    persisted_updates.push(change.position_id);
+                }
+            }
+        }
+
+        for entry in &persisted_entries {
+            self.persist_position_entry_best_effort(entry);
+        }
+
+        for position_id in persisted_updates {
+            self.persist_position_update_best_effort(position_id);
+        }
+
+        for prepared_snapshot in prepared_snapshots {
+            self.commit_prepared_position_snapshot_best_effort(prepared_snapshot);
+        }
+
+        Ok(events)
+    }
+
+    /// Applies one Convert change to a NETTING position and returns its lifecycle notification.
+    ///
+    /// Returns `None` for a repeated change matching the recorded contents.
+    /// New positions are cached as NETTING using the supplied `position_id`; callers should pass
+    /// the canonical `{instrument_id}-{strategy_id}` ID for NETTING fill routing.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the position, target cycle, or accounting values are invalid.
+    pub fn apply_position_convert(
+        &mut self,
+        instrument: &InstrumentAny,
+        change: PositionConvert,
+    ) -> anyhow::Result<Option<PositionEvent>> {
+        anyhow::ensure!(
+            instrument.id() == change.instrument_id,
+            "instrument {} does not match Convert change instrument {}",
+            instrument.id(),
+            change.instrument_id,
+        );
+        let events = self.apply_position_converts_inner(&[change], Some(instrument))?;
+        Ok(events.into_iter().next())
     }
 
     /// Updates a cached position by applying an order fill in place.
@@ -8169,6 +8317,78 @@ fn handle_persistence_result(
     }
 
     Ok(())
+}
+
+struct PreparedPositionEntry {
+    position_id: PositionId,
+    opening_order_id: Option<ClientOrderId>,
+    oms_type: OmsType,
+    key: String,
+    value: Bytes,
+    index_order: bool,
+    carry_replay_state: bool,
+}
+
+enum PreparedConvertAction {
+    Create {
+        position: Box<Position>,
+        entry: PreparedPositionEntry,
+    },
+    Reopen {
+        position: Box<Position>,
+        entry: PreparedPositionEntry,
+    },
+    Update {
+        cell: SharedCell<Position>,
+        position: Box<Position>,
+    },
+}
+
+fn convert_changes_equivalent(lhs: &PositionConvert, rhs: &PositionConvert) -> bool {
+    lhs.operation_id == rhs.operation_id
+        && lhs.trader_id == rhs.trader_id
+        && lhs.strategy_id == rhs.strategy_id
+        && lhs.instrument_id == rhs.instrument_id
+        && lhs.position_id == rhs.position_id
+        && lhs.account_id == rhs.account_id
+        && lhs.cycle_id == rhs.cycle_id
+        && lhs.kind == rhs.kind
+        && lhs.quantity == rhs.quantity
+        && lhs.cost == rhs.cost
+        && lhs.realized_pnl == rhs.realized_pnl
+}
+
+fn prepare_position_entry(
+    position: &Position,
+    oms_type: OmsType,
+    index_order: bool,
+    carry_replay_state: bool,
+) -> anyhow::Result<PreparedPositionEntry> {
+    let oms_type = resolve_position_oms(position, oms_type);
+
+    if index_order && position.opening_order_id.is_none() {
+        anyhow::bail!(
+            "Cannot index an opening order for position {}: the position has no opening order",
+            position.id,
+        );
+    }
+
+    // The key embeds the position ID, which embeds the instrument ID and venue
+    // symbol, and exchange symbols may contain non-ASCII characters.
+    let key = position_oms_key(position.id);
+    check_valid_string_utf8(&key, stringify!(key))?;
+    let value = Bytes::from(serde_json::to_vec(&oms_type)?);
+    check_predicate_false(value.is_empty(), stringify!(value))?;
+
+    Ok(PreparedPositionEntry {
+        position_id: position.id,
+        opening_order_id: position.opening_order_id,
+        oms_type,
+        key,
+        value,
+        index_order,
+        carry_replay_state,
+    })
 }
 
 fn position_oms_key(position_id: PositionId) -> String {

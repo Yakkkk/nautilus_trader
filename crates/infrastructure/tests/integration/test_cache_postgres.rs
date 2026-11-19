@@ -63,11 +63,15 @@ mod serial_tests {
         position::Position,
         types::{Currency, Money, Price, Quantity},
     };
+    use rstest::rstest;
     use sqlx::PgPool;
     use ustr::Ustr;
 
     use super::get_cache;
-    use crate::position_convert::{exercise_convert_cycle_reuse, exercise_convert_restart};
+    use crate::position_convert::{
+        ConvertRecoveryCase, exercise_convert_batch_recovery, exercise_convert_cycle_reuse,
+        exercise_convert_restart,
+    };
 
     async fn get_test_pg_cache_database() -> anyhow::Result<PostgresCacheDatabase> {
         match tokio::time::timeout(
@@ -112,6 +116,27 @@ mod serial_tests {
         exercise_convert_cycle_reuse(trader_id, async || {
             Box::new(get_test_pg_cache_database().await.unwrap()) as Box<dyn CacheDatabaseAdapter>
         })
+        .await;
+        reset_test_database(&database).await;
+        database.close().unwrap();
+    }
+
+    #[rstest]
+    #[case(ConvertRecoveryCase::Partial)]
+    #[case(ConvertRecoveryCase::MissingPlan)]
+    #[case(ConvertRecoveryCase::ReplacedCycle)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_convert_batch_recovery(#[case] case: ConvertRecoveryCase) {
+        let mut database = get_test_pg_cache_database().await.unwrap();
+        reset_test_database(&database).await;
+        Box::pin(exercise_convert_batch_recovery(
+            TraderId::default(),
+            async || {
+                Box::new(get_test_pg_cache_database().await.unwrap())
+                    as Box<dyn CacheDatabaseAdapter>
+            },
+            case,
+        ))
         .await;
         reset_test_database(&database).await;
         database.close().unwrap();

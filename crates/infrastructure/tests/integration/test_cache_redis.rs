@@ -75,7 +75,8 @@ mod serial_tests {
 
     use crate::{
         position_convert::{
-            convert_position, exercise_convert_cycle_reuse, exercise_convert_restart,
+            ConvertRecoveryCase, convert_position, exercise_convert_batch_recovery,
+            exercise_convert_cycle_reuse, exercise_convert_restart,
         },
         position_flip::populate_flip_cache,
     };
@@ -789,6 +790,32 @@ mod serial_tests {
         exercise_convert_cycle_reuse(TraderId::from("test-trader"), async || {
             Box::new(connect_redis_cache_adapter().await.unwrap()) as Box<dyn CacheDatabaseAdapter>
         })
+        .await;
+    }
+
+    #[rstest]
+    #[case(ConvertRecoveryCase::Partial)]
+    #[case(ConvertRecoveryCase::MissingPlan)]
+    #[case(ConvertRecoveryCase::ReplacedCycle)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_convert_batch_recovery(#[case] case: ConvertRecoveryCase) {
+        let _guard = redis_test_mutex().lock().await;
+        let trader_id = TraderId::from(format!("CONVERT-{}", UUID4::new()));
+        Box::pin(exercise_convert_batch_recovery(
+            trader_id,
+            async || {
+                let database = RedisCacheDatabase::new(
+                    trader_id,
+                    UUID4::new(),
+                    CacheConfig::default(),
+                    redis_cache_config(),
+                )
+                .await
+                .unwrap();
+                Box::new(RedisCacheDatabaseAdapter { database }) as Box<dyn CacheDatabaseAdapter>
+            },
+            case,
+        ))
         .await;
     }
 
