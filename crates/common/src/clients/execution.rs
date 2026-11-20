@@ -20,7 +20,7 @@ use std::{fmt::Debug, future::Future, pin::Pin};
 use anyhow::Context;
 use async_trait::async_trait;
 use indexmap::IndexMap;
-use nautilus_core::{DurationNanos, Params, UnixNanos, time::get_atomic_clock_realtime};
+use nautilus_core::{DurationNanos, Params, UUID4, UnixNanos, time::get_atomic_clock_realtime};
 use nautilus_model::{
     accounts::AccountAny,
     enums::{LiquiditySide, OmsType},
@@ -33,6 +33,7 @@ use nautilus_model::{
     types::{AccountBalance, MarginBalance, Money, Price, Quantity},
 };
 use rust_decimal::Decimal;
+use thiserror::Error;
 
 use super::log_not_implemented;
 use crate::messages::execution::{
@@ -46,6 +47,37 @@ use crate::messages::execution::{
 /// Default maximum absolute position difference tolerated during reconciliation.
 pub const DEFAULT_POSITION_RECONCILIATION_TOLERANCE: Decimal =
     Decimal::from_parts(1, 0, 0, false, 8);
+
+/// A synchronous Convert query dispatch failure.
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
+pub enum ConvertQueryDispatchError {
+    /// The caller may retry under its bounded policy.
+    #[error("{0}")]
+    Retryable(String),
+    /// The caller must not retry.
+    #[error("{0}")]
+    Permanent(String),
+}
+
+impl ConvertQueryDispatchError {
+    /// Creates a retryable query dispatch failure.
+    #[must_use]
+    pub fn retryable(message: impl Into<String>) -> Self {
+        Self::Retryable(message.into())
+    }
+
+    /// Creates a permanent query dispatch failure.
+    #[must_use]
+    pub fn permanent(message: impl Into<String>) -> Self {
+        Self::Permanent(message.into())
+    }
+
+    /// Returns whether the failure may be retried.
+    #[must_use]
+    pub fn is_retryable(&self) -> bool {
+        matches!(self, Self::Retryable(_))
+    }
+}
 
 /// Owned report collection with a core-thread continuation.
 ///
@@ -364,9 +396,39 @@ pub trait ExecutionClient {
         )
     }
 
+    /// Dispatches a conversion while carrying the live run identity.
+    ///
+    /// Clients should echo `run_id` on every resulting
+    /// [`ConvertExecutionEvent`](crate::messages::execution::ConvertExecutionEvent). The default
+    /// rejects a live run token rather than silently dispatching without support for returning it.
+    /// Simulated clients may instead use the lease on their separate
+    /// [`SimulatedConvertExecutionEvent`](crate::messages::execution::SimulatedConvertExecutionEvent).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if conversion is unsupported or cannot be dispatched.
+    fn submit_convert_for_run(
+        &self,
+        cmd: SubmitConvert,
+        scope: ConvertScope,
+        run_id: Option<UUID4>,
+    ) -> anyhow::Result<()> {
+        if run_id.is_some() {
+            anyhow::bail!(
+                "Execution client {} does not support live-run Convert submission",
+                self.client_id()
+            );
+        }
+
+        self.submit_convert(cmd, scope)
+    }
+
     /// Dispatches a bounded, read-only check of the original transaction.
     ///
     /// The client must not create a new conversion submission for a query.
+    /// Clients must cancel outstanding query work on stop or reset. A returned error means the
+    /// query was not dispatched. Return [`ConvertQueryDispatchError::retryable`] for a transient
+    /// failure; all other errors are treated as permanent.
     ///
     /// # Errors
     ///
@@ -380,6 +442,50 @@ pub trait ExecutionClient {
             "Execution client {} does not support querying Convert",
             self.client_id()
         )
+    }
+
+    /// Dispatches a bounded query while carrying the live run identity.
+    ///
+    /// Clients should echo `run_id` on every resulting
+    /// [`ConvertExecutionEvent`](crate::messages::execution::ConvertExecutionEvent). Return
+    /// [`ConvertQueryDispatchError::retryable`] for a transient dispatch failure; all other errors
+    /// are treated as permanent. The default rejects a live run token rather than silently
+    /// dispatching without support for returning it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if querying conversion is unsupported or cannot be dispatched.
+    fn query_convert_for_run(
+        &self,
+        cmd: QueryConvert,
+        transaction: &ConvertTransaction,
+        run_id: Option<UUID4>,
+    ) -> anyhow::Result<()> {
+        if run_id.is_some() {
+            anyhow::bail!(
+                "Execution client {} does not support live-run Convert queries",
+                self.client_id()
+            );
+        }
+
+        self.query_convert(cmd, transaction)
+    }
+
+    /// Restores the retained wallet submission context for an original conversion.
+    ///
+    /// The client must not sign or submit another transaction. Clients without wallet protection
+    /// may leave the default no-op implementation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if retained wallet evidence is malformed or conflicts with a newer
+    /// submission reservation.
+    async fn restore_convert_context(
+        &self,
+        _operation_id: UUID4,
+        _transaction: &ConvertTransaction,
+    ) -> anyhow::Result<()> {
+        Ok(())
     }
 
     /// Queries the status of an order.

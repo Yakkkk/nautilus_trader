@@ -38,12 +38,18 @@ use futures_util::{StreamExt, stream::FuturesUnordered};
 use indexmap::{IndexMap, IndexSet};
 use nautilus_common::{
     clients::ExecutionClient,
-    live::dst,
-    messages::{ExecutionEvent, ExecutionReport, execution::GenerateFillReports},
+    live::{dispatch::DispatchMessage, dst},
+    messages::{
+        ExecutionEvent, ExecutionReport,
+        execution::{
+            ConvertExecutionStatus, ConvertOperationRecord, ConvertTransaction,
+            GenerateFillReports, QueryConvert,
+        },
+    },
 };
 use nautilus_core::UUID4;
 use nautilus_model::{
-    identifiers::{ClientId, ClientOrderId},
+    identifiers::{AccountId, ClientId, ClientOrderId},
     reports::{FillReport, OrderStatusReport, PositionStatusReport},
 };
 
@@ -63,6 +69,249 @@ use crate::{
 const POSITION_FILLS_PER_CYCLE: usize = 64;
 
 impl LiveNode {
+    /// Restores retained Convert operations before ordinary startup reconciliation.
+    ///
+    /// The caller supplies the execution-event receiver when the run loop already owns it. Callers
+    /// in `start` mode leave the receiver with the runner so the recovery window can consume
+    /// evidence returned for the current live run.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a retained operation envelope, fixed scope, wallet context, or original
+    /// accounting plan cannot be restored safely.
+    pub(super) async fn recover_converts_before_reconciliation(
+        &mut self,
+        exec_evt_rx: Option<
+            &mut tokio::sync::mpsc::UnboundedReceiver<DispatchMessage<ExecutionEvent>>,
+        >,
+    ) -> anyhow::Result<()> {
+        let records = self.kernel.cache.borrow().load_convert_operations()?;
+        if records.is_empty() {
+            return Ok(());
+        }
+
+        let live_run_id = self.kernel.exec_engine.borrow().convert_live_run_id();
+        let startup_deadline = dst::time::Instant::now() + self.config.timeout_reconciliation;
+
+        for record in records {
+            if Self::convert_accounting_requires_recovery(&record) {
+                self.kernel
+                    .exec_engine
+                    .borrow_mut()
+                    .recover_convert_operation(record.operation_id)?;
+            }
+        }
+
+        let settled = self
+            .kernel
+            .cache
+            .borrow_mut()
+            .settle_expired_convert_operations();
+
+        if settled > 0 {
+            log::warn!(
+                "Classified {settled} Convert operation(s) as historical gaps after original plan comparison"
+            );
+        }
+
+        let records = self.kernel.cache.borrow().load_convert_operations()?;
+        let mut pending_queries = IndexMap::new();
+
+        for record in records {
+            self.restore_convert_wallet_context(&record, startup_deadline)
+                .await?;
+
+            if Self::convert_recovery_query_is_required(&record) {
+                let command = QueryConvert {
+                    operation_id: record.operation_id,
+                    trader_id: record.trader_id,
+                    strategy_id: record.strategy_id,
+                    account_id: record.account_id,
+                    client_id: record.client_id,
+                    ts_init: self.kernel.generate_timestamp_ns(),
+                };
+
+                if self.kernel.exec_engine.borrow().query_convert(&command) {
+                    pending_queries
+                        .insert(record.operation_id, (record.account_id, record.client_id));
+                }
+            }
+        }
+
+        self.collect_convert_recovery_results(
+            &mut pending_queries,
+            exec_evt_rx,
+            startup_deadline,
+            live_run_id,
+        )
+        .await;
+
+        self.exec_manager.sync_convert_scope_activity();
+        Ok(())
+    }
+
+    async fn collect_convert_recovery_results(
+        &mut self,
+        pending: &mut IndexMap<UUID4, (AccountId, ClientId)>,
+        exec_evt_rx: Option<
+            &mut tokio::sync::mpsc::UnboundedReceiver<DispatchMessage<ExecutionEvent>>,
+        >,
+        deadline: dst::time::Instant,
+        run_id: Option<UUID4>,
+    ) {
+        if pending.is_empty() {
+            return;
+        }
+
+        if let Some(exec_evt_rx) = exec_evt_rx {
+            loop {
+                if pending.is_empty() {
+                    break;
+                }
+
+                tokio::select! {
+                    biased;
+
+                    () = dst::time::sleep_until(deadline) => break,
+                    message = exec_evt_rx.recv() => {
+                        let Some(message) = message else {
+                            break;
+                        };
+                        message.dispatch(|event| {
+                            self.process_recovery_exec_event(event, pending, run_id);
+                        });
+                    }
+                }
+            }
+            return;
+        }
+
+        let Some(mut runner) = self.runner.take() else {
+            return;
+        };
+
+        loop {
+            if pending.is_empty() {
+                break;
+            }
+
+            tokio::select! {
+                biased;
+
+                () = dst::time::sleep_until(deadline) => break,
+                message = runner.recv_exec_event() => {
+                    let Some(message) = message else {
+                        break;
+                    };
+                    message.dispatch(|event| {
+                        self.process_recovery_exec_event(event, pending, run_id);
+                    });
+                }
+            }
+        }
+        self.runner = Some(runner);
+    }
+
+    fn process_recovery_exec_event(
+        &mut self,
+        event: ExecutionEvent,
+        pending: &mut IndexMap<UUID4, (AccountId, ClientId)>,
+        run_id: Option<UUID4>,
+    ) {
+        if let ExecutionEvent::Convert(event) = event {
+            if event.run_id != run_id {
+                log::debug!(
+                    "Discarding Convert execution result from stale live run {:?}",
+                    event.run_id,
+                );
+                return;
+            }
+
+            let expected = pending.get(&event.operation_id).copied();
+            if expected != Some((event.account_id, event.client_id)) {
+                self.process_exec_event(ExecutionEvent::Convert(event));
+                return;
+            }
+
+            let operation_id = event.operation_id;
+            self.process_exec_event(ExecutionEvent::Convert(event));
+            pending.shift_remove(&operation_id);
+        } else {
+            self.process_exec_event(event);
+        }
+    }
+
+    fn convert_accounting_requires_recovery(record: &ConvertOperationRecord) -> bool {
+        record.dispatched
+            && !record.historical_gap
+            && !record.authorization_invalid
+            && !matches!(
+                record.status,
+                Some(ConvertExecutionStatus::Rejected) if record.transaction.is_none()
+            )
+    }
+
+    fn convert_recovery_query_is_required(record: &ConvertOperationRecord) -> bool {
+        if !record.dispatched
+            || record.applied
+            || record.authorization_invalid
+            || matches!(
+                record.status,
+                Some(ConvertExecutionStatus::Rejected) if record.transaction.is_none()
+            )
+        {
+            return false;
+        }
+
+        if record.historical_gap && record.status == Some(ConvertExecutionStatus::Confirmed) {
+            return false;
+        }
+
+        record
+            .transaction
+            .as_ref()
+            .is_some_and(ConvertTransaction::has_original_locator)
+    }
+
+    async fn restore_convert_wallet_context(
+        &self,
+        record: &ConvertOperationRecord,
+        deadline: dst::time::Instant,
+    ) -> anyhow::Result<()> {
+        let Some(transaction) = record
+            .transaction
+            .as_ref()
+            .filter(|transaction| transaction.nonce.is_some())
+        else {
+            return Ok(());
+        };
+
+        let Some(client) = self.exec_clients.iter().find(|client| {
+            client.client_id() == record.client_id && client.account_id() == record.account_id
+        }) else {
+            return Ok(());
+        };
+
+        let restore = client.restore_convert_context(record.operation_id, transaction);
+        tokio::pin!(restore);
+        tokio::select! {
+            biased;
+
+            result = &mut restore => result.map_err(|e| {
+                anyhow::anyhow!(
+                    "failed to restore Convert wallet context for operation {}: {e}",
+                    record.operation_id,
+                )
+            }),
+            () = dst::time::sleep_until(deadline) => {
+                anyhow::bail!(
+                    "timed out restoring Convert wallet context for operation {}",
+                    record.operation_id,
+                )
+            }
+        }
+    }
+
     /// Runs due checks while serializing order and position reconciliation.
     pub(super) fn run_reconciliation_checks(
         &mut self,

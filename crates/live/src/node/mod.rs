@@ -480,6 +480,11 @@ impl LiveNode {
             return Ok(());
         }
 
+        self.kernel
+            .exec_engine
+            .borrow_mut()
+            .begin_convert_live_run();
+
         let connection_deadline = dst::time::Instant::now() + self.config.timeout_connection;
 
         // Connect data clients first and flush instrument events into cache
@@ -534,7 +539,7 @@ impl LiveNode {
             }
         }
 
-        if let Err(e) = self.perform_startup_reconciliation().await {
+        if let Err(e) = self.perform_startup_reconciliation(None).await {
             if let Err(finalize_err) = self.abort_startup("Startup reconciliation failed").await {
                 anyhow::bail!(
                     "startup reconciliation failed: {e}; failed to finalize startup abort: {finalize_err}"
@@ -582,6 +587,7 @@ impl LiveNode {
             anyhow::bail!("Not running");
         }
 
+        self.kernel.exec_engine.borrow_mut().end_convert_live_run();
         self.handle.set_shutting_down();
 
         #[cfg(feature = "plugin")]
@@ -618,6 +624,7 @@ impl LiveNode {
     /// failures and cleanup rejection; externally retained work can prevent clearing.
     pub fn dispose(&mut self) {
         self.close_external_ingress();
+        self.kernel.exec_engine.borrow_mut().end_convert_live_run();
         self.handle.set_stopped();
         self.kernel.dispose();
         drop(self.runner.take());
@@ -910,7 +917,15 @@ impl LiveNode {
     /// # Errors
     ///
     /// Returns an error if reconciliation fails or times out.
-    async fn perform_startup_reconciliation(&mut self) -> anyhow::Result<()> {
+    async fn perform_startup_reconciliation(
+        &mut self,
+        exec_evt_rx: Option<
+            &mut tokio::sync::mpsc::UnboundedReceiver<DispatchMessage<ExecutionEvent>>,
+        >,
+    ) -> anyhow::Result<()> {
+        self.recover_converts_before_reconciliation(exec_evt_rx)
+            .await?;
+
         if !self.config.exec_engine.reconciliation {
             log::info!("Startup reconciliation disabled");
             self.kernel
@@ -1148,6 +1163,11 @@ impl LiveNode {
             return Ok(());
         }
 
+        self.kernel
+            .exec_engine
+            .borrow_mut()
+            .begin_convert_live_run();
+
         let mut external_msgbus_rx = match self.take_external_ingress_receiver() {
             Ok(rx) => rx,
             Err(e) => {
@@ -1334,7 +1354,10 @@ impl LiveNode {
         debug_assert_eq!(engine_connection_status, EngineConnectionStatus::Connected);
 
         // Run reconciliation now that instruments are in cache and start trader
-        if let Err(e) = self.perform_startup_reconciliation().await {
+        if let Err(e) = self
+            .perform_startup_reconciliation(Some(&mut exec_evt_rx))
+            .await
+        {
             let result = self.abort_startup("Startup reconciliation failed").await;
             Self::drain_channels(
                 &mut time_evt_rx,
@@ -2381,6 +2404,7 @@ impl LiveNode {
 
     async fn abort_startup(&mut self, reason: &str) -> anyhow::Result<()> {
         log::info!("{reason}, aborting startup");
+        self.kernel.exec_engine.borrow_mut().end_convert_live_run();
         self.handle.set_shutting_down();
         self.finalize_stop().await
     }
@@ -2404,6 +2428,7 @@ impl LiveNode {
         mut receivers: Option<&mut RunnerReceivers<'_>>,
     ) -> anyhow::Result<()> {
         log::info!("{reason}, aborting startup");
+        self.kernel.exec_engine.borrow_mut().end_convert_live_run();
         self.handle.set_shutting_down();
 
         #[cfg(feature = "plugin")]
@@ -2512,6 +2537,7 @@ impl LiveNode {
         start_err: anyhow::Error,
     ) -> anyhow::Result<()> {
         log::info!("Trader startup failed, aborting startup");
+        self.kernel.exec_engine.borrow_mut().end_convert_live_run();
         self.handle.set_shutting_down();
         let stop_result = self.kernel.stop_trader_after_start_failure();
         let finalize_result = self.finalize_stop().await;
@@ -2533,6 +2559,8 @@ impl LiveNode {
     }
 
     fn initiate_shutdown(&mut self) {
+        self.kernel.exec_engine.borrow_mut().end_convert_live_run();
+
         #[cfg(feature = "plugin")]
         if let Err(e) = self.plugins.stop_controllers() {
             log::error!("Error stopping plug-in controllers: {e}");
@@ -2547,6 +2575,8 @@ impl LiveNode {
     }
 
     async fn finalize_stop(&mut self) -> anyhow::Result<()> {
+        self.kernel.exec_engine.borrow_mut().end_convert_live_run();
+
         // Capture recovery at the grace-period boundary, before disconnection can queue more
         // evidence. A later drain must not turn incomplete recovery into a successful shutdown.
         let unresolved_submissions = self.exec_manager.unresolved_submission_ids();
@@ -3585,6 +3615,7 @@ fn render_client_statuses(rows: Vec<ClientStatus>) -> String {
 #[cfg(test)]
 mod tests {
     mod convert;
+    mod convert_recovery;
     mod report_acceptance;
     mod shutdown;
 

@@ -212,6 +212,12 @@ pub struct ConvertOperationRecord {
     /// Whether simulated cash for this operation has already been posted.
     #[serde(default)]
     pub simulated_cash_credited: bool,
+    /// Whether a previously fixed plan is known lost and must never be rebuilt from current costs.
+    #[serde(default)]
+    pub plan_lost: bool,
+    /// Whether retained evidence conflicts and automatic planning must stay disabled.
+    #[serde(default)]
+    pub recovery_blocked: bool,
     pub unapplied_instruments: Vec<InstrumentId>,
     pub reason: Option<String>,
 }
@@ -235,6 +241,8 @@ impl ConvertOperationRecord {
             transaction: None,
             applied: false,
             simulated_cash_credited: false,
+            plan_lost: false,
+            recovery_blocked: false,
             unapplied_instruments: Vec::new(),
             reason: None,
         }
@@ -283,10 +291,13 @@ impl ConvertOperationRecord {
             self.unapplied_instruments = self.affected_instruments.clone();
         }
         self.historical_gap = true;
-        self.reason = Some(
-            "all affected instruments formally expired; accounting retained as a historical gap"
-                .to_string(),
-        );
+        let gap =
+            "all affected instruments formally expired; accounting retained as a historical gap";
+        self.reason = Some(match self.reason.take() {
+            Some(reason) if reason.contains("historical gap") => reason,
+            Some(reason) => format!("{reason}; {gap}"),
+            None => gap.to_string(),
+        });
     }
 
     /// Returns the result conveyed to the strategy.
@@ -334,6 +345,8 @@ pub struct ConvertExecutionEvent {
     pub account_id: AccountId,
     pub client_id: ClientId,
     pub outcome: ConvertExecutionOutcome,
+    /// Live run that dispatched the submit or query producing this evidence.
+    pub run_id: Option<UUID4>,
 }
 
 /// A simulated conversion outcome scoped to one execution-client run.

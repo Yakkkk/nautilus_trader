@@ -767,6 +767,15 @@ impl AsyncRunner {
             else => None,
         }
     }
+
+    /// Waits for the next execution event without consuming any other runner channel.
+    ///
+    /// Startup recovery uses this ingress so it buffers the same channel as the integrated run
+    /// loop while leaving system, trading, and data messages queued for their normal dispatch.
+    #[cfg(feature = "node")]
+    pub(crate) async fn recv_exec_event(&mut self) -> Option<DispatchMessage<ExecutionEvent>> {
+        self.channels.exec_evt_rx.recv().await
+    }
 }
 
 #[cfg(feature = "node")]

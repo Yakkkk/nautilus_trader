@@ -501,6 +501,7 @@ fn test_polymarket_convert_in_backtest(#[case] scenario: Scenario, #[case] use_q
             operation_id,
             account_id,
             client_id,
+            run_id: None,
             outcome: ConvertExecutionOutcome::Confirmed {
                 verified: Box::new(record.verified.clone()),
                 pending_inputs: Vec::new(),

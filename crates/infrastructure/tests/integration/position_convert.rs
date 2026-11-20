@@ -18,11 +18,16 @@ use std::{cell::RefCell, rc::Rc};
 use nautilus_common::{
     cache::{Cache, database::CacheDatabaseAdapter},
     clock::VirtualClock,
+    messages::execution::{ConvertExecutionStatus, ConvertOperationRecord, SubmitConvert},
 };
 use nautilus_core::{UUID4, UnixNanos};
 use nautilus_execution::engine::{
     ExecutionEngine,
     polymarket_convert::{ConvertRecord, ConvertTokenAmount, ConvertTransaction, VerifiedConvert},
+};
+use nautilus_live::{
+    config::{LiveExecutionEngineConfig, LiveNodeConfig},
+    node::LiveNode,
 };
 use nautilus_model::{
     accounts::{AccountAny, CashAccount},
@@ -35,8 +40,8 @@ use nautilus_model::{
         },
     },
     identifiers::{
-        AccountId, ClientOrderId, InstrumentId, PositionId, StrategyId, TradeId, TraderId,
-        VenueOrderId,
+        AccountId, ClientId, ClientOrderId, InstrumentId, PositionId, StrategyId, TradeId,
+        TraderId, VenueOrderId,
     },
     instruments::{Instrument, InstrumentAny, stubs::binary_option},
     orders::{Order, OrderTestBuilder},
@@ -321,8 +326,13 @@ async fn exercise_replay_after_removing_fill(
 
 #[derive(Clone, Copy, Debug)]
 pub(super) enum ConvertRecoveryCase {
+    Complete,
     Partial,
+    StaleEnvelope,
+    StaleEnvelopeSettled,
     MissingPlan,
+    MissingIndex,
+    ConflictingEnvelope,
     ReplacedCycle,
 }
 
@@ -378,10 +388,8 @@ pub(super) async fn exercise_convert_batch_recovery(
         .apply_verified_convert(verified.clone(), &[])
         .unwrap();
     assert!(record.applied, "{:?}", record.reason);
-    let output_change = *record
-        .plan
-        .as_ref()
-        .unwrap()
+    let plan = record.plan.as_ref().unwrap();
+    let output_change = *plan
         .iter()
         .find(|change| change.instrument_id == output.id())
         .unwrap();
@@ -418,10 +426,69 @@ pub(super) async fn exercise_convert_batch_recovery(
         .unwrap()
         .unwrap();
 
+    if matches!(
+        case,
+        ConvertRecoveryCase::Complete | ConvertRecoveryCase::StaleEnvelopeSettled
+    ) {
+        let input_change = *plan
+            .iter()
+            .find(|change| change.instrument_id == input.id())
+            .unwrap();
+        writer
+            .apply_position_convert(&input, input_change)
+            .unwrap()
+            .unwrap();
+    }
+
     if matches!(case, ConvertRecoveryCase::MissingPlan) {
         record.plan = None;
     }
 
+    if matches!(case, ConvertRecoveryCase::StaleEnvelopeSettled) {
+        for instrument_id in [input.id(), output.id()] {
+            writer
+                .add_instrument_close(InstrumentClose::new(
+                    instrument_id,
+                    Price::from("0.00"),
+                    InstrumentCloseType::ContractExpired,
+                    UnixNanos::from(300),
+                    UnixNanos::from(300),
+                ))
+                .unwrap();
+        }
+    }
+
+    let command = SubmitConvert {
+        operation_id: verified.operation_id,
+        trader_id,
+        strategy_id: verified.strategy_id,
+        account_id: verified.account_id,
+        client_id: ClientId::from("POLYMARKET"),
+        inputs: verified.inputs.clone(),
+        ts_init: verified.ts_event,
+    };
+    let mut operation = ConvertOperationRecord::new(&command);
+    operation.dispatched = true;
+    operation.applied = true;
+    operation.status = Some(ConvertExecutionStatus::Confirmed);
+    operation.transaction = Some(verified.transaction.clone());
+    operation.affected_instruments = verified.affected_instruments.clone();
+    if matches!(
+        case,
+        ConvertRecoveryCase::StaleEnvelope | ConvertRecoveryCase::StaleEnvelopeSettled
+    ) {
+        operation.status = None;
+        operation.applied = false;
+        operation.transaction = None;
+    }
+
+    if matches!(case, ConvertRecoveryCase::ConflictingEnvelope) {
+        operation.transaction.as_mut().unwrap().wallet = "0x9876".into();
+    }
+
+    if !matches!(case, ConvertRecoveryCase::MissingIndex) {
+        writer.add_convert_operation(&operation).unwrap();
+    }
     writer
         .add(
             &ConvertRecord::cache_key(verified.operation_id),
@@ -430,30 +497,47 @@ pub(super) async fn exercise_convert_batch_recovery(
         .unwrap();
     writer.dispose();
 
-    let mut reader = Cache::new(None, Some(connect().await));
-    reader.cache_general().unwrap();
-    reader.cache_all().await.unwrap();
-    reader.build_index();
-    let cache = Rc::new(RefCell::new(reader));
-    let mut restarted = ExecutionEngine::new(
-        Rc::new(RefCell::new(VirtualClock::new())),
-        Rc::clone(&cache),
-        None,
-    );
-    assert_eq!(
-        restarted.convert_record(verified.operation_id).unwrap(),
-        Some(record.clone())
-    );
-    let recovered = restarted
-        .recover_convert(verified.operation_id, &[])
+    let config = LiveNodeConfig {
+        trader_id,
+        exec_engine: LiveExecutionEngineConfig {
+            load_cache: true,
+            reconciliation: false,
+            ..Default::default()
+        },
+        delay_post_stop: std::time::Duration::ZERO,
+        ..Default::default()
+    };
+    let mut node = LiveNode::build("ConvertRecovery".to_string(), Some(config)).unwrap();
+    node.set_cache_database(connect().await).unwrap();
+    node.start().await.unwrap();
+    let cache = node.kernel().cache();
+    let engine = node.kernel().exec_engine();
+    let recovered = engine
+        .borrow()
+        .convert_record(verified.operation_id)
+        .unwrap()
+        .unwrap();
+    let restored = cache
+        .borrow()
+        .load_convert_operation(verified.operation_id)
         .unwrap();
 
     match case {
-        ConvertRecoveryCase::Partial => {
+        ConvertRecoveryCase::Complete
+        | ConvertRecoveryCase::Partial
+        | ConvertRecoveryCase::StaleEnvelope
+        | ConvertRecoveryCase::StaleEnvelopeSettled => {
             assert!(recovered.applied, "{:?}", recovered.reason);
             assert!(recovered.unapplied_instruments.is_empty());
+            let restored = restored.unwrap();
+            assert!(!restored.historical_gap);
+            let result = restored.result();
+            assert!(result.applied);
+            assert_eq!(result.status, ConvertExecutionStatus::Confirmed);
+            assert_eq!(result.transaction, Some(verified.transaction.clone()));
             assert_eq!(
-                restarted
+                engine
+                    .borrow_mut()
                     .recover_convert(verified.operation_id, &[])
                     .unwrap(),
                 recovered
@@ -461,6 +545,7 @@ pub(super) async fn exercise_convert_batch_recovery(
             let input_position = cache.borrow().position_owned(&original.id).unwrap();
             assert_eq!(input_position.quantity, Quantity::from("60.00"));
             assert_eq!(input_position.cost_open, Decimal::from(30));
+            assert_eq!(input_position.replay_events.len(), 2);
         }
         ConvertRecoveryCase::MissingPlan | ConvertRecoveryCase::ReplacedCycle => {
             assert!(!recovered.applied);
@@ -470,7 +555,47 @@ pub(super) async fn exercise_convert_batch_recovery(
             if matches!(case, ConvertRecoveryCase::ReplacedCycle) {
                 assert_eq!(recovered.unapplied_instruments, vec![input.id()]);
             }
+            let restored = restored.unwrap();
+            let result = restored.result();
+            assert_eq!(result.status, ConvertExecutionStatus::Confirmed);
+            assert_eq!(result.transaction, Some(verified.transaction.clone()));
+            assert_eq!(
+                result.unapplied_instruments,
+                recovered.unapplied_instruments
+            );
 
+            if matches!(case, ConvertRecoveryCase::MissingPlan) {
+                assert!(restored.plan_lost);
+                let reason = result.reason.as_deref().unwrap();
+                assert!(reason.contains("plan"));
+                assert!(reason.contains("cannot reconstruct"));
+            } else {
+                assert!(!restored.plan_lost);
+                assert_eq!(result.reason, recovered.reason);
+            }
+            assert!(!result.applied);
+
+            assert_same_position(
+                &cache.borrow().position(&original.id).unwrap(),
+                &persisted_input,
+            );
+        }
+        ConvertRecoveryCase::MissingIndex => {
+            assert!(restored.is_none());
+            assert_eq!(recovered, record);
+            assert_same_position(
+                &cache.borrow().position(&original.id).unwrap(),
+                &persisted_input,
+            );
+        }
+        ConvertRecoveryCase::ConflictingEnvelope => {
+            assert_eq!(recovered, record);
+            let result = restored.unwrap().result();
+            assert!(!result.applied);
+            assert_eq!(result.status, ConvertExecutionStatus::Confirmed);
+            assert_eq!(result.transaction, operation.transaction);
+            assert!(!result.unapplied_instruments.is_empty());
+            assert!(result.reason.unwrap().contains("conflict"));
             assert_same_position(
                 &cache.borrow().position(&original.id).unwrap(),
                 &persisted_input,
@@ -489,7 +614,8 @@ pub(super) async fn exercise_convert_batch_recovery(
         panic!("Expected a single Convert replay change");
     };
     assert_eq!(*replayed, output_change);
-    cache.borrow_mut().dispose();
+    node.stop().await.unwrap();
+    node.dispose();
 }
 
 fn sell_through_execution(

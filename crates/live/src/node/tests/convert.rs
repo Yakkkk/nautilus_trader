@@ -16,8 +16,9 @@
 use nautilus_common::{
     actor::registry::{ActorRef, try_get_actor_unchecked},
     messages::execution::{
-        ConvertExecutionEvent, ConvertExecutionOutcome, ConvertExecutionStatus, ConvertResult,
-        ConvertTokenAmount, ConvertTransaction, QueryConvert, SubmitConvert, VerifiedConvert,
+        ConvertExecutionEvent, ConvertExecutionOutcome, ConvertExecutionStatus,
+        ConvertOperationRecord, ConvertResult, ConvertTokenAmount, ConvertTransaction,
+        QueryConvert, SubmitConvert, VerifiedConvert,
     },
 };
 use nautilus_core::time::get_atomic_clock_realtime;
@@ -31,6 +32,7 @@ use nautilus_model::{
         stubs::binary_option,
     },
     position::Position,
+    reports::ExecutionMassStatus,
 };
 
 use super::*;
@@ -72,12 +74,14 @@ struct ConvertClient {
     client_id: ClientId,
     calls: Rc<RefCell<ClientCalls>>,
     fail_dispatch: Rc<Cell<bool>>,
+    reporting_cache: Option<Rc<RefCell<Cache>>>,
+    connected: bool,
 }
 
 #[async_trait::async_trait(?Send)]
 impl ExecutionClient for ConvertClient {
     fn is_connected(&self) -> bool {
-        true
+        self.connected
     }
 
     fn client_id(&self) -> ClientId {
@@ -116,6 +120,17 @@ impl ExecutionClient for ConvertClient {
     }
 
     fn stop(&mut self) -> anyhow::Result<()> {
+        self.connected = false;
+        Ok(())
+    }
+
+    async fn connect(&mut self) -> anyhow::Result<()> {
+        self.connected = true;
+        Ok(())
+    }
+
+    async fn disconnect(&mut self) -> anyhow::Result<()> {
+        self.connected = false;
         Ok(())
     }
 
@@ -135,6 +150,18 @@ impl ExecutionClient for ConvertClient {
             .queries
             .push((command, transaction.clone()));
         Ok(())
+    }
+
+    async fn generate_mass_status(
+        &self,
+        _lookback_mins: Option<u64>,
+    ) -> anyhow::Result<Option<ExecutionMassStatus>> {
+        if let Some(cache) = &self.reporting_cache {
+            cache
+                .borrow()
+                .prepare_convert_position_report(self.account_id, None)?;
+        }
+        Ok(None)
     }
 
     fn submit_order(&self, command: SubmitOrder) -> anyhow::Result<()> {
@@ -233,6 +260,8 @@ impl ConvertFixture {
                     client_id,
                     calls: calls.clone(),
                     fail_dispatch: fail_dispatch.clone(),
+                    reporting_cache: None,
+                    connected: true,
                 },
             ))))
             .unwrap();
@@ -372,6 +401,7 @@ impl ConvertFixture {
             operation_id,
             account_id: self.account_id,
             client_id: self.client_id,
+            run_id: None,
             outcome,
         });
         self.node
@@ -420,6 +450,115 @@ impl ConvertFixture {
             pending_inputs: Vec::new(),
         }
     }
+}
+
+#[rstest]
+#[case(InstrumentCloseType::ContractExpired, true)]
+#[case(InstrumentCloseType::EndOfSession, false)]
+#[tokio::test]
+async fn startup_restores_convert_scope_using_persisted_formal_closes(
+    #[case] output_close: InstrumentCloseType,
+    #[case] historical_gap: bool,
+) {
+    let config = LiveNodeConfig {
+        exec_engine: crate::config::LiveExecutionEngineConfig {
+            load_cache: true,
+            reconciliation: true,
+            ..Default::default()
+        },
+        timeout_reconciliation: Duration::from_secs(1),
+        delay_post_stop: Duration::ZERO,
+        ..Default::default()
+    };
+    let mut node = LiveNode::build("ConvertRecovery".to_string(), Some(config)).unwrap();
+    let account_id = AccountId::from("POLYMARKET-001");
+    let client_id = ClientId::from("POLYMARKET");
+    let input = InstrumentId::from("NO-A.POLYMARKET");
+    let output = InstrumentId::from("YES-B.POLYMARKET");
+    let command = SubmitConvert {
+        operation_id: UUID4::new(),
+        trader_id: node.trader_id(),
+        strategy_id: StrategyId::from("CONVERT-001"),
+        account_id,
+        client_id,
+        inputs: vec![ConvertTokenAmount {
+            instrument_id: input,
+            quantity: dec!(100),
+        }],
+        ts_init: UnixNanos::default(),
+    };
+    let mut record = ConvertOperationRecord::new(&command);
+    record.dispatched = true;
+    record.affected_instruments = vec![input, output];
+    record.transaction = Some(ConvertTransaction {
+        relayer_transaction_id: None,
+        ..ConvertFixture::transaction()
+    });
+
+    let (database, _) = TestCacheDatabaseControl::create();
+    database
+        .add(
+            ConvertOperationRecord::cache_key(command.operation_id),
+            serde_json::to_vec(&record).unwrap().into(),
+        )
+        .unwrap();
+
+    for (instrument_id, close_type) in [
+        (input, InstrumentCloseType::ContractExpired),
+        (output, output_close),
+    ] {
+        database
+            .add_instrument_close(&InstrumentClose::new(
+                instrument_id,
+                Price::from("0.00"),
+                close_type,
+                UnixNanos::from(10),
+                UnixNanos::from(10),
+            ))
+            .unwrap();
+    }
+    node.set_cache_database(Box::new(database)).unwrap();
+
+    let calls = Rc::new(RefCell::new(ClientCalls::default()));
+    let client = LiveExecutionClient::new(Box::new(ConvertClient {
+        account_id,
+        client_id,
+        calls: calls.clone(),
+        fail_dispatch: Rc::new(Cell::new(false)),
+        reporting_cache: Some(node.kernel.cache()),
+        connected: false,
+    }));
+    node.kernel
+        .exec_engine
+        .borrow_mut()
+        .register_client(Box::new(client.clone()))
+        .unwrap();
+    node.exec_clients.push(client);
+
+    let startup = node.start().await;
+    assert_eq!(startup.is_ok(), historical_gap, "{startup:?}");
+    {
+        let cache = node.kernel.cache.borrow();
+        let restored = cache
+            .load_convert_operation(command.operation_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(restored.historical_gap, historical_gap);
+        assert_eq!(restored.result().status, ConvertExecutionStatus::Unknown);
+        assert_eq!(restored.transaction, record.transaction);
+        assert!(!restored.applied);
+        assert_eq!(
+            cache.convert_scope_account_is_active(account_id),
+            !historical_gap
+        );
+        assert!(calls.borrow().submits.is_empty());
+        assert!(calls.borrow().queries.is_empty());
+    }
+
+    if historical_gap {
+        node.stop().await.unwrap();
+    }
+    node.dispose();
 }
 
 #[rstest]
@@ -1002,6 +1141,8 @@ fn convert_submit_does_not_fall_back_or_dispatch_to_another_account(#[case] rout
             client_id: ClientId::from("OTHER-ACCOUNT"),
             calls: fixture.calls.clone(),
             fail_dispatch: fixture.fail_dispatch.clone(),
+            reporting_cache: None,
+            connected: true,
         }))
         .unwrap();
 
@@ -1015,6 +1156,116 @@ fn convert_submit_does_not_fall_back_or_dispatch_to_another_account(#[case] rout
     assert_eq!(result.status, ConvertExecutionStatus::Rejected);
     assert!(result.reason.is_some());
     assert!(fixture.calls.borrow().submits.is_empty());
+}
+
+#[rstest]
+fn recovered_convert_with_unfixed_plan_can_complete_after_pending_input_clears() {
+    let mut fixture = ConvertFixture::new(true);
+    let operation_id = fixture.submit(fixture.inputs(), None);
+    fixture.flush_commands();
+    let ConvertExecutionOutcome::Confirmed { verified, .. } = fixture.confirmation(operation_id)
+    else {
+        unreachable!();
+    };
+    fixture.emit(
+        operation_id,
+        ConvertExecutionOutcome::Confirmed {
+            verified,
+            pending_inputs: vec![fixture.no_a],
+        },
+    );
+    assert_eq!(
+        fixture.last_result().status,
+        ConvertExecutionStatus::Confirmed
+    );
+    assert!(!fixture.last_result().applied);
+    let recovered = fixture
+        .node
+        .kernel
+        .exec_engine
+        .borrow_mut()
+        .recover_convert_operation(operation_id)
+        .unwrap();
+    assert!(!recovered.applied);
+    assert!(!recovered.plan_lost);
+
+    fixture.query(operation_id, fixture.strategy_id, fixture.account_id);
+    fixture.flush_commands();
+    fixture.emit(operation_id, fixture.confirmation(operation_id));
+    assert!(fixture.last_result().applied);
+}
+
+#[rstest]
+#[case(false)]
+#[case(true)]
+fn convert_query_does_not_rebuild_a_lost_applied_plan(#[case] stale_core: bool) {
+    let mut fixture = ConvertFixture::new(true);
+    let operation_id = fixture.submit(fixture.inputs(), None);
+    fixture.flush_commands();
+    fixture.emit(
+        operation_id,
+        ConvertExecutionOutcome::Submitted(ConvertFixture::transaction()),
+    );
+
+    if stale_core {
+        let ConvertExecutionOutcome::Confirmed { verified, .. } =
+            fixture.confirmation(operation_id)
+        else {
+            unreachable!();
+        };
+        let record = fixture
+            .node
+            .kernel
+            .exec_engine
+            .borrow_mut()
+            .apply_verified_convert(*verified, &[fixture.no_a])
+            .unwrap();
+        assert!(record.plan.is_none());
+        assert!(!record.plan_fixed);
+    }
+    {
+        let mut cache = fixture.node.kernel.cache.borrow_mut();
+        let mut record = cache.load_convert_operation(operation_id).unwrap().unwrap();
+        record.status = Some(ConvertExecutionStatus::Confirmed);
+        record.applied = true;
+        cache.add_convert_operation(&record).unwrap();
+    }
+    let recovered = fixture
+        .node
+        .kernel
+        .exec_engine
+        .borrow_mut()
+        .recover_convert_operation(operation_id)
+        .unwrap();
+    assert!(!recovered.applied);
+
+    fixture.query(operation_id, fixture.strategy_id, fixture.account_id);
+    fixture.flush_commands();
+    assert_eq!(fixture.calls.borrow().queries.len(), 1);
+    fixture.emit(operation_id, fixture.confirmation(operation_id));
+
+    let result = fixture.last_result();
+    assert_eq!(result.status, ConvertExecutionStatus::Confirmed);
+    assert_eq!(result.transaction, Some(ConvertFixture::transaction()));
+    assert!(!result.applied);
+    assert_eq!(
+        result.unapplied_instruments,
+        recovered.unapplied_instruments
+    );
+    assert!(result.reason.is_some());
+    let cache = fixture.node.kernel.cache.borrow();
+    assert_eq!(
+        cache
+            .position(&fixture.position_id(fixture.no_a))
+            .unwrap()
+            .quantity,
+        Quantity::from("100.00")
+    );
+    assert!(
+        cache
+            .position(&fixture.position_id(fixture.yes_c))
+            .is_none()
+    );
 }
 
 #[rstest]

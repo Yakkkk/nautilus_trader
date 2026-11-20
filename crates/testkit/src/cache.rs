@@ -51,6 +51,7 @@ use ustr::Ustr;
 )]
 #[derive(Debug, Default)]
 struct TestCacheDatabaseState {
+    general: AHashMap<String, Bytes>,
     actors: AHashMap<ActorId, AHashMap<String, Bytes>>,
     strategies: AHashMap<StrategyId, AHashMap<String, Bytes>>,
     instrument_closes: AHashMap<InstrumentId, InstrumentClose>,
@@ -194,7 +195,7 @@ impl CacheDatabaseAdapter for TestCacheDatabase {
     }
 
     fn load(&self) -> anyhow::Result<AHashMap<String, Bytes>> {
-        Ok(AHashMap::new())
+        Ok(self.control.state.lock().general.clone())
     }
 
     async fn load_currencies(&self) -> anyhow::Result<AHashMap<Ustr, Currency>> {
@@ -331,7 +332,8 @@ impl CacheDatabaseAdapter for TestCacheDatabase {
         Ok(Vec::new())
     }
 
-    fn add(&self, _key: String, _value: Bytes) -> anyhow::Result<()> {
+    fn add(&self, key: String, value: Bytes) -> anyhow::Result<()> {
+        self.control.state.lock().general.insert(key, value);
         Ok(())
     }
 

@@ -124,7 +124,9 @@ use crate::defi::cache::IntegrityError;
 #[cfg(feature = "live")]
 use crate::live::dst;
 use crate::{
-    messages::execution::{ConvertExecutionStatus, ConvertOperationRecord},
+    messages::execution::{
+        CONVERT_OPERATION_CACHE_PREFIX, ConvertExecutionStatus, ConvertOperationRecord,
+    },
     xrate::{get_exchange_rate, get_exchange_rate_with_alternates},
 };
 
@@ -2673,6 +2675,36 @@ impl Cache {
         Ok(Some(record))
     }
 
+    /// Loads every retained Convert operation record from general cache state.
+    ///
+    /// Records without a retained operation envelope are not discoverable and are omitted.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a retained record cannot be decoded or its key does not match the
+    /// retained operation ID.
+    pub fn load_convert_operations(&self) -> anyhow::Result<Vec<ConvertOperationRecord>> {
+        let mut records = Vec::new();
+
+        for (key, value) in &self.general {
+            let Some(operation_id) = key.strip_prefix(CONVERT_OPERATION_CACHE_PREFIX) else {
+                continue;
+            };
+            let record: ConvertOperationRecord = serde_json::from_slice(value).map_err(|e| {
+                anyhow::anyhow!("failed to decode Convert operation record {operation_id}: {e}")
+            })?;
+            anyhow::ensure!(
+                record.operation_id.to_string() == operation_id,
+                "Convert operation record key {operation_id} contained operation {}",
+                record.operation_id,
+            );
+            records.push(record);
+        }
+
+        records.sort_unstable_by_key(|record| record.operation_id.to_string());
+        Ok(records)
+    }
+
     /// Returns whether every affected instrument has a formal contract-expiration close.
     #[must_use]
     pub fn convert_scope_is_expired(&self, affected_instruments: &[InstrumentId]) -> bool {
@@ -2745,10 +2777,14 @@ impl Cache {
 
     /// Retains historical gaps for active operations whose complete scope formally expired.
     ///
-    /// This stops automatic position accounting for each operation without changing its execution
-    /// evidence or wallet transaction context. Callers must only invoke it after the core cache
-    /// required by the operation is fully loaded.
-    fn settle_expired_convert_operations(&mut self) -> usize {
+    /// This is the I9 classification entry point for cold-start recovery. It stops automatic
+    /// position accounting for each operation without changing its execution evidence or wallet
+    /// transaction context. Callers must only invoke it after the core cache required by the
+    /// operation is fully loaded and after comparing any retained original accounting plan.
+    ///
+    /// Returns the number of operations newly classified as historical gaps.
+    #[must_use]
+    pub fn settle_expired_convert_operations(&mut self) -> usize {
         let expired = self
             .convert_operation_scopes
             .iter()
@@ -2848,10 +2884,35 @@ impl Cache {
     /// Returns an error if the record cannot be encoded, conflicts with a fixed active scope,
     /// or the cache write fails.
     pub fn add_convert_operation(&mut self, record: &ConvertOperationRecord) -> anyhow::Result<()> {
+        self.store_convert_operation(record, false)
+    }
+
+    /// Restores a retained Convert operation after startup compared its original accounting plan.
+    ///
+    /// This is the only path allowed to return a previously Applied operation to unresolved
+    /// accounting when the saved position changes do not match its retained plan. Ordinary
+    /// operation updates remain unable to reopen an ended operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the record cannot be encoded, conflicts with another fixed scope, or
+    /// the cache write fails.
+    pub fn restore_convert_operation_recovery(
+        &mut self,
+        record: &ConvertOperationRecord,
+    ) -> anyhow::Result<()> {
+        self.store_convert_operation(record, true)
+    }
+
+    fn store_convert_operation(
+        &mut self,
+        record: &ConvertOperationRecord,
+        recovery: bool,
+    ) -> anyhow::Result<()> {
         let previous = self.load_convert_operation(record.operation_id)?;
         let normalized = normalized_convert_instruments(&record.affected_instruments)?;
         let (active, desired) =
-            self.convert_scope_transition(record, previous.as_ref(), &normalized)?;
+            self.convert_scope_transition(record, previous.as_ref(), &normalized, recovery)?;
 
         let key = ConvertOperationRecord::cache_key(record.operation_id);
         let value = serde_json::to_vec(record).map_err(|e| {
@@ -2878,7 +2939,7 @@ impl Cache {
         record: &ConvertOperationRecord,
     ) -> anyhow::Result<()> {
         self.add_convert_operation(record)?;
-        self.settle_expired_convert_operations();
+        let _ = self.settle_expired_convert_operations();
         Ok(())
     }
 
@@ -2887,10 +2948,16 @@ impl Cache {
         record: &ConvertOperationRecord,
         previous: Option<&ConvertOperationRecord>,
         normalized: &[InstrumentId],
+        recovery: bool,
     ) -> anyhow::Result<(Option<ConvertOperationScope>, Option<ConvertOperationScope>)> {
         if let Some(previous) = previous {
+            let accounting_restored = recovery
+                && previous.operation_id == record.operation_id
+                && previous.applied
+                && !record.applied;
             anyhow::ensure!(
-                !(convert_record_is_terminal(previous) && convert_record_holds_scope(record)),
+                !(convert_record_is_terminal(previous) && convert_record_holds_scope(record))
+                    || accounting_restored,
                 "Convert operation {} cannot reopen an ended operation",
                 record.operation_id,
             );
@@ -3172,7 +3239,7 @@ impl Cache {
         self.instrument_closes.insert(close.instrument_id, close);
 
         if contract_expired {
-            self.settle_expired_convert_operations();
+            let _ = self.settle_expired_convert_operations();
         }
         Ok(())
     }

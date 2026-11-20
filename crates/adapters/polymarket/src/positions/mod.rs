@@ -27,7 +27,11 @@ use std::{
 };
 
 use alloy_primitives::{Address, U256};
-use nautilus_core::time::{AtomicTime, get_atomic_clock_realtime};
+use nautilus_common::messages::execution::ConvertTransaction;
+use nautilus_core::{
+    UUID4,
+    time::{AtomicTime, get_atomic_clock_realtime},
+};
 use nautilus_network::websocket::proxy::ProxyUrl;
 use parking_lot::Mutex;
 use rust_decimal::Decimal;
@@ -555,6 +559,7 @@ impl PolymarketPositionClient {
         *submission = Some(WalletSubmission {
             nonce,
             transaction_id: None,
+            operation_id: None,
         });
 
         for wallet_call in &wallet_calls {
@@ -589,6 +594,7 @@ impl PolymarketPositionClient {
         *submission = Some(WalletSubmission {
             nonce,
             transaction_id: Some(transaction_id.clone()),
+            operation_id: None,
         });
 
         Ok(PolymarketPositionTransaction {
@@ -609,6 +615,7 @@ enum PositionMarket {
 struct WalletSubmission {
     nonce: U256,
     transaction_id: Option<String>,
+    operation_id: Option<UUID4>,
 }
 
 type WalletSubmissionState = tokio::sync::Mutex<Option<WalletSubmission>>;
@@ -620,6 +627,75 @@ fn wallet_submission(wallet: Address) -> Arc<WalletSubmissionState> {
     });
 
     submissions.entry(wallet).or_default().clone()
+}
+
+/// Restores a retained Convert wallet authorization without signing a new transaction.
+///
+/// A newer reservation is retained unchanged. A reservation with the same nonce must belong to the
+/// same operation before its transaction locator can be enriched.
+pub(crate) async fn restore_convert_wallet_context(
+    operation_id: UUID4,
+    transaction: &ConvertTransaction,
+) -> Result<()> {
+    let wallet = parse_address(&transaction.wallet, "convert wallet")?;
+    let nonce = transaction
+        .nonce
+        .as_deref()
+        .ok_or_else(|| Error::bad_request("retained Convert operation has no wallet nonce"))?;
+    let nonce = U256::from_str_radix(nonce, 10)
+        .map_err(|e| Error::bad_request(format!("invalid retained Convert wallet nonce: {e}")))?;
+
+    let state = wallet_submission(wallet);
+    let mut submission = state.lock().await;
+
+    match submission.as_ref() {
+        None => {
+            *submission = Some(WalletSubmission {
+                nonce,
+                transaction_id: transaction.relayer_transaction_id.clone(),
+                operation_id: Some(operation_id),
+            });
+        }
+        Some(existing) if existing.nonce < nonce => {
+            *submission = Some(WalletSubmission {
+                nonce,
+                transaction_id: transaction.relayer_transaction_id.clone(),
+                operation_id: Some(operation_id),
+            });
+        }
+        Some(existing) if existing.nonce > nonce => {
+            log::warn!(
+                "Retained Convert operation {operation_id} nonce {nonce} is older than the active wallet submission nonce {}; keeping the active reservation",
+                existing.nonce,
+            );
+        }
+        Some(existing) => {
+            if existing.operation_id != Some(operation_id) {
+                return Err(Error::exchange(format!(
+                    "wallet submission nonce {nonce} belongs to a different operation",
+                )));
+            }
+
+            let existing_transaction_id = existing.transaction_id.clone();
+            if let (Some(existing_transaction_id), Some(incoming_transaction_id)) = (
+                existing_transaction_id.as_deref(),
+                transaction.relayer_transaction_id.as_deref(),
+            ) && existing_transaction_id != incoming_transaction_id
+            {
+                return Err(Error::exchange(format!(
+                    "retained Convert operation {operation_id} Relayer transaction ID conflicts \
+                     with the active wallet reservation",
+                )));
+            }
+
+            if existing_transaction_id.is_none() {
+                let state = submission.as_mut().expect("submission is present");
+                state.transaction_id = transaction.relayer_transaction_id.clone();
+            }
+        }
+    }
+
+    Ok(())
 }
 
 fn outcome_from_transaction(tx: RelayerTransaction) -> Result<PolymarketPositionOutcome> {

@@ -122,8 +122,13 @@ mod serial_tests {
     }
 
     #[rstest]
+    #[case(ConvertRecoveryCase::Complete)]
     #[case(ConvertRecoveryCase::Partial)]
+    #[case(ConvertRecoveryCase::StaleEnvelope)]
+    #[case(ConvertRecoveryCase::StaleEnvelopeSettled)]
     #[case(ConvertRecoveryCase::MissingPlan)]
+    #[case(ConvertRecoveryCase::MissingIndex)]
+    #[case(ConvertRecoveryCase::ConflictingEnvelope)]
     #[case(ConvertRecoveryCase::ReplacedCycle)]
     #[tokio::test(flavor = "multi_thread")]
     async fn test_convert_batch_recovery(#[case] case: ConvertRecoveryCase) {

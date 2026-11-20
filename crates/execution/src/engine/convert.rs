@@ -15,10 +15,14 @@
 
 //! Dispatch and evidence handling for negative-risk conversions.
 
-use nautilus_common::messages::execution::{
-    ConvertExecutionEvent, ConvertExecutionOutcome, ConvertExecutionStatus, ConvertOperationRecord,
-    ConvertResult, ConvertTransaction, QueryConvert, SimulatedConvertExecutionEvent, SubmitConvert,
-    VerifiedConvert, has_unique_inputs, normalized_inputs,
+use nautilus_common::{
+    clients::ConvertQueryDispatchError,
+    messages::execution::{
+        ConvertExecutionEvent, ConvertExecutionOutcome, ConvertExecutionStatus,
+        ConvertOperationRecord, ConvertResult, ConvertTransaction, QueryConvert,
+        SimulatedConvertExecutionEvent, SubmitConvert, VerifiedConvert, has_unique_inputs,
+        normalized_inputs,
+    },
 };
 use nautilus_model::{
     accounts::{Account, AccountAny},
@@ -32,8 +36,51 @@ use super::{
 };
 use crate::engine::polymarket_convert::merge_convert_transaction;
 
+const CONVERT_QUERY_MAX_ATTEMPTS: usize = 3;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) enum ConvertLiveRunState {
+    #[default]
+    Inactive,
+    Active(UUID4),
+    Stopped,
+}
+
 impl ExecutionEngine {
+    /// Starts a live run identity that Convert clients echo on evidence.
+    pub fn begin_convert_live_run(&mut self) {
+        self.convert_live_run = ConvertLiveRunState::Active(UUID4::new());
+    }
+
+    /// Ends the live run identity so late Convert evidence is ignored.
+    pub fn end_convert_live_run(&mut self) {
+        self.convert_live_run = ConvertLiveRunState::Stopped;
+    }
+
+    pub(super) fn stop_convert_live_run_if_active(&mut self) {
+        if matches!(self.convert_live_run, ConvertLiveRunState::Active(_)) {
+            self.convert_live_run = ConvertLiveRunState::Stopped;
+        }
+    }
+
+    /// Returns the current live run identity, if any.
+    #[must_use]
+    pub fn convert_live_run_id(&self) -> Option<UUID4> {
+        match self.convert_live_run {
+            ConvertLiveRunState::Active(run_id) => Some(run_id),
+            ConvertLiveRunState::Inactive | ConvertLiveRunState::Stopped => None,
+        }
+    }
+
     pub(super) fn handle_submit_convert(&self, command: &SubmitConvert) {
+        if self.convert_live_run == ConvertLiveRunState::Stopped {
+            publish_rejection(
+                command,
+                "Convert submission is unavailable after the live run has stopped".to_string(),
+            );
+            return;
+        }
+
         let mut record = match self.load_convert_operation(command.operation_id) {
             Ok(Some(record)) => record,
             Ok(None) => {
@@ -105,7 +152,7 @@ impl ExecutionEngine {
             return;
         }
 
-        match client.submit_convert(command.clone(), scope) {
+        match client.submit_convert_for_run(command.clone(), scope, self.convert_live_run_id()) {
             Ok(()) => {
                 record.reason =
                     Some("conversion dispatched; awaiting execution evidence".to_string());
@@ -121,7 +168,15 @@ impl ExecutionEngine {
         }
     }
 
-    pub(super) fn handle_query_convert(&self, command: QueryConvert) {
+    pub(super) fn handle_query_convert(&self, command: &QueryConvert) -> bool {
+        if self.convert_live_run == ConvertLiveRunState::Stopped {
+            publish_query_rejection(
+                command,
+                "Convert query is unavailable after the live run has stopped".to_string(),
+            );
+            return false;
+        }
+
         let record = match self.load_convert_operation(command.operation_id) {
             Ok(record) => record,
             Err(e) => {
@@ -130,16 +185,16 @@ impl ExecutionEngine {
                     command.operation_id,
                 );
                 publish_query_rejection(
-                    &command,
+                    command,
                     "cannot read the retained Convert operation".to_string(),
                 );
-                return;
+                return false;
             }
         };
 
-        let Some(mut record) = record.filter(|record| record.is_owned_by(&command)) else {
-            publish_query_rejection(&command, "unknown Convert operation".to_string());
-            return;
+        let Some(mut record) = record.filter(|record| record.is_owned_by(command)) else {
+            publish_query_rejection(command, "unknown Convert operation".to_string());
+            return false;
         };
 
         if record.applied
@@ -148,7 +203,7 @@ impl ExecutionEngine {
                 && record.transaction.is_none())
         {
             publish_result(&record.result());
-            return;
+            return false;
         }
 
         if record.status == Some(ConvertExecutionStatus::Confirmed)
@@ -160,7 +215,7 @@ impl ExecutionEngine {
             record.mark_historical_gap();
             self.store_convert_operation(&record);
             publish_result(&record.result());
-            return;
+            return false;
         }
 
         let Some(transaction) = record
@@ -169,7 +224,7 @@ impl ExecutionEngine {
             .filter(|transaction| transaction.has_original_locator())
         else {
             publish_result(&record.result());
-            return;
+            return false;
         };
 
         let Some(client) = self.explicit_convert_client(command.client_id, command.account_id)
@@ -178,19 +233,206 @@ impl ExecutionEngine {
             result.reason =
                 Some("no matching execution client is available to query conversion".to_string());
             publish_result(&result);
-            return;
+            return false;
         };
 
-        if let Err(e) = client.query_convert(command, transaction) {
-            log::warn!(
-                "Convert query failed for operation {}: {e}",
-                record.operation_id,
-            );
-            publish_result(&record.result());
+        for attempt in 1..=CONVERT_QUERY_MAX_ATTEMPTS {
+            match client.query_convert_for_run(
+                command.clone(),
+                transaction,
+                self.convert_live_run_id(),
+            ) {
+                Ok(()) => return true,
+                Err(e) => {
+                    let retryable = error_has_retryable_convert_query(&e);
+                    if !retryable {
+                        log::warn!(
+                            "Convert query failed without retry for operation {}: {e}",
+                            record.operation_id,
+                        );
+                        publish_result(&record.result());
+                        return false;
+                    }
+
+                    log::warn!(
+                        "Convert query attempt {attempt}/{CONVERT_QUERY_MAX_ATTEMPTS} failed for \
+                         operation {}: {e}",
+                        record.operation_id,
+                    );
+                }
+            }
         }
+
+        log::warn!(
+            "Convert query budget exhausted for operation {} after \
+             {CONVERT_QUERY_MAX_ATTEMPTS} attempts; recovery remains pending",
+            record.operation_id,
+        );
+        publish_result(&record.result());
+        false
+    }
+
+    /// Dispatches a bounded, read-only query for a retained conversion through the normal client
+    /// route, retrying only explicitly retryable dispatch errors up to a fixed attempt budget.
+    ///
+    /// The client must emit any evidence as a [`ConvertExecutionEvent`]; this method does not
+    /// create a new submission or apply a parallel result path.
+    ///
+    /// Clients must cancel outstanding query work on stop or reset, return an error only when the
+    /// query was not dispatched, mark transient failures with [`ConvertQueryDispatchError::retryable`],
+    /// and must not emit evidence for a stopped run.
+    pub fn query_convert(&self, command: &QueryConvert) -> bool {
+        self.handle_query_convert(command)
+    }
+
+    /// Recovers one retained conversion's accounting against its original fixed plan.
+    ///
+    /// The operation record is downgraded from Applied only when the retained plan comparison
+    /// finds saved position changes missing or conflicting. Historical gaps are left untouched.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the operation record cannot be read or written, or the retained core
+    /// plan cannot be decoded.
+    pub fn recover_convert_operation(
+        &mut self,
+        operation_id: UUID4,
+    ) -> anyhow::Result<ConvertOperationRecord> {
+        let mut operation = self
+            .load_convert_operation(operation_id)?
+            .ok_or_else(|| anyhow::anyhow!("Convert operation {operation_id} is not retained"))?;
+
+        if operation.historical_gap {
+            return Ok(operation);
+        }
+
+        let was_applied = operation.applied;
+        let was_confirmed = operation.status == Some(ConvertExecutionStatus::Confirmed);
+
+        if operation.plan_lost || operation.recovery_blocked {
+            if !operation.recovery_blocked
+                && let Some(core_record) = self.convert_record(operation_id)?
+            {
+                let mut verified = core_record.verified;
+                if self
+                    .validate_convert_confirmation(&operation, &mut verified)
+                    .is_ok()
+                {
+                    operation.status = Some(ConvertExecutionStatus::Confirmed);
+                    operation.transaction = Some(verified.transaction);
+                }
+            }
+
+            operation.applied = false;
+            operation.unapplied_instruments = sorted_instruments(&operation.affected_instruments);
+            if operation.reason.is_none() {
+                operation.reason = Some(if operation.recovery_blocked {
+                    "conflicting retained Convert evidence disables automatic recovery".to_string()
+                } else {
+                    "original Convert accounting plan is lost; recovery cannot reconstruct it"
+                        .to_string()
+                });
+            }
+            self.cache
+                .borrow_mut()
+                .restore_convert_operation_recovery(&operation)?;
+            return Ok(operation);
+        }
+
+        let Some(core_record) = self.convert_record(operation_id)? else {
+            let lost_plan = was_applied || was_confirmed || operation.plan_lost;
+            if lost_plan {
+                operation.plan_lost = true;
+            }
+            operation.applied = false;
+            operation.unapplied_instruments = sorted_instruments(&operation.affected_instruments);
+            if lost_plan {
+                operation.reason = Some(
+                    "missing original Convert verification and accounting plan; recovery cannot \
+                     reconstruct it"
+                        .to_string(),
+                );
+            } else if operation.reason.is_none() {
+                operation.reason = Some(
+                    "retained Convert execution remains pending without a recoverable accounting \
+                     plan"
+                        .to_string(),
+                );
+            }
+
+            self.cache
+                .borrow_mut()
+                .restore_convert_operation_recovery(&operation)?;
+            return Ok(operation);
+        };
+
+        let mut verified = core_record.verified;
+        if let Err(reason) = self.validate_convert_confirmation(&operation, &mut verified) {
+            let conflict = format!(
+                "conflict: recovered Convert plan did not match the retained operation: {reason}"
+            );
+            operation.recovery_blocked = true;
+            operation.applied = false;
+            operation.unapplied_instruments = sorted_instruments(&operation.affected_instruments);
+
+            operation.reason = Some(conflict);
+
+            self.cache
+                .borrow_mut()
+                .restore_convert_operation_recovery(&operation)?;
+            return Ok(operation);
+        }
+
+        operation.status = Some(ConvertExecutionStatus::Confirmed);
+        operation.transaction = Some(verified.transaction);
+
+        let recovered = self.recover_convert(operation_id, &[])?;
+
+        operation.applied = recovered.applied;
+        let lost_plan = recovered.plan.is_none() && (was_applied || recovered.plan_fixed);
+        operation.plan_lost |= lost_plan;
+        operation.unapplied_instruments = recovered.unapplied_instruments;
+        operation.reason = if lost_plan {
+            Some(
+                "original Convert accounting plan is missing; recovery cannot reconstruct it"
+                    .to_string(),
+            )
+        } else {
+            recovered.reason
+        };
+
+        self.cache
+            .borrow_mut()
+            .restore_convert_operation_recovery(&operation)?;
+        Ok(operation)
     }
 
     pub(super) fn handle_convert_event(&mut self, event: ConvertExecutionEvent) {
+        match self.convert_live_run {
+            ConvertLiveRunState::Inactive => {
+                if event.run_id.is_some() {
+                    log::debug!("Ignoring conversion evidence emitted outside a live run");
+                    return;
+                }
+            }
+            ConvertLiveRunState::Active(run_id) => {
+                if event.run_id != Some(run_id) {
+                    log::debug!(
+                        "Ignoring conversion evidence from stale live run {:?}",
+                        event.run_id,
+                    );
+                    return;
+                }
+            }
+            ConvertLiveRunState::Stopped => {
+                log::debug!(
+                    "Ignoring conversion evidence after the live run stopped: {:?}",
+                    event.run_id,
+                );
+                return;
+            }
+        }
+
         let Some(record) = self.owned_convert_record(&event) else {
             return;
         };
@@ -393,7 +635,7 @@ impl ExecutionEngine {
         &mut self,
         simulation: SimulatedConvertExecutionEvent,
     ) {
-        if !simulation.is_current() {
+        if !simulation.is_current() || self.convert_live_run == ConvertLiveRunState::Stopped {
             log::debug!(
                 "Dropping stale simulated Convert outcome {}",
                 simulation.event.operation_id,
@@ -420,6 +662,7 @@ impl ExecutionEngine {
             account_id,
             client_id,
             outcome,
+            run_id,
         } = event;
 
         let ConvertExecutionOutcome::Confirmed {
@@ -432,6 +675,7 @@ impl ExecutionEngine {
                 account_id,
                 client_id,
                 outcome,
+                run_id,
             };
             self.handle_convert_event_with_record(event, record);
             return;
@@ -599,22 +843,47 @@ impl ExecutionEngine {
         verified: VerifiedConvert,
         pending_inputs: &[InstrumentId],
     ) {
-        if record.historical_gap || record.applied {
+        if record.historical_gap {
             record.status = Some(ConvertExecutionStatus::Confirmed);
             record.transaction = Some(verified.transaction);
             return;
         }
 
-        if self
-            .cache
-            .borrow()
-            .convert_scope_is_expired(&record.affected_instruments)
-        {
+        if record.recovery_blocked || record.plan_lost {
             record.status = Some(ConvertExecutionStatus::Confirmed);
             record.transaction = Some(verified.transaction);
-            record.mark_historical_gap();
+            record.applied = false;
+            record.unapplied_instruments = record.affected_instruments.clone();
+            if record.reason.is_none() {
+                record.reason = Some(if record.recovery_blocked {
+                    "conflicting retained Convert evidence disables automatic recovery".to_string()
+                } else {
+                    "original Convert accounting plan is lost; execution evidence retained \
+                     without rebuilding accounting from current costs"
+                        .to_string()
+                });
+            }
+
+            if self
+                .cache
+                .borrow()
+                .convert_scope_is_expired(&record.affected_instruments)
+            {
+                record.mark_historical_gap();
+            }
             return;
         }
+
+        if record.applied {
+            record.status = Some(ConvertExecutionStatus::Confirmed);
+            record.transaction = Some(verified.transaction);
+            return;
+        }
+
+        let expired = self
+            .cache
+            .borrow()
+            .convert_scope_is_expired(&record.affected_instruments);
 
         match self.apply_verified_convert(verified.clone(), pending_inputs) {
             Ok(core_record) => {
@@ -626,15 +895,23 @@ impl ExecutionEngine {
                     record.unapplied_instruments.clear();
                     record.reason = None;
                 } else {
+                    record.applied = false;
                     record.unapplied_instruments = core_record.unapplied_instruments;
                     record.reason = core_record.reason;
+                    if expired {
+                        record.mark_historical_gap();
+                    }
                 }
             }
             Err(e) => {
                 record.status = Some(ConvertExecutionStatus::Confirmed);
                 record.transaction = Some(verified.transaction);
+                record.applied = false;
                 record.unapplied_instruments = record.affected_instruments.clone();
                 record.reason = Some(format!("Convert accounting failed: {e}"));
+                if expired {
+                    record.mark_historical_gap();
+                }
             }
         }
     }
@@ -824,6 +1101,14 @@ impl ExecutionEngine {
 fn convert_evidence_is_terminal(record: &ConvertOperationRecord) -> bool {
     record.authorization_invalid
         || (record.status == Some(ConvertExecutionStatus::Rejected) && record.transaction.is_none())
+}
+
+fn error_has_retryable_convert_query(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<ConvertQueryDispatchError>()
+            .is_some_and(ConvertQueryDispatchError::is_retryable)
+    })
 }
 
 fn sorted_instruments(instruments: &[InstrumentId]) -> Vec<InstrumentId> {

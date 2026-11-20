@@ -870,6 +870,15 @@ impl ExecutionClient for SandboxExecutionClient {
         Ok(())
     }
 
+    fn submit_convert_for_run(
+        &self,
+        cmd: SubmitConvert,
+        scope: ConvertScope,
+        _run_id: Option<UUID4>,
+    ) -> anyhow::Result<()> {
+        self.submit_convert(cmd, scope)
+    }
+
     fn modify_order(&self, cmd: ModifyOrder) -> anyhow::Result<()> {
         let mut inner = self.inner.borrow_mut();
         if inner.config.latency_model.is_none() {
@@ -1611,6 +1620,7 @@ impl SandboxInner {
             operation_id: cmd.operation_id,
             account_id: cmd.account_id,
             client_id: cmd.client_id,
+            run_id: None,
             outcome: ConvertExecutionOutcome::Confirmed {
                 verified: Box::new(verified),
                 pending_inputs: Vec::new(),
@@ -1636,6 +1646,7 @@ impl SandboxInner {
             operation_id: cmd.operation_id,
             account_id: cmd.account_id,
             client_id: cmd.client_id,
+            run_id: None,
             outcome: ConvertExecutionOutcome::Rejected(reason.to_string()),
         };
 

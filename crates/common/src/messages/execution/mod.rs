@@ -35,10 +35,10 @@ use strum::Display as StrumDisplay;
 pub use self::{
     cancel::{BatchCancelOrders, CancelAllOrders, CancelOrder},
     convert::{
-        ConvertExecutionEvent, ConvertExecutionOutcome, ConvertExecutionStatus,
-        ConvertOperationRecord, ConvertResult, ConvertTokenAmount, ConvertTransaction,
-        QueryConvert, SimulatedConvertExecutionEvent, SubmitConvert, VerifiedConvert,
-        has_unique_inputs, normalized_inputs,
+        CONVERT_OPERATION_CACHE_PREFIX, ConvertExecutionEvent, ConvertExecutionOutcome,
+        ConvertExecutionStatus, ConvertOperationRecord, ConvertResult, ConvertTokenAmount,
+        ConvertTransaction, QueryConvert, SimulatedConvertExecutionEvent, SubmitConvert,
+        VerifiedConvert, has_unique_inputs, normalized_inputs,
     },
     modify::{BatchModifyOrders, ModifyOrder},
     query::{QueryAccount, QueryOrder},
