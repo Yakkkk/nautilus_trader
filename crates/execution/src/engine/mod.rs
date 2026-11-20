@@ -53,8 +53,8 @@ use nautilus_common::{
         ExecutionReport,
         execution::{
             BatchCancelOrders, BatchModifyOrders, CancelAllOrders, CancelOrder,
-            ConvertExecutionEvent, ModifyOrder, QueryAccount, QueryOrder, SubmitOrder,
-            SubmitOrderList, TradingCommand,
+            ConvertExecutionEvent, ModifyOrder, QueryAccount, QueryOrder,
+            SimulatedConvertExecutionEvent, SubmitOrder, SubmitOrderList, TradingCommand,
         },
     },
     msgbus::{
@@ -267,6 +267,17 @@ impl ExecutionEngine {
             ShareableMessageHandler::from_typed(move |event: &ConvertExecutionEvent| {
                 if let Some(rc) = weak4.upgrade() {
                     rc.borrow_mut().handle_convert_event(event.clone());
+                }
+            }),
+        );
+
+        let weak5 = WeakCell::from(Rc::downgrade(engine));
+        msgbus::register_any(
+            MessagingSwitchboard::exec_engine_process_simulated_convert(),
+            ShareableMessageHandler::from_typed(move |event: &SimulatedConvertExecutionEvent| {
+                if let Some(rc) = weak5.upgrade() {
+                    rc.borrow_mut()
+                        .handle_simulated_convert_event(event.clone());
                 }
             }),
         );

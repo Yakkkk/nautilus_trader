@@ -626,6 +626,12 @@ impl AsyncRunner {
             ExecutionEvent::Convert(event) => {
                 msgbus::send_any(MessagingSwitchboard::exec_engine_process_convert(), &event);
             }
+            ExecutionEvent::SimulatedConvert(event) => {
+                msgbus::send_any(
+                    MessagingSwitchboard::exec_engine_process_simulated_convert(),
+                    &event,
+                );
+            }
             ExecutionEvent::Account(ref account) => {
                 msgbus::send_account_state(
                     MessagingSwitchboard::portfolio_update_account(),

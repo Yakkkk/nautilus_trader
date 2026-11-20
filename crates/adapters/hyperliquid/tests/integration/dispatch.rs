@@ -181,6 +181,7 @@ fn assert_event_types(events: &[ExecutionEvent], expected: &[&str]) {
             ExecutionEvent::Report(_) => "Report",
             ExecutionEvent::Account(_) => "Account",
             ExecutionEvent::Convert(_) => "Convert",
+            ExecutionEvent::SimulatedConvert(_) => "SimulatedConvert",
             ExecutionEvent::Data(_) => "Data",
         })
         .collect();

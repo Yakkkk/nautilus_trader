@@ -996,6 +996,7 @@ impl ClientOutput {
                 event.trader_id == trader_id && event.account_id.is_none_or(|id| id == account_id)
             }),
             ExecutionEvent::Convert(event) => event.account_id == account_id,
+            ExecutionEvent::SimulatedConvert(event) => event.event.account_id == account_id,
             ExecutionEvent::Report(report) => match report {
                 ExecutionReport::Order(report) => report.account_id == account_id,
                 ExecutionReport::Fill(report) => report.account_id == account_id,

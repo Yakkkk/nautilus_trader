@@ -19,12 +19,18 @@ use indexmap::IndexMap;
 pub use nautilus_common::messages::execution::{
     ConvertTokenAmount, ConvertTransaction, VerifiedConvert,
 };
-use nautilus_common::{cache::Cache, messages::execution::has_unique_inputs};
+use nautilus_common::{
+    cache::Cache,
+    messages::execution::{SubmitConvert, has_unique_inputs},
+};
 use nautilus_core::UUID4;
 use nautilus_model::{
     enums::{InstrumentCloseType, OmsType, PositionSide},
     identifiers::{InstrumentId, PositionId, StrategyId},
-    instruments::{Instrument, InstrumentAny, neg_risk::CtfNegRiskEvent},
+    instruments::{
+        Instrument, InstrumentAny,
+        neg_risk::{ConvertScope, CtfNegRiskEvent},
+    },
     polymarket_convert::{
         PolymarketConvertInput, PolymarketConvertOutput, allocate_convert_costs_precise,
     },
@@ -48,6 +54,205 @@ pub struct SimulatedConvertEffect {
     pub inputs: Vec<ConvertTokenAmount>,
     pub outputs: Vec<ConvertTokenAmount>,
     pub net_cash: Decimal,
+}
+
+/// Validates the complete conversion scope, instruments, positions, and exact quantities.
+///
+/// # Errors
+///
+/// Returns an error if the effect differs from the admitted scope, an instrument or position is
+/// missing or invalid, the account has no settlement balance, or a quantity is inexact.
+pub fn validate_simulated_convert_effect(
+    cache: &Cache,
+    command: &SubmitConvert,
+    scope: &ConvertScope,
+    effect: &SimulatedConvertEffect,
+) -> Result<Currency, String> {
+    let effect_inputs: Vec<_> = effect
+        .inputs
+        .iter()
+        .map(|input| input.instrument_id)
+        .collect();
+    let effect_outputs: Vec<_> = effect
+        .outputs
+        .iter()
+        .map(|output| output.instrument_id)
+        .collect();
+
+    if effect_inputs != scope.inputs || effect_outputs != scope.outputs {
+        return Err("conversion scope did not match the complete negative-risk event".to_string());
+    }
+
+    let mut currency = None;
+    let mut size_precisions = IndexMap::with_capacity(effect_inputs.len() + effect_outputs.len());
+
+    for instrument_id in effect_inputs.iter().chain(effect_outputs.iter()) {
+        let instrument = cache
+            .instrument(instrument_id)
+            .ok_or_else(|| format!("conversion instrument {instrument_id} was not loaded"))?;
+
+        if cache
+            .instrument_close(instrument_id)
+            .is_some_and(|close| close.close_type == InstrumentCloseType::ContractExpired)
+        {
+            return Err(format!("conversion instrument {instrument_id} has expired"));
+        }
+
+        if let Some(currency) = currency {
+            if instrument.cost_currency() != currency {
+                return Err(format!(
+                    "conversion instrument {instrument_id} cost currency differed from {currency}"
+                ));
+            }
+        } else {
+            currency = Some(instrument.cost_currency());
+        }
+        size_precisions.insert(*instrument_id, instrument.size_precision());
+    }
+
+    let currency = currency.ok_or_else(|| "conversion scope was empty".to_string())?;
+
+    for input in &effect.inputs {
+        let position_id = convert_position_id(input.instrument_id, command.strategy_id);
+        let position = cache.position(&position_id).ok_or_else(|| {
+            format!(
+                "conversion input position {position_id} for strategy {} and account {} was not found",
+                command.strategy_id, command.account_id,
+            )
+        })?;
+        validate_simulated_convert_position(
+            cache,
+            &position,
+            command,
+            position_id,
+            input.instrument_id,
+            size_precisions[&input.instrument_id],
+            currency,
+            SimulatedConvertPositionRole::Input,
+        )?;
+    }
+
+    for output in &effect.outputs {
+        let position_id = convert_position_id(output.instrument_id, command.strategy_id);
+        if let Some(position) = cache.position(&position_id) {
+            validate_simulated_convert_position(
+                cache,
+                &position,
+                command,
+                position_id,
+                output.instrument_id,
+                size_precisions[&output.instrument_id],
+                currency,
+                SimulatedConvertPositionRole::Output,
+            )?;
+        }
+    }
+
+    let account = cache
+        .account(&command.account_id)
+        .ok_or_else(|| format!("conversion account {} was not found", command.account_id))?;
+    if account.balance(Some(currency)).is_none() {
+        return Err(format!(
+            "conversion account {} has no {currency} balance",
+            command.account_id,
+        ));
+    }
+
+    for input in &effect.inputs {
+        exact_convert_quantity(
+            input.quantity,
+            size_precisions[&input.instrument_id],
+            &format!("conversion input {}", input.instrument_id),
+        )?;
+    }
+
+    for output in &effect.outputs {
+        exact_convert_quantity(
+            output.quantity,
+            size_precisions[&output.instrument_id],
+            &format!("conversion output {}", output.instrument_id),
+        )?;
+    }
+
+    Ok(currency)
+}
+
+#[derive(Clone, Copy)]
+enum SimulatedConvertPositionRole {
+    Input,
+    Output,
+}
+
+impl SimulatedConvertPositionRole {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Input => "input",
+            Self::Output => "output",
+        }
+    }
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "validates one conversion position against its command context"
+)]
+fn validate_simulated_convert_position(
+    cache: &Cache,
+    position: &Position,
+    command: &SubmitConvert,
+    position_id: PositionId,
+    instrument_id: InstrumentId,
+    size_precision: u8,
+    currency: Currency,
+    role: SimulatedConvertPositionRole,
+) -> Result<(), String> {
+    let label = role.label();
+
+    if position.id != position_id {
+        return Err(format!(
+            "conversion {label} position {} did not match canonical ID {position_id}",
+            position.id,
+        ));
+    }
+
+    if position.trader_id != command.trader_id
+        || position.strategy_id != command.strategy_id
+        || position.account_id != command.account_id
+        || position.instrument_id != instrument_id
+    {
+        return Err(format!(
+            "conversion {label} position {position_id} did not belong to trader {}, strategy {}, account {}",
+            command.trader_id, command.strategy_id, command.account_id,
+        ));
+    }
+
+    if cache.oms_type(&position_id) != Some(OmsType::Netting) {
+        return Err(format!(
+            "conversion {label} position {position_id} was not a NETTING position"
+        ));
+    }
+
+    if position.size_precision != size_precision {
+        return Err(format!(
+            "conversion {label} position {position_id} size precision did not match its instrument"
+        ));
+    }
+
+    if position.settlement_currency != currency {
+        return Err(format!(
+            "conversion {label} position {position_id} settlement currency did not match {currency}"
+        ));
+    }
+
+    if matches!(role, SimulatedConvertPositionRole::Output)
+        && (position.side == PositionSide::Short || position.signed_qty < Decimal::ZERO)
+    {
+        return Err(format!(
+            "conversion {label} position {position_id} was short"
+        ));
+    }
+
+    Ok(())
 }
 
 /// Calculates the chain-unit effects of a negative-risk conversion without applying them.

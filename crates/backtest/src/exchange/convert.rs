@@ -17,25 +17,15 @@
 
 use std::rc::Rc;
 
-use ahash::AHashMap;
-use nautilus_common::{
-    cache::Cache,
-    messages::execution::{
-        ConvertExecutionEvent, ConvertExecutionOutcome, ConvertTransaction, SubmitConvert,
-        TradingCommand, VerifiedConvert,
-    },
+use nautilus_common::messages::execution::{
+    ConvertExecutionEvent, ConvertExecutionOutcome, ConvertTransaction, SubmitConvert,
+    TradingCommand, VerifiedConvert,
 };
 use nautilus_core::UUID4;
 use nautilus_execution::engine::polymarket_convert::{
-    calculate_convert_effect, convert_position_id, exact_convert_quantity,
+    calculate_convert_effect, convert_position_id, validate_simulated_convert_effect,
 };
-use nautilus_model::{
-    enums::{InstrumentCloseType, OmsType, PositionSide},
-    identifiers::{InstrumentId, PositionId},
-    instruments::{Instrument, neg_risk::ConvertScope},
-    position::Position,
-    types::{Currency, Money},
-};
+use nautilus_model::{instruments::neg_risk::ConvertScope, types::Money};
 use rust_decimal::Decimal;
 
 use super::{DeferEventsGuard, ExchangeCommand, InflightCommand, SimulatedExchange};
@@ -132,120 +122,10 @@ impl SimulatedExchange {
                 })?
         };
         let effect = calculate_convert_effect(&event, &command.inputs)?;
-        let effect_inputs: Vec<_> = effect
-            .inputs
-            .iter()
-            .map(|input| input.instrument_id)
-            .collect();
-        let effect_outputs: Vec<_> = effect
-            .outputs
-            .iter()
-            .map(|output| output.instrument_id)
-            .collect();
-
-        if effect_inputs != scope.inputs || effect_outputs != scope.outputs {
-            return Err(
-                "conversion scope did not match the complete negative-risk event".to_string(),
-            );
-        }
-
-        let (currency, size_precisions) = {
+        let currency = {
             let cache = self.cache.borrow();
-            let mut currency = None;
-            let mut size_precisions =
-                AHashMap::with_capacity(effect_inputs.len() + effect_outputs.len());
-
-            for instrument_id in effect_inputs.iter().chain(effect_outputs.iter()) {
-                let instrument = cache.instrument(instrument_id).ok_or_else(|| {
-                    format!("conversion instrument {instrument_id} was not loaded")
-                })?;
-
-                if cache
-                    .instrument_close(instrument_id)
-                    .is_some_and(|close| close.close_type == InstrumentCloseType::ContractExpired)
-                {
-                    return Err(format!("conversion instrument {instrument_id} has expired"));
-                }
-
-                if let Some(currency) = currency {
-                    if instrument.cost_currency() != currency {
-                        return Err(format!(
-                            "conversion instrument {instrument_id} cost currency differed from {currency}"
-                        ));
-                    }
-                } else {
-                    currency = Some(instrument.cost_currency());
-                }
-                size_precisions.insert(*instrument_id, instrument.size_precision());
-            }
-            let currency = currency.ok_or_else(|| "conversion scope was empty".to_string())?;
-
-            for input in &effect.inputs {
-                let position_id = convert_position_id(input.instrument_id, command.strategy_id);
-                let position = cache.position(&position_id).ok_or_else(|| {
-                    format!(
-                        "conversion input position {position_id} for strategy {} and account {} was not found",
-                        command.strategy_id, command.account_id,
-                    )
-                })?;
-                validate_convert_position(
-                    &cache,
-                    &position,
-                    command,
-                    position_id,
-                    input.instrument_id,
-                    size_precisions[&input.instrument_id],
-                    currency,
-                    ConvertPositionRole::Input,
-                )?;
-            }
-
-            for output in &effect.outputs {
-                let position_id = convert_position_id(output.instrument_id, command.strategy_id);
-                if let Some(position) = cache.position(&position_id) {
-                    validate_convert_position(
-                        &cache,
-                        &position,
-                        command,
-                        position_id,
-                        output.instrument_id,
-                        size_precisions[&output.instrument_id],
-                        currency,
-                        ConvertPositionRole::Output,
-                    )?;
-                }
-            }
-
-            let account = cache.account(&command.account_id).ok_or_else(|| {
-                format!("conversion account {} was not found", command.account_id)
-            })?;
-
-            if account.balance(Some(currency)).is_none() {
-                return Err(format!(
-                    "conversion account {} has no {currency} balance",
-                    command.account_id,
-                ));
-            }
-            (currency, size_precisions)
+            validate_simulated_convert_effect(&cache, command, scope, &effect)?
         };
-
-        for input in &effect.inputs {
-            let precision = size_precisions[&input.instrument_id];
-            exact_convert_quantity(
-                input.quantity,
-                precision,
-                &format!("conversion input {}", input.instrument_id),
-            )?;
-        }
-
-        for output in &effect.outputs {
-            let precision = size_precisions[&output.instrument_id];
-            exact_convert_quantity(
-                output.quantity,
-                precision,
-                &format!("conversion output {}", output.instrument_id),
-            )?;
-        }
 
         let net_cash = Money::from_decimal_exact(effect.net_cash, currency)
             .map_err(|e| format!("conversion net cash cannot be represented exactly: {e}"))?;
@@ -403,82 +283,4 @@ impl SimulatedExchange {
             self.convert_inventory.borrow_mut().release(operation_id);
         }
     }
-}
-
-#[derive(Clone, Copy)]
-enum ConvertPositionRole {
-    Input,
-    Output,
-}
-
-impl ConvertPositionRole {
-    const fn label(self) -> &'static str {
-        match self {
-            Self::Input => "input",
-            Self::Output => "output",
-        }
-    }
-}
-
-#[expect(
-    clippy::too_many_arguments,
-    reason = "validates one conversion position against its command context"
-)]
-fn validate_convert_position(
-    cache: &Cache,
-    position: &Position,
-    command: &SubmitConvert,
-    position_id: PositionId,
-    instrument_id: InstrumentId,
-    size_precision: u8,
-    currency: Currency,
-    role: ConvertPositionRole,
-) -> Result<(), String> {
-    let label = role.label();
-
-    if position.id != position_id {
-        return Err(format!(
-            "conversion {label} position {} did not match canonical ID {position_id}",
-            position.id,
-        ));
-    }
-
-    if position.trader_id != command.trader_id
-        || position.strategy_id != command.strategy_id
-        || position.account_id != command.account_id
-        || position.instrument_id != instrument_id
-    {
-        return Err(format!(
-            "conversion {label} position {position_id} did not belong to trader {}, strategy {}, account {}",
-            command.trader_id, command.strategy_id, command.account_id,
-        ));
-    }
-
-    if cache.oms_type(&position_id) != Some(OmsType::Netting) {
-        return Err(format!(
-            "conversion {label} position {position_id} was not a NETTING position"
-        ));
-    }
-
-    if position.size_precision != size_precision {
-        return Err(format!(
-            "conversion {label} position {position_id} size precision did not match its instrument"
-        ));
-    }
-
-    if position.settlement_currency != currency {
-        return Err(format!(
-            "conversion {label} position {position_id} settlement currency did not match {currency}"
-        ));
-    }
-
-    if matches!(role, ConvertPositionRole::Output)
-        && (position.side == PositionSide::Short || position.signed_qty < Decimal::ZERO)
-    {
-        return Err(format!(
-            "conversion {label} position {position_id} was short"
-        ));
-    }
-
-    Ok(())
 }

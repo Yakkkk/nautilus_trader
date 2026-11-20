@@ -15,7 +15,7 @@
 
 //! Commands and results for negative-risk asset conversion.
 
-use std::{collections::HashSet, fmt::Display};
+use std::{collections::HashSet, fmt::Display, sync::Weak};
 
 use nautilus_core::{UUID4, UnixNanos};
 use nautilus_model::{
@@ -204,6 +204,9 @@ pub struct ConvertOperationRecord {
     pub historical_gap: bool,
     pub transaction: Option<ConvertTransaction>,
     pub applied: bool,
+    /// Whether simulated cash for this operation has already been posted.
+    #[serde(default)]
+    pub simulated_cash_credited: bool,
     pub unapplied_instruments: Vec<InstrumentId>,
     pub reason: Option<String>,
 }
@@ -225,6 +228,7 @@ impl ConvertOperationRecord {
             historical_gap: false,
             transaction: None,
             applied: false,
+            simulated_cash_credited: false,
             unapplied_instruments: Vec::new(),
             reason: None,
         }
@@ -312,6 +316,36 @@ pub struct ConvertExecutionEvent {
     pub account_id: AccountId,
     pub client_id: ClientId,
     pub outcome: ConvertExecutionOutcome,
+}
+
+/// A simulated conversion outcome scoped to one execution-client run.
+///
+/// The weak lease lets a delayed delivery check whether the producing run is still active
+/// without retaining that run or its state.
+#[derive(Clone, Debug)]
+pub struct SimulatedConvertExecutionEvent {
+    pub lease: Weak<()>,
+    /// Whether the simulation should post its net cash through an account-state event.
+    pub apply_cash: bool,
+    pub event: ConvertExecutionEvent,
+}
+
+impl SimulatedConvertExecutionEvent {
+    /// Returns whether the producing run is still active.
+    #[must_use]
+    pub fn is_current(&self) -> bool {
+        self.lease.upgrade().is_some()
+    }
+}
+
+impl Display for SimulatedConvertExecutionEvent {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "SimulatedConvertExecutionEvent(operation_id={}, client_id={}, account_id={})",
+            self.event.operation_id, self.event.client_id, self.event.account_id
+        )
+    }
 }
 
 /// Separates client execution evidence from the core's local application result.

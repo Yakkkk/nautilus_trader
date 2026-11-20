@@ -17,14 +17,19 @@
 
 use nautilus_common::messages::execution::{
     ConvertExecutionEvent, ConvertExecutionOutcome, ConvertExecutionStatus, ConvertOperationRecord,
-    ConvertResult, ConvertTransaction, QueryConvert, SubmitConvert, VerifiedConvert,
-    has_unique_inputs, normalized_inputs,
+    ConvertResult, ConvertTransaction, QueryConvert, SimulatedConvertExecutionEvent, SubmitConvert,
+    VerifiedConvert, has_unique_inputs, normalized_inputs,
 };
-use nautilus_model::{enums::InstrumentCloseType, instruments::neg_risk::ConvertScope};
+use nautilus_model::{
+    accounts::{Account, AccountAny},
+    enums::InstrumentCloseType,
+    events::AccountState,
+    instruments::neg_risk::ConvertScope,
+};
 
 use super::{
-    AccountId, ClientId, ExecutionClient, ExecutionEngine, HashSet, InstrumentId, UUID4, msgbus,
-    switchboard,
+    AccountId, ClientId, ExecutionClient, ExecutionEngine, HashSet, InstrumentId,
+    MessagingSwitchboard, UUID4, msgbus, switchboard,
 };
 use crate::engine::polymarket_convert::merge_convert_transaction;
 
@@ -181,54 +186,17 @@ impl ExecutionEngine {
     }
 
     pub(super) fn handle_convert_event(&mut self, event: ConvertExecutionEvent) {
-        let record = match self.load_convert_operation(event.operation_id) {
-            Ok(record) => record,
-            Err(e) => {
-                log::error!("Cannot read Convert operation {}: {e}", event.operation_id);
-                return;
-            }
-        };
-
-        let Some(mut record) = record else {
-            log::warn!(
-                "Ignoring conversion evidence for unknown operation {}",
-                event.operation_id,
-            );
+        let Some(record) = self.owned_convert_record(&event) else {
             return;
         };
+        self.handle_convert_event_with_record(event, record);
+    }
 
-        if record.account_id != event.account_id || record.client_id != event.client_id {
-            log::error!(
-                "Ignoring conversion evidence for operation {}: account or client does not match",
-                event.operation_id,
-            );
-            return;
-        }
-
-        if !record.dispatched {
-            log::error!(
-                "Ignoring conversion evidence for operation {}: request was not dispatched",
-                event.operation_id,
-            );
-            return;
-        }
-
-        if record.historical_gap {
-            if let ConvertExecutionOutcome::Confirmed { verified, .. } = event.outcome {
-                let mut verified = *verified;
-                match self.validate_convert_confirmation(&record, &mut verified) {
-                    Ok(()) => record.transaction = Some(verified.transaction),
-                    Err(reason) => log::error!(
-                        "Rejected conversion confirmation for operation {}: {reason}",
-                        record.operation_id,
-                    ),
-                }
-            }
-            self.store_convert_operation(&record);
-            publish_result(&record.result());
-            return;
-        }
-
+    fn handle_convert_event_with_record(
+        &mut self,
+        event: ConvertExecutionEvent,
+        mut record: ConvertOperationRecord,
+    ) {
         match event.outcome {
             ConvertExecutionOutcome::Rejected(reason) => {
                 if !record.applied
@@ -315,6 +283,229 @@ impl ExecutionEngine {
         publish_result(&record.result());
     }
 
+    fn owned_convert_record(
+        &self,
+        event: &ConvertExecutionEvent,
+    ) -> Option<ConvertOperationRecord> {
+        let record = match self.load_convert_operation(event.operation_id) {
+            Ok(Some(record)) => record,
+            Ok(None) => {
+                log::warn!(
+                    "Ignoring conversion evidence for unknown operation {}",
+                    event.operation_id,
+                );
+                return None;
+            }
+            Err(e) => {
+                log::error!("Cannot read Convert operation {}: {e}", event.operation_id);
+                return None;
+            }
+        };
+
+        if record.account_id != event.account_id || record.client_id != event.client_id {
+            log::error!(
+                "Ignoring conversion evidence for operation {}: account or client does not match",
+                event.operation_id,
+            );
+            return None;
+        }
+
+        if !record.dispatched {
+            log::error!(
+                "Ignoring conversion evidence for operation {}: request was not dispatched",
+                event.operation_id,
+            );
+            return None;
+        }
+
+        Some(record)
+    }
+
+    pub(super) fn handle_simulated_convert_event(
+        &mut self,
+        simulation: SimulatedConvertExecutionEvent,
+    ) {
+        if !simulation.is_current() {
+            log::debug!(
+                "Dropping stale simulated Convert outcome {}",
+                simulation.event.operation_id,
+            );
+            return;
+        }
+
+        let apply_cash = simulation.apply_cash;
+        let event = simulation.event;
+        let Some(mut record) = self.owned_convert_record(&event) else {
+            return;
+        };
+
+        if matches!(
+            record.status,
+            Some(ConvertExecutionStatus::Rejected | ConvertExecutionStatus::Failed)
+        ) {
+            publish_result(&record.result());
+            return;
+        }
+
+        let ConvertExecutionEvent {
+            operation_id,
+            account_id,
+            client_id,
+            outcome,
+        } = event;
+
+        let ConvertExecutionOutcome::Confirmed {
+            verified,
+            pending_inputs,
+        } = outcome
+        else {
+            let event = ConvertExecutionEvent {
+                operation_id,
+                account_id,
+                client_id,
+                outcome,
+            };
+            self.handle_convert_event_with_record(event, record);
+            return;
+        };
+        let mut verified = *verified;
+
+        if let Err(reason) = self.validate_convert_confirmation(&record, &mut verified) {
+            log::error!(
+                "Rejected simulated conversion confirmation for operation {operation_id}: {reason}",
+            );
+            self.reject_simulated_convert(
+                record,
+                format!("simulated conversion confirmation failed: {reason}"),
+            );
+            return;
+        }
+
+        if apply_cash && !record.simulated_cash_credited {
+            if let Err(reason) = self.credit_simulated_convert_cash(&verified) {
+                log::error!(
+                    "Cannot apply simulated conversion cash for operation {operation_id}: {reason}",
+                );
+                self.reject_simulated_convert(
+                    record,
+                    format!("cannot apply simulated conversion cash: {reason}"),
+                );
+                return;
+            }
+
+            record.simulated_cash_credited = true;
+            self.store_convert_operation(&record);
+            log::debug!("Applied simulated conversion cash for operation {operation_id}");
+        }
+
+        self.apply_validated_convert_confirmation(&mut record, verified, &pending_inputs);
+        self.store_convert_operation(&record);
+        publish_result(&record.result());
+    }
+
+    fn reject_simulated_convert(&self, mut record: ConvertOperationRecord, reason: String) {
+        if record.status == Some(ConvertExecutionStatus::Confirmed) {
+            publish_result(&record.result());
+            return;
+        }
+
+        if !record.applied {
+            record.status = Some(ConvertExecutionStatus::Rejected);
+            record.reason = Some(reason);
+        }
+        self.store_convert_operation(&record);
+        publish_result(&record.result());
+    }
+
+    fn credit_simulated_convert_cash(&self, verified: &VerifiedConvert) -> Result<(), String> {
+        if verified.net_cash.is_zero() {
+            return Ok(());
+        }
+
+        let state = self.simulated_convert_cash_state(verified)?;
+        let event_id = state.event_id;
+        msgbus::send_account_state(MessagingSwitchboard::portfolio_update_account(), &state);
+
+        let applied = self
+            .cache
+            .borrow()
+            .account(&verified.account_id)
+            .and_then(|account| account.last_event())
+            .is_some_and(|event| event.event_id == event_id);
+        if !applied {
+            return Err("conversion account state was not applied".to_string());
+        }
+
+        Ok(())
+    }
+
+    fn simulated_convert_cash_state(
+        &self,
+        verified: &VerifiedConvert,
+    ) -> Result<AccountState, String> {
+        let net_cash = verified.net_cash;
+        let (balances, margins, account_type, base_currency) = {
+            let cache = self.cache.borrow();
+            let account = cache.account(&verified.account_id).ok_or_else(|| {
+                format!("conversion account {} was not found", verified.account_id)
+            })?;
+            let balance = account
+                .balance(Some(net_cash.currency))
+                .copied()
+                .ok_or_else(|| {
+                    format!(
+                        "conversion account {} has no {} balance",
+                        verified.account_id, net_cash.currency
+                    )
+                })?;
+            let total = balance.total.checked_add(net_cash).ok_or_else(|| {
+                format!("conversion cash total overflow for {}", net_cash.currency)
+            })?;
+            let free = balance.free.checked_add(net_cash).ok_or_else(|| {
+                format!(
+                    "conversion cash free-balance overflow for {}",
+                    net_cash.currency
+                )
+            })?;
+            let mut updated_balance = balance;
+            updated_balance.total = total;
+            updated_balance.free = free;
+
+            let margins = match &*account {
+                AccountAny::Margin(margin_account) => margin_account
+                    .margins
+                    .values()
+                    .chain(margin_account.account_margins.values())
+                    .copied()
+                    .collect(),
+                _ => Vec::new(),
+            };
+
+            let mut balances = account.balances();
+            balances.insert(net_cash.currency, updated_balance);
+
+            (
+                balances.into_values().collect(),
+                margins,
+                account.account_type(),
+                account.base_currency(),
+            )
+        };
+
+        let ts_now = self.clock.borrow().timestamp_ns();
+        Ok(AccountState::new(
+            verified.account_id,
+            account_type,
+            balances,
+            margins,
+            false,
+            UUID4::new(),
+            ts_now,
+            ts_now,
+            base_currency,
+        ))
+    }
+
     fn apply_convert_confirmation(
         &mut self,
         record: &mut ConvertOperationRecord,
@@ -328,6 +519,20 @@ impl ExecutionEngine {
                 "Rejected conversion confirmation for operation {}: {reason}",
                 record.operation_id,
             );
+            return;
+        }
+
+        self.apply_validated_convert_confirmation(record, verified, pending_inputs);
+    }
+
+    fn apply_validated_convert_confirmation(
+        &mut self,
+        record: &mut ConvertOperationRecord,
+        verified: VerifiedConvert,
+        pending_inputs: &[InstrumentId],
+    ) {
+        if record.historical_gap {
+            record.transaction = Some(verified.transaction);
             return;
         }
 
@@ -593,4 +798,135 @@ fn publish_query_rejection(command: &QueryConvert, reason: String) {
 fn publish_result(result: &ConvertResult) {
     let topic = switchboard::get_event_convert_topic(result.strategy_id);
     msgbus::publish_any(topic, result);
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{cell::RefCell, rc::Rc};
+
+    use nautilus_common::{cache::Cache, clock::VirtualClock};
+    use nautilus_core::UnixNanos;
+    use nautilus_model::{
+        accounts::{AccountAny, MarginAccount},
+        enums::AccountType,
+        events::AccountState,
+        identifiers::{StrategyId, TraderId},
+        types::{AccountBalance, Currency, MarginBalance, Money},
+    };
+    use rust_decimal_macros::dec;
+
+    use super::*;
+
+    #[rstest::rstest]
+    fn simulated_cash_state_preserves_other_balances_and_live_margin_maps() {
+        let cache = Rc::new(RefCell::new(Cache::default()));
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
+        let account_id = AccountId::from("POLYMARKET-001");
+        let usd = Currency::USD();
+        let eur = Currency::EUR();
+        let instrument_id = InstrumentId::from("TEST.POLYMARKET");
+        let balances = vec![
+            AccountBalance::new(
+                Money::from("100 USD"),
+                Money::zero(usd),
+                Money::from("100 USD"),
+            ),
+            AccountBalance::new(
+                Money::from("50 EUR"),
+                Money::zero(eur),
+                Money::from("50 EUR"),
+            ),
+        ];
+        let margins = vec![
+            MarginBalance::new_checked(
+                Money::from("5 USD"),
+                Money::from("2 USD"),
+                Some(instrument_id),
+            )
+            .unwrap(),
+            MarginBalance::new_checked(Money::from("7 USD"), Money::from("3 USD"), None).unwrap(),
+        ];
+        let state = AccountState::new(
+            account_id,
+            AccountType::Margin,
+            balances,
+            margins,
+            true,
+            UUID4::new(),
+            UnixNanos::default(),
+            UnixNanos::default(),
+            Some(usd),
+        );
+        let mut margin_account = MarginAccount::new(state, true);
+        let live_instrument_margin = MarginBalance::new_checked(
+            Money::from("9 USD"),
+            Money::from("4 USD"),
+            Some(instrument_id),
+        )
+        .unwrap();
+        let live_account_margin =
+            MarginBalance::new_checked(Money::from("11 USD"), Money::from("6 USD"), None).unwrap();
+        *margin_account.margins.get_mut(&instrument_id).unwrap() = live_instrument_margin;
+        *margin_account.account_margins.get_mut(&usd).unwrap() = live_account_margin;
+        cache
+            .borrow_mut()
+            .add_account(AccountAny::Margin(margin_account))
+            .unwrap();
+
+        let engine = ExecutionEngine::new(clock, Rc::clone(&cache), None);
+        let verified = VerifiedConvert {
+            operation_id: UUID4::new(),
+            trader_id: TraderId::from("TRADER-001"),
+            strategy_id: StrategyId::from("CONVERT-001"),
+            account_id,
+            transaction: ConvertTransaction {
+                wallet: "test-wallet".to_string(),
+                relayer_transaction_id: Some("sim-operation".to_string()),
+                transaction_hash: None,
+                nonce: None,
+                call_summary: None,
+            },
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            affected_instruments: Vec::new(),
+            net_cash: Money::from_decimal_exact(dec!(10), usd).unwrap(),
+            ts_event: UnixNanos::default(),
+        };
+
+        let state = engine.simulated_convert_cash_state(&verified).unwrap();
+        assert_eq!(state.account_id, account_id);
+        assert_eq!(state.account_type, AccountType::Margin);
+        assert_eq!(state.base_currency, Some(usd));
+        assert_eq!(
+            state
+                .balances
+                .iter()
+                .find(|balance| balance.currency == usd)
+                .unwrap()
+                .total,
+            Money::from("110 USD"),
+        );
+        assert_eq!(
+            state
+                .balances
+                .iter()
+                .find(|balance| balance.currency == eur)
+                .unwrap()
+                .total,
+            Money::from("50 EUR"),
+        );
+        assert_ne!(
+            cache
+                .borrow()
+                .account(&account_id)
+                .and_then(|account| account.last_event())
+                .map(|event| event.margins)
+                .unwrap(),
+            state.margins,
+        );
+        assert_eq!(
+            state.margins,
+            vec![live_instrument_margin, live_account_margin],
+        );
+    }
 }

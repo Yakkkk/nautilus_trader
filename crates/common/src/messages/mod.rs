@@ -88,6 +88,8 @@ pub enum ExecutionEvent {
     Account(AccountState),
     /// Evidence returned by an execution client for a conversion.
     Convert(execution::ConvertExecutionEvent),
+    /// A simulated conversion outcome scoped to the producing client run.
+    SimulatedConvert(execution::SimulatedConvertExecutionEvent),
     /// Custom data published on the bus, such as venue account operations.
     Data(CustomData),
 }

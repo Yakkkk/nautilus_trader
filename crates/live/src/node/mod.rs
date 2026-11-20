@@ -103,7 +103,7 @@ use nautilus_common::{
     messages::{
         DataEvent, ExecutionEvent, ExecutionReport, SystemCommand, SystemEvent,
         data::DataCommand,
-        execution::{ConvertExecutionEvent, TradingCommand},
+        execution::{ConvertExecutionEvent, SimulatedConvertExecutionEvent, TradingCommand},
         system::{QueueStateChanged, ReconnectSocket, SocketStateChange, SocketStateChanged},
     },
     msgbus::{self, BusMessage, MessagingSwitchboard},
@@ -2729,7 +2729,10 @@ impl LiveNode {
                     order_ids.push(client_order_id);
                 }
             }
-            ExecutionEvent::Account(_) | ExecutionEvent::Convert(_) | ExecutionEvent::Data(_) => {}
+            ExecutionEvent::Account(_)
+            | ExecutionEvent::Convert(_)
+            | ExecutionEvent::SimulatedConvert(_)
+            | ExecutionEvent::Data(_) => {}
         }
 
         Some(order_ids)
@@ -3393,6 +3396,7 @@ struct PendingEvents {
     exec_reports: Vec<DispatchMessage<ExecutionReport>>,
     order_evts: Vec<DispatchMessage<OrderEventAny>>,
     convert_evts: Vec<DispatchMessage<ConvertExecutionEvent>>,
+    simulated_convert_evts: Vec<DispatchMessage<SimulatedConvertExecutionEvent>>,
     exec_cmds: Vec<DispatchMessage<TradingCommandMessage>>,
 }
 
@@ -3405,6 +3409,7 @@ impl PendingEvents {
             && self.exec_reports.is_empty()
             && self.order_evts.is_empty()
             && self.convert_evts.is_empty()
+            && self.simulated_convert_evts.is_empty()
             && self.exec_cmds.is_empty()
     }
 
@@ -3440,18 +3445,20 @@ impl PendingEvents {
             + self.exec_reports.len()
             + self.order_evts.len()
             + self.convert_evts.len()
+            + self.simulated_convert_evts.len()
             + self.exec_cmds.len();
 
         if total > 0 {
             log::debug!(
                 "Processing {total} events/commands queued during startup \
                  (data_evts={}, data_cmds={}, exec_reports={}, order_evts={}, \
-                 convert_evts={}, exec_cmds={})",
+                 convert_evts={}, simulated_convert_evts={}, exec_cmds={})",
                 self.data_evts.len(),
                 self.data_cmds.len(),
                 self.exec_reports.len(),
                 self.order_evts.len(),
                 self.convert_evts.len(),
+                self.simulated_convert_evts.len(),
                 self.exec_cmds.len()
             );
         }
@@ -3475,6 +3482,12 @@ impl PendingEvents {
 
         for evt in self.convert_evts.drain(..) {
             evt.dispatch(|evt| AsyncRunner::handle_exec_event(ExecutionEvent::Convert(evt)));
+        }
+
+        for evt in self.simulated_convert_evts.drain(..) {
+            evt.dispatch(|evt| {
+                AsyncRunner::handle_exec_event(ExecutionEvent::SimulatedConvert(evt));
+            });
         }
 
         for cmd in self.exec_cmds.drain(..) {
@@ -3506,6 +3519,13 @@ impl PendingEvents {
                 } else {
                     event.into()
                 }),
+                ExecutionEvent::SimulatedConvert(event) => {
+                    self.simulated_convert_evts.push(if rooted {
+                        DispatchMessage::new(event, owner)
+                    } else {
+                        event.into()
+                    });
+                }
                 ExecutionEvent::Report(report) => self.exec_reports.push(if rooted {
                     DispatchMessage::new(report, owner)
                 } else {
