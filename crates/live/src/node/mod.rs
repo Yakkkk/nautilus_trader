@@ -2261,6 +2261,7 @@ impl LiveNode {
                 self.observe_exec_command_before_dispatch(message.command());
             }
         });
+        self.exec_manager.sync_convert_scope_activity();
     }
 
     /// Dispatches a normal-ingress execution event, then commits a direct
@@ -2278,6 +2279,7 @@ impl LiveNode {
         };
 
         AsyncRunner::handle_exec_event(evt);
+        self.exec_manager.sync_convert_scope_activity();
 
         if let Some(fill) = &recent_fill_candidate {
             self.exec_manager.commit_recent_fill_if_applied(fill);
@@ -6601,6 +6603,98 @@ mod tests {
                 .exec_manager
                 .position_contains_fill_report(&fill_report)
         );
+    }
+
+    #[rstest]
+    fn test_position_fill_report_result_defers_after_convert_scope_change_and_preserves_streamed_fill()
+     {
+        use nautilus_common::messages::execution::{
+            ConvertExecutionStatus, ConvertOperationRecord, ConvertTokenAmount, SubmitConvert,
+        };
+
+        let (mut node, venue_report, fill_report) =
+            position_fill_test_fixture("ConvertScopePositionFillNode", Quantity::from("1.0"));
+        let key = (venue_report.instrument_id, venue_report.account_id);
+        let position_result = position_report_result(&node, venue_report);
+        let input = InstrumentId::from("INPUT.POLYMARKET");
+
+        let mut record = ConvertOperationRecord::new(&SubmitConvert {
+            operation_id: UUID4::new(),
+            trader_id: TraderId::from("TESTER-001"),
+            strategy_id: StrategyId::from("CONVERT-001"),
+            account_id: key.1,
+            client_id: ClientId::from("POSITION-FILLS"),
+            inputs: vec![ConvertTokenAmount {
+                instrument_id: input,
+                quantity: Decimal::from(1),
+            }],
+            ts_init: UnixNanos::from(1),
+        });
+        record.affected_instruments = vec![input, key.0];
+        record.dispatched = true;
+        record.status = Some(ConvertExecutionStatus::Unknown);
+        node.kernel
+            .cache
+            .borrow_mut()
+            .add_convert_operation(&record)
+            .unwrap();
+
+        assert!(
+            !node
+                .exec_manager
+                .position_report_check_is_current(&position_result.check, &key)
+        );
+
+        node.handle_position_fill_report_result(PositionFillReportResult {
+            position_result,
+            reports: IndexMap::from([(key, vec![fill_report.clone()])]),
+        });
+
+        {
+            let cache = node.kernel.cache.borrow();
+            let positions = cache.positions_open(None, Some(&key.0), None, Some(&key.1), None);
+            assert_eq!(positions.len(), 1);
+            assert_eq!(positions[0].quantity, Quantity::from("1.0"));
+            assert_eq!(
+                cache.orders_total_count(None, Some(&key.0), None, Some(&key.1), None),
+                1
+            );
+        }
+        assert!(
+            !node
+                .exec_manager
+                .position_contains_fill_report(&fill_report)
+        );
+
+        let client_order_id = fill_report.client_order_id.unwrap();
+        let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt());
+        let order = node
+            .kernel
+            .cache
+            .borrow()
+            .order_owned(&client_order_id)
+            .unwrap();
+        let OrderEventAny::Filled(fill) = OrderFilledTestBuilder::new(&order, &instrument)
+            .trade_id(fill_report.trade_id)
+            .last_qty(fill_report.last_qty)
+            .last_px(fill_report.last_px)
+            .commission(fill_report.commission)
+            .ts_event(fill_report.ts_event)
+            .without_position_id()
+            .build()
+        else {
+            unreachable!()
+        };
+        node.process_reconciliation_events(&[OrderEventAny::Filled(fill)]);
+
+        let cache = node.kernel.cache.borrow();
+        let order = cache.order(&client_order_id).unwrap();
+        let positions = cache.positions_open(None, Some(&key.0), None, Some(&key.1), None);
+        assert_eq!(order.filled_qty(), Quantity::from("2.0"));
+        assert_eq!(order.trade_ids().len(), 2);
+        assert!(order.trade_ids().contains(&&fill_report.trade_id));
+        assert_eq!(positions.len(), 1);
+        assert_eq!(positions[0].quantity, Quantity::from("2.0"));
     }
 
     #[rstest]

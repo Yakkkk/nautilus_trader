@@ -178,6 +178,8 @@ pub struct PositionReportCheck {
     pub client_coverage: IndexMap<InstrumentAccountKey, ReportClientCoverage>,
     /// Activity revisions captured before the query.
     pub activity_revisions: IndexMap<InstrumentAccountKey, u64>,
+    /// Convert scope transition generation captured before the query.
+    pub convert_scope_generation: u64,
 }
 
 /// Fill report request for one instrument, account, and execution client.

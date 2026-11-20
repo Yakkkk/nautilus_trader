@@ -22,7 +22,6 @@ use nautilus_common::messages::execution::{
 };
 use nautilus_model::{
     accounts::{Account, AccountAny},
-    enums::InstrumentCloseType,
     events::AccountState,
     instruments::neg_risk::ConvertScope,
 };
@@ -94,14 +93,26 @@ impl ExecutionEngine {
             return;
         };
 
+        record.dispatched = true;
+        record.reason = Some("conversion dispatch is in progress".to_string());
+        if let Err(e) = self.try_store_convert_operation(&record) {
+            let reason = format!("cannot register conversion dispatch scope: {e}");
+            record.dispatched = false;
+            record.status = Some(ConvertExecutionStatus::Rejected);
+            record.reason = Some(reason.clone());
+            self.store_convert_operation(&record);
+            publish_rejection(command, reason);
+            return;
+        }
+
         match client.submit_convert(command.clone(), scope) {
             Ok(()) => {
-                record.dispatched = true;
                 record.reason =
                     Some("conversion dispatched; awaiting execution evidence".to_string());
                 self.store_convert_operation(&record);
             }
             Err(e) => {
+                record.dispatched = false;
                 record.status = Some(ConvertExecutionStatus::Rejected);
                 record.reason = Some(format!("conversion dispatch failed: {e}"));
                 self.store_convert_operation(&record);
@@ -132,27 +143,21 @@ impl ExecutionEngine {
         };
 
         if record.applied
-            || record.historical_gap
-            || matches!(
-                record.status,
-                Some(ConvertExecutionStatus::Rejected | ConvertExecutionStatus::Failed)
-            )
+            || record.authorization_invalid
+            || (record.status == Some(ConvertExecutionStatus::Rejected)
+                && record.transaction.is_none())
         {
             publish_result(&record.result());
             return;
         }
 
         if record.status == Some(ConvertExecutionStatus::Confirmed)
-            && self.all_affected_expired(&record.affected_instruments)
+            && self
+                .cache
+                .borrow()
+                .convert_scope_is_expired(&record.affected_instruments)
         {
-            if record.unapplied_instruments.is_empty() {
-                record.unapplied_instruments = record.affected_instruments.clone();
-            }
-            record.historical_gap = true;
-            record.reason = Some(
-                "all affected instruments formally expired; accounting retained as a historical gap"
-                    .to_string(),
-            );
+            record.mark_historical_gap();
             self.store_convert_operation(&record);
             publish_result(&record.result());
             return;
@@ -197,90 +202,153 @@ impl ExecutionEngine {
         event: ConvertExecutionEvent,
         mut record: ConvertOperationRecord,
     ) {
-        match event.outcome {
+        if convert_evidence_is_terminal(&record) {
+            log::debug!(
+                "Ignoring contradictory conversion evidence for terminal operation {}",
+                record.operation_id,
+            );
+            publish_result(&record.result());
+            return;
+        }
+
+        self.apply_convert_evidence(&mut record, event.outcome);
+
+        self.store_convert_operation(&record);
+        publish_result(&record.result());
+    }
+
+    fn apply_convert_evidence(
+        &mut self,
+        record: &mut ConvertOperationRecord,
+        outcome: ConvertExecutionOutcome,
+    ) {
+        match outcome {
             ConvertExecutionOutcome::Rejected(reason) => {
-                if !record.applied
-                    && matches!(record.status, None | Some(ConvertExecutionStatus::Unknown))
-                {
+                if !record.applied && record.status.is_none() && record.transaction.is_none() {
                     record.status = Some(ConvertExecutionStatus::Rejected);
-                    record.reason = Some(reason);
+                    if !record.historical_gap {
+                        record.reason = Some(reason);
+                    }
                 }
             }
             ConvertExecutionOutcome::Submitted(transaction) => {
-                if transaction.relayer_transaction_id.is_none() {
-                    if self.can_set_unknown(&record)
-                        && let Ok(merged) = Self::merge_event_transaction(&record, &transaction)
-                    {
-                        record.transaction = Some(merged);
-                        record.status = Some(ConvertExecutionStatus::Unknown);
-                        record.reason =
-                            Some("submitted evidence had no Relayer transaction ID".to_string());
-                    }
-                } else if !record.applied
-                    && matches!(
-                        record.status,
-                        None | Some(
-                            ConvertExecutionStatus::Unknown | ConvertExecutionStatus::Submitted
-                        )
-                    )
-                    && let Some(merged) =
-                        self.merge_event_transaction_or_ignore(&record, &transaction)
-                {
-                    record.transaction = Some(merged);
-                    record.status = Some(ConvertExecutionStatus::Submitted);
-                    record.reason = None;
-                }
+                self.apply_convert_submitted_evidence(record, &transaction);
             }
             ConvertExecutionOutcome::Unknown {
                 transaction,
                 reason,
             } => {
-                if self.can_set_unknown(&record) {
-                    if let Some(transaction) = transaction {
-                        let Some(merged) =
-                            self.merge_event_transaction_or_ignore(&record, &transaction)
-                        else {
-                            self.store_convert_operation(&record);
-                            publish_result(&record.result());
-                            return;
-                        };
-                        record.transaction = Some(merged);
-                    }
-
-                    record.status = Some(ConvertExecutionStatus::Unknown);
-                    record.reason = Some(reason);
-                }
+                self.apply_convert_unknown_evidence(record, transaction, reason);
             }
             ConvertExecutionOutcome::Failed {
                 transaction,
                 reason,
             } => {
-                if !record.applied && record.status != Some(ConvertExecutionStatus::Confirmed) {
-                    if let Some(transaction) = transaction {
-                        let Some(merged) =
-                            self.merge_event_transaction_or_ignore(&record, &transaction)
-                        else {
-                            self.store_convert_operation(&record);
-                            publish_result(&record.result());
-                            return;
-                        };
-                        record.transaction = Some(merged);
-                    }
-
-                    record.status = Some(ConvertExecutionStatus::Failed);
-                    record.reason = Some(reason);
-                }
+                self.apply_convert_failed_evidence(record, transaction, reason, false);
+            }
+            ConvertExecutionOutcome::AuthorizationInvalid {
+                transaction,
+                reason,
+            } => {
+                self.apply_convert_failed_evidence(record, transaction, reason, true);
             }
             ConvertExecutionOutcome::Confirmed {
                 verified,
                 pending_inputs,
             } => {
-                self.apply_convert_confirmation(&mut record, verified, &pending_inputs);
+                self.apply_convert_confirmation(record, verified, &pending_inputs);
+            }
+        }
+    }
+
+    fn apply_convert_submitted_evidence(
+        &self,
+        record: &mut ConvertOperationRecord,
+        transaction: &ConvertTransaction,
+    ) {
+        if record.applied || record.status == Some(ConvertExecutionStatus::Confirmed) {
+            return;
+        }
+
+        let eligible = if transaction.relayer_transaction_id.is_none() {
+            matches!(record.status, None | Some(ConvertExecutionStatus::Unknown))
+        } else {
+            matches!(
+                record.status,
+                None | Some(ConvertExecutionStatus::Unknown | ConvertExecutionStatus::Submitted)
+            )
+        };
+
+        if !eligible {
+            return;
+        }
+
+        let Some(merged) = self.merge_event_transaction_or_ignore(record, transaction) else {
+            return;
+        };
+
+        if transaction.relayer_transaction_id.is_none() {
+            record.status = Some(ConvertExecutionStatus::Unknown);
+            if !record.historical_gap {
+                record.reason =
+                    Some("submitted evidence had no Relayer transaction ID".to_string());
+            }
+        } else {
+            record.status = Some(ConvertExecutionStatus::Submitted);
+            if !record.historical_gap {
+                record.reason = None;
             }
         }
 
-        self.store_convert_operation(&record);
-        publish_result(&record.result());
+        record.transaction = Some(merged);
+    }
+
+    fn apply_convert_unknown_evidence(
+        &self,
+        record: &mut ConvertOperationRecord,
+        transaction: Option<ConvertTransaction>,
+        reason: String,
+    ) {
+        if !self.can_set_unknown(record) {
+            return;
+        }
+
+        if let Some(transaction) = transaction {
+            let Some(merged) = self.merge_event_transaction_or_ignore(record, &transaction) else {
+                return;
+            };
+            record.transaction = Some(merged);
+        }
+
+        record.status = Some(ConvertExecutionStatus::Unknown);
+        if !record.historical_gap {
+            record.reason = Some(reason);
+        }
+    }
+
+    fn apply_convert_failed_evidence(
+        &self,
+        record: &mut ConvertOperationRecord,
+        transaction: Option<ConvertTransaction>,
+        reason: String,
+        authorization_invalid: bool,
+    ) {
+        if record.applied || record.status == Some(ConvertExecutionStatus::Confirmed) {
+            return;
+        }
+
+        if let Some(transaction) = transaction {
+            let Some(merged) = self.merge_event_transaction_or_ignore(record, &transaction) else {
+                return;
+            };
+            record.transaction = Some(merged);
+        }
+
+        record.status = Some(ConvertExecutionStatus::Failed);
+        record.authorization_invalid |= authorization_invalid;
+        if !record.historical_gap {
+            record.reason = Some(reason);
+        }
     }
 
     fn owned_convert_record(
@@ -531,27 +599,20 @@ impl ExecutionEngine {
         verified: VerifiedConvert,
         pending_inputs: &[InstrumentId],
     ) {
-        if record.historical_gap {
-            record.transaction = Some(verified.transaction);
-            return;
-        }
-
-        if record.applied {
+        if record.historical_gap || record.applied {
             record.status = Some(ConvertExecutionStatus::Confirmed);
             record.transaction = Some(verified.transaction);
             return;
         }
 
-        if self.all_affected_expired(&record.affected_instruments) {
+        if self
+            .cache
+            .borrow()
+            .convert_scope_is_expired(&record.affected_instruments)
+        {
             record.status = Some(ConvertExecutionStatus::Confirmed);
             record.transaction = Some(verified.transaction);
-            record.applied = false;
-            record.historical_gap = true;
-            record.unapplied_instruments = record.affected_instruments.clone();
-            record.reason = Some(
-                "all affected instruments formally expired; accounting retained as a historical gap"
-                    .to_string(),
-            );
+            record.mark_historical_gap();
             return;
         }
 
@@ -697,16 +758,6 @@ impl ExecutionEngine {
         })
     }
 
-    fn all_affected_expired(&self, affected: &[InstrumentId]) -> bool {
-        !affected.is_empty()
-            && affected.iter().all(|instrument_id| {
-                self.cache
-                    .borrow()
-                    .instrument_close(instrument_id)
-                    .is_some_and(|close| close.close_type == InstrumentCloseType::ContractExpired)
-            })
-    }
-
     fn explicit_convert_client(
         &self,
         client_id: ClientId,
@@ -757,13 +808,22 @@ impl ExecutionEngine {
     }
 
     fn store_convert_operation(&self, record: &ConvertOperationRecord) {
-        if let Err(e) = self.cache.borrow_mut().add_convert_operation(record) {
+        if let Err(e) = self.try_store_convert_operation(record) {
             log::error!(
                 "Cannot retain Convert operation {}: {e}",
                 record.operation_id,
             );
         }
     }
+
+    fn try_store_convert_operation(&self, record: &ConvertOperationRecord) -> anyhow::Result<()> {
+        self.cache.borrow_mut().add_convert_operation(record)
+    }
+}
+
+fn convert_evidence_is_terminal(record: &ConvertOperationRecord) -> bool {
+    record.authorization_invalid
+        || (record.status == Some(ConvertExecutionStatus::Rejected) && record.transaction.is_none())
 }
 
 fn sorted_instruments(instruments: &[InstrumentId]) -> Vec<InstrumentId> {

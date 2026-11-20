@@ -37,9 +37,11 @@ use nautilus_common::{
     messages::{
         ExecutionReport,
         execution::{
-            BatchCancelOrders, CancelAllOrders, CancelOrder, GenerateFillReports,
+            BatchCancelOrders, CancelAllOrders, CancelOrder, ConvertExecutionStatus,
+            ConvertOperationRecord, ConvertTokenAmount, GenerateFillReports,
             GenerateOrderStatusReport, GenerateOrderStatusReports, GeneratePositionStatusReports,
-            ModifyOrder, QueryAccount, QueryOrder, SubmitOrder, SubmitOrderList, TradingCommand,
+            ModifyOrder, QueryAccount, QueryOrder, SubmitConvert, SubmitOrder, SubmitOrderList,
+            TradingCommand,
         },
     },
     msgbus::{
@@ -67,9 +69,10 @@ use nautilus_live::{
 };
 use nautilus_model::{
     accounts::{AccountAny, MarginAccount},
+    data::InstrumentClose,
     enums::{
-        AccountType, AvgPxReconciliation, ContingencyType, LiquiditySide, OmsType, OrderSide,
-        OrderStatus, OrderType, PositionSide, TimeInForce, TriggerType,
+        AccountType, AvgPxReconciliation, ContingencyType, InstrumentCloseType, LiquiditySide,
+        OmsType, OrderSide, OrderStatus, OrderType, PositionSide, TimeInForce, TriggerType,
     },
     events::{
         OrderEventAny, OrderFilled, PositionEvent,
@@ -399,6 +402,30 @@ fn create_mass_status(
     mass_status.add_order_reports(order_reports);
     mass_status.add_fill_reports(fill_reports);
     mass_status
+}
+
+fn create_convert_scope_record(
+    account_id: AccountId,
+    output: InstrumentId,
+    status: ConvertExecutionStatus,
+) -> ConvertOperationRecord {
+    let input = InstrumentId::from("CONVERT-INPUT.POLYMARKET");
+    let mut record = ConvertOperationRecord::new(&SubmitConvert {
+        operation_id: UUID4::new(),
+        trader_id: TraderId::from("TESTER-001"),
+        strategy_id: StrategyId::from("CONVERT-001"),
+        account_id,
+        client_id: test_client_id(),
+        inputs: vec![ConvertTokenAmount {
+            instrument_id: input,
+            quantity: dec!(25),
+        }],
+        ts_init: UnixNanos::from(1),
+    });
+    record.affected_instruments = vec![input, output];
+    record.dispatched = true;
+    record.status = Some(status);
+    record
 }
 
 struct ManagerLogCapture {
@@ -1012,6 +1039,226 @@ async fn test_reconcile_mass_status_with_empty_reports() {
         .reconcile_execution_mass_status(&mass_status, &ctx.exec_engine);
 
     assert!(result.events.is_empty());
+}
+
+#[tokio::test]
+async fn test_reconcile_mass_status_defers_active_convert_scope_and_release_grace() {
+    let mut ctx = TestContext::new();
+    let output = test_instrument_id();
+    ctx.add_instrument(test_instrument());
+
+    let position_report = PositionStatusReport::new(
+        test_account_id(),
+        output,
+        PositionSide::Long,
+        Quantity::from("25"),
+        UnixNanos::from(1),
+        UnixNanos::from(1),
+        None,
+        None,
+        Some(dec!(0.50)),
+    );
+    let mut mass_status = ExecutionMassStatus::new(
+        test_client_id(),
+        test_account_id(),
+        test_venue(),
+        UnixNanos::default(),
+        Some(UUID4::new()),
+    );
+    let venue_order_id = VenueOrderId::from("V-REAL-CONVERT");
+    let order_report = create_order_report(
+        None,
+        venue_order_id,
+        output,
+        OrderStatus::Filled,
+        Quantity::from("10.0"),
+        Quantity::from("10.0"),
+    )
+    .with_price(Price::from("0.50"));
+    let fill_report = FillReport::new(
+        test_account_id(),
+        output,
+        venue_order_id,
+        TradeId::from("T-REAL-CONVERT"),
+        OrderSide::Buy,
+        Quantity::from("10.0"),
+        Price::from("0.50"),
+        Money::from("0.05 USDT"),
+        LiquiditySide::Maker,
+        None,
+        None,
+        UnixNanos::from(1),
+        UnixNanos::from(1),
+        None,
+    );
+    mass_status.add_order_reports(vec![order_report]);
+    mass_status.add_fill_reports(vec![fill_report]);
+    mass_status.add_position_reports(vec![position_report]);
+
+    let mut record =
+        create_convert_scope_record(test_account_id(), output, ConvertExecutionStatus::Unknown);
+    ctx.cache
+        .borrow_mut()
+        .add_convert_operation(&record)
+        .unwrap();
+
+    let active = ctx
+        .manager
+        .reconcile_execution_mass_status(&mass_status, &ctx.exec_engine);
+    assert!(active.events.is_empty());
+    assert!(active.external_orders.is_empty());
+    assert_eq!(active.unresolved_positions.len(), 1);
+    assert!(active.unresolved_positions[0].contains("Convert scope"));
+    assert!(
+        ctx.cache
+            .borrow()
+            .positions_open(None, Some(&output), None, Some(&test_account_id()), None)
+            .is_empty()
+    );
+
+    record.status = Some(ConvertExecutionStatus::Rejected);
+    ctx.cache
+        .borrow_mut()
+        .add_convert_operation(&record)
+        .unwrap();
+
+    let released = ctx
+        .manager
+        .reconcile_execution_mass_status(&mass_status, &ctx.exec_engine);
+    assert!(released.events.iter().any(|event| {
+        matches!(
+            event,
+            OrderEventAny::Filled(fill)
+                if fill.instrument_id == output && fill.trade_id == TradeId::from("T-REAL-CONVERT")
+        )
+    }));
+    assert!(released.unresolved_positions.is_empty());
+    let cache = ctx.cache.borrow();
+    let positions = cache.positions_open(None, Some(&output), None, Some(&test_account_id()), None);
+    assert_eq!(positions.len(), 1);
+    assert_eq!(positions[0].quantity, Quantity::from("10"));
+}
+
+#[tokio::test]
+async fn test_reconcile_mass_status_does_not_defer_for_ordinary_recent_activity() {
+    let mut ctx = TestContext::with_config(ExecutionManagerConfig {
+        position_check_threshold_ns: DurationNanos::from_secs(5),
+        ..Default::default()
+    });
+    let instrument_id = test_instrument_id();
+    ctx.add_instrument(test_instrument());
+
+    let mut mass_status = ExecutionMassStatus::new(
+        test_client_id(),
+        test_account_id(),
+        test_venue(),
+        UnixNanos::default(),
+        Some(UUID4::new()),
+    );
+    mass_status.add_position_reports(vec![PositionStatusReport::new(
+        test_account_id(),
+        instrument_id,
+        PositionSide::Long,
+        Quantity::from("5.0"),
+        UnixNanos::from(1_000_000),
+        UnixNanos::from(1_000_000),
+        None,
+        None,
+        Some(dec!(3000.50)),
+    )]);
+
+    ctx.manager
+        .record_position_activity(instrument_id, test_account_id());
+    let result = ctx
+        .manager
+        .reconcile_execution_mass_status(&mass_status, &ctx.exec_engine);
+
+    assert_eq!(result.events.len(), 2);
+    assert!(matches!(result.events[0], OrderEventAny::Accepted(_)));
+    assert!(matches!(result.events[1], OrderEventAny::Filled(_)));
+    assert!(result.unresolved_positions.is_empty());
+    let cache = ctx.cache.borrow();
+    let positions = cache.positions_open(
+        None,
+        Some(&instrument_id),
+        None,
+        Some(&test_account_id()),
+        None,
+    );
+    assert_eq!(positions.len(), 1);
+    assert_eq!(positions[0].quantity, Quantity::from("5"));
+}
+
+#[tokio::test]
+async fn test_reconcile_mass_status_allows_complete_historical_gap_to_progress() {
+    let mut ctx = TestContext::new();
+    let output = test_instrument_id();
+    ctx.add_instrument(test_instrument());
+
+    let record =
+        create_convert_scope_record(test_account_id(), output, ConvertExecutionStatus::Unknown);
+    ctx.cache
+        .borrow_mut()
+        .add_convert_operation(&record)
+        .unwrap();
+
+    for instrument_id in &record.affected_instruments {
+        ctx.cache
+            .borrow_mut()
+            .add_instrument_close(InstrumentClose::new(
+                *instrument_id,
+                Price::from("0.000"),
+                InstrumentCloseType::ContractExpired,
+                UnixNanos::from(2),
+                UnixNanos::from(2),
+            ))
+            .unwrap();
+    }
+
+    let retained = ctx
+        .cache
+        .borrow()
+        .load_convert_operation(record.operation_id)
+        .unwrap()
+        .unwrap();
+    assert!(retained.historical_gap);
+    assert!(
+        !ctx.cache
+            .borrow()
+            .convert_scope_account_is_active(test_account_id())
+    );
+
+    let position_report = PositionStatusReport::new(
+        test_account_id(),
+        output,
+        PositionSide::Long,
+        Quantity::from("25"),
+        UnixNanos::from(1),
+        UnixNanos::from(1),
+        None,
+        None,
+        Some(dec!(0.50)),
+    );
+    let mut mass_status = ExecutionMassStatus::new(
+        test_client_id(),
+        test_account_id(),
+        test_venue(),
+        UnixNanos::default(),
+        Some(UUID4::new()),
+    );
+    mass_status.add_position_reports(vec![position_report]);
+
+    let result = ctx
+        .manager
+        .reconcile_execution_mass_status(&mass_status, &ctx.exec_engine);
+    assert!(result.events.is_empty());
+    assert!(result.unresolved_positions.is_empty());
+    assert!(
+        ctx.cache
+            .borrow()
+            .positions_open(None, Some(&output), None, Some(&test_account_id()), None)
+            .is_empty()
+    );
 }
 
 #[tokio::test]

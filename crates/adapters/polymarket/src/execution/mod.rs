@@ -563,12 +563,13 @@ impl ExecutionClient for PolymarketExecutionClient {
         &self,
         cmd: &GeneratePositionStatusReports,
     ) -> anyhow::Result<Vec<PositionStatusReport>> {
+        let convert_scope = self.prepare_convert_position_report_scope(cmd.instrument_id)?;
         gate_report(
             || {
                 self.settlement
                     .ensure_resolved(cmd.instrument_id, "position status reports")
             },
-            self.generate_position_status_reports_impl(cmd),
+            self.generate_position_status_reports_impl(cmd, convert_scope),
         )
         .await
     }

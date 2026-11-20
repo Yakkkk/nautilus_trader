@@ -131,9 +131,11 @@ pub struct VerifiedConvert {
     pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.trading")
 )]
 pub enum ConvertExecutionStatus {
+    /// Refused before any wallet authorization was dispatched.
     Rejected = 1,
     Submitted = 2,
     Unknown = 3,
+    /// A provider attempt failed; authorization validity is not established.
     Failed = 4,
     Confirmed = 5,
 }
@@ -197,11 +199,14 @@ pub struct ConvertOperationRecord {
     pub affected_instruments: Vec<InstrumentId>,
     /// The execution evidence, or `None` while admission or dispatch is pending.
     pub status: Option<ConvertExecutionStatus>,
-    /// Whether the admitted request has been handed to its execution client.
+    /// Whether the admitted request has been authorized for, or handed to, its execution client.
     pub dispatched: bool,
     /// Whether the complete scope formally settled before accounting could be applied.
     #[serde(default)]
     pub historical_gap: bool,
+    /// Whether the original wallet authorization is proven unable to execute the conversion.
+    #[serde(default)]
+    pub authorization_invalid: bool,
     pub transaction: Option<ConvertTransaction>,
     pub applied: bool,
     /// Whether simulated cash for this operation has already been posted.
@@ -226,6 +231,7 @@ impl ConvertOperationRecord {
             status: None,
             dispatched: false,
             historical_gap: false,
+            authorization_invalid: false,
             transaction: None,
             applied: false,
             simulated_cash_credited: false,
@@ -269,6 +275,18 @@ impl ConvertOperationRecord {
             && self.strategy_id == command.strategy_id
             && self.account_id == command.account_id
             && self.client_id == command.client_id
+    }
+
+    /// Retains the accounting gap without changing the external execution evidence.
+    pub fn mark_historical_gap(&mut self) {
+        if self.unapplied_instruments.is_empty() {
+            self.unapplied_instruments = self.affected_instruments.clone();
+        }
+        self.historical_gap = true;
+        self.reason = Some(
+            "all affected instruments formally expired; accounting retained as a historical gap"
+                .to_string(),
+        );
     }
 
     /// Returns the result conveyed to the strategy.
@@ -351,6 +369,7 @@ impl Display for SimulatedConvertExecutionEvent {
 /// Separates client execution evidence from the core's local application result.
 #[derive(Clone, Debug)]
 pub enum ConvertExecutionOutcome {
+    /// The request was refused before any wallet authorization was dispatched.
     Rejected(String),
     Submitted(ConvertTransaction),
     Unknown {
@@ -358,6 +377,11 @@ pub enum ConvertExecutionOutcome {
         reason: String,
     },
     Failed {
+        transaction: Option<ConvertTransaction>,
+        reason: String,
+    },
+    /// The original authorization is proven unable to execute and no conversion succeeded.
+    AuthorizationInvalid {
         transaction: Option<ConvertTransaction>,
         reason: String,
     },

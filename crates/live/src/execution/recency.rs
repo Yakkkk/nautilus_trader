@@ -43,6 +43,12 @@ where
         self.inner.insert(key, dst::time::Instant::now());
     }
 
+    pub(crate) fn mark_at(&mut self, key: K, at: dst::time::Instant) {
+        if self.inner.get(&key).is_none_or(|current| *current < at) {
+            self.inner.insert(key, at);
+        }
+    }
+
     #[must_use]
     pub(crate) fn contains_key(&self, key: &K) -> bool {
         self.inner.contains_key(key)
@@ -165,5 +171,16 @@ mod tests {
         recency.inner.insert("A", now + Duration::from_secs(1));
 
         assert!(recency.within_at(&"A", now, Duration::from_millis(1)));
+    }
+
+    #[rstest]
+    fn test_mark_at_preserves_a_newer_existing_mark() {
+        let mut recency = RecencyMap::default();
+        let now = dst::time::Instant::now();
+
+        recency.mark_at("A", now);
+        recency.mark_at("A", now - Duration::from_secs(1));
+
+        assert_eq!(recency.last_marked(&"A"), Some(now));
     }
 }

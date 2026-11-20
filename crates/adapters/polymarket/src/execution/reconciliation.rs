@@ -1243,8 +1243,8 @@ fn build_position_report_from_reportable_position(
     position: &DataApiPosition,
     account_id: AccountId,
     ts_init: UnixNanos,
+    instrument_id: InstrumentId,
 ) -> Option<PositionStatusReport> {
-    let instrument_id = instrument_id_from_market_token(&position.condition_id, &position.asset);
     let quantity = match Quantity::from_decimal_dp(position.size, USDC_DECIMALS as u8) {
         Ok(quantity) => quantity,
         Err(e) => {
@@ -1328,6 +1328,12 @@ impl ResolvedBalanceScope {
     }
 }
 
+#[derive(Debug)]
+pub(crate) struct ReconciliationPositionReports {
+    pub reports: Vec<(PositionStatusReport, bool)>,
+    pub excluded: Vec<(InstrumentId, bool)>,
+}
+
 pub(crate) fn build_reconciliation_position_reports(
     positions: &[DataApiPosition],
     account_id: AccountId,
@@ -1336,12 +1342,13 @@ pub(crate) fn build_reconciliation_position_reports(
     instrument_filter: Option<InstrumentId>,
     load_ids: Option<&[InstrumentId]>,
     resolved_balances: &ResolvedBalanceScope,
-) -> anyhow::Result<Vec<PositionStatusReport>> {
+) -> anyhow::Result<ReconciliationPositionReports> {
     let collection_load_ids = instrument_filter.is_none().then_some(load_ids).flatten();
     let mut reports = Vec::with_capacity(positions.len());
+    let mut excluded = Vec::new();
 
     for position in positions {
-        if let Some(report) = build_reconciliation_position_report(
+        if let Some(entry) = build_reconciliation_position_report(
             position,
             account_id,
             ts_init,
@@ -1350,11 +1357,23 @@ pub(crate) fn build_reconciliation_position_reports(
             collection_load_ids,
             resolved_balances,
         )? {
-            reports.push(report);
+            match entry {
+                PositionReportEntry::Report(report, redeemable) => {
+                    reports.push((report, redeemable));
+                }
+                PositionReportEntry::Excluded(instrument_id, redeemable) => {
+                    excluded.push((instrument_id, redeemable));
+                }
+            }
         }
     }
 
-    Ok(reports)
+    Ok(ReconciliationPositionReports { reports, excluded })
+}
+
+enum PositionReportEntry {
+    Report(PositionStatusReport, bool),
+    Excluded(InstrumentId, bool),
 }
 
 fn build_reconciliation_position_report(
@@ -1365,13 +1384,18 @@ fn build_reconciliation_position_report(
     instrument_filter: Option<InstrumentId>,
     collection_load_ids: Option<&[InstrumentId]>,
     resolved_balances: &ResolvedBalanceScope,
-) -> anyhow::Result<Option<PositionStatusReport>> {
+) -> anyhow::Result<Option<PositionReportEntry>> {
     let instrument_id = instrument_id_from_market_token(&position.condition_id, &position.asset);
 
-    if !position_in_report_scope(position, instrument_filter, collection_load_ids)
-        || resolved_balances.excludes(position, instrument_id)
-    {
+    if !position_in_report_scope(position, instrument_filter, collection_load_ids) {
         return Ok(None);
+    }
+
+    if resolved_balances.excludes(position, instrument_id) {
+        return Ok(Some(PositionReportEntry::Excluded(
+            instrument_id,
+            position.redeemable,
+        )));
     }
 
     let instrument = instruments
@@ -1394,8 +1418,12 @@ fn build_reconciliation_position_report(
     )?;
 
     Ok(build_position_report_from_reportable_position(
-        position, account_id, ts_init,
-    ))
+        position,
+        account_id,
+        ts_init,
+        instrument.id(),
+    )
+    .map(|report| PositionReportEntry::Report(report, position.redeemable)))
 }
 
 /// Full reconciliation mass status generation.
@@ -1415,6 +1443,7 @@ pub(crate) async fn generate_mass_status(
     let client_id = core.client_id;
     let venue = core.venue;
     let ts_init = ctx.clock.get_time_ns();
+    let convert_scope = core.prepare_convert_position_report(None)?;
     let lookback_start = lookback_mins
         .map(DurationNanos::try_from_mins)
         .transpose()?
@@ -1501,10 +1530,15 @@ pub(crate) async fn generate_mass_status(
         );
     }
 
+    anyhow::ensure!(
+        core.convert_position_report_is_current(&convert_scope),
+        "Polymarket Convert scope changed or remained unresolved during mass status collection"
+    );
+
     let mut position_reports = if ctx.signer_type == PolymarketSignerType::Session {
         Vec::new()
     } else {
-        build_reconciliation_position_reports(
+        let collected = build_reconciliation_position_reports(
             &positions,
             ctx.account_id,
             ts_init,
@@ -1512,7 +1546,12 @@ pub(crate) async fn generate_mass_status(
             None,
             load_ids,
             resolved_balances,
-        )?
+        )?;
+        collected
+            .reports
+            .into_iter()
+            .map(|(report, _)| report)
+            .collect()
     };
 
     {
@@ -2364,7 +2403,10 @@ fn instrument_in_load_ids_scope(
     }
 }
 
-fn polymarket_instrument_ids_equivalent(left: InstrumentId, right: InstrumentId) -> bool {
+pub(super) fn polymarket_instrument_ids_equivalent(
+    left: InstrumentId,
+    right: InstrumentId,
+) -> bool {
     if left == right {
         return true;
     }
@@ -2381,6 +2423,20 @@ fn polymarket_instrument_ids_equivalent(left: InstrumentId, right: InstrumentId)
     };
 
     left_condition.eq_ignore_ascii_case(right_condition) && left_token == right_token
+}
+
+pub(super) fn resolve_polymarket_instrument_id(
+    instrument_id: InstrumentId,
+    instruments: &AtomicMap<Ustr, InstrumentAny>,
+) -> InstrumentId {
+    let Some((_, token_id)) = instrument_id.symbol.as_str().rsplit_once('-') else {
+        return instrument_id;
+    };
+
+    instruments
+        .get_cloned(&Ustr::from(token_id))
+        .filter(|instrument| polymarket_instrument_ids_equivalent(instrument.id(), instrument_id))
+        .map_or(instrument_id, |instrument| instrument.id())
 }
 
 fn unmapped_in_scope_message(
@@ -3133,8 +3189,13 @@ mod tests {
         .unwrap();
         let ts = UnixNanos::from(123_456_789u64);
         let account_id = AccountId::from("POLYMARKET-001");
-        let report =
-            build_position_report_from_reportable_position(&position, account_id, ts).unwrap();
+        let report = build_position_report_from_reportable_position(
+            &position,
+            account_id,
+            ts,
+            instrument_id_from_market_token(&position.condition_id, &position.asset),
+        )
+        .unwrap();
         assert_eq!(report.account_id, account_id);
         assert_eq!(
             report.instrument_id,
@@ -3166,6 +3227,10 @@ mod tests {
             &positions[position_index],
             AccountId::from("POLYMARKET-001"),
             UnixNanos::from(1_000_000_000u64),
+            instrument_id_from_market_token(
+                &positions[position_index].condition_id,
+                &positions[position_index].asset,
+            ),
         )
         .expect("fixture position is reportable");
 
@@ -3184,6 +3249,7 @@ mod tests {
             &position,
             AccountId::from("POLYMARKET-001"),
             UnixNanos::from(1_000_000_000u64),
+            instrument_id_from_market_token(&position.condition_id, &position.asset),
         )
         .expect("fixture position is reportable");
 
@@ -3240,7 +3306,11 @@ mod tests {
         )
         .unwrap();
 
-        let reported_ids: Vec<_> = reports.iter().map(|report| report.instrument_id).collect();
+        let reported_ids: Vec<_> = reports
+            .reports
+            .iter()
+            .map(|(report, _)| report.instrument_id)
+            .collect();
 
         let expected_ids = if expected_reported {
             vec![instrument_id]
@@ -3249,6 +3319,29 @@ mod tests {
         };
 
         assert_eq!(reported_ids, expected_ids);
+    }
+
+    #[rstest]
+    fn test_reconciliation_position_report_uses_registered_identity_and_redeemable() {
+        let instrument_id = test_instrument().id();
+        let mut position = data_api_position(TEST_TOKEN_ID, true);
+        position.condition_id = TEST_CONDITION_ID.to_ascii_uppercase();
+
+        let collected = build_reconciliation_position_reports(
+            &[position],
+            AccountId::from("POLY-001"),
+            UnixNanos::from(1),
+            &test_instruments(),
+            None,
+            None,
+            &resolved_balance_scope(None, Some(instrument_id)),
+        )
+        .unwrap();
+
+        assert_eq!(collected.reports.len(), 1);
+        assert_eq!(collected.reports[0].0.instrument_id, instrument_id);
+        assert!(collected.reports[0].1);
+        assert!(collected.excluded.is_empty());
     }
 
     #[rstest]
@@ -3304,7 +3397,7 @@ mod tests {
                 let error = result.unwrap_err().to_string();
                 assert!(error.contains(expected), "unexpected error: {error}");
             }
-            None => assert!(result.unwrap().is_empty()),
+            None => assert!(result.unwrap().reports.is_empty()),
         }
     }
 

@@ -121,10 +121,96 @@ pub use view::CacheView; // Re-export
 
 #[cfg(feature = "defi")]
 use crate::defi::cache::IntegrityError;
+#[cfg(feature = "live")]
+use crate::live::dst;
 use crate::{
-    messages::execution::ConvertOperationRecord,
+    messages::execution::{ConvertExecutionStatus, ConvertOperationRecord},
     xrate::{get_exchange_rate, get_exchange_rate_with_alternates},
 };
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ConvertOperationScope {
+    account_id: AccountId,
+    client_id: ClientId,
+    instruments: Vec<InstrumentId>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ConvertScopeTouch {
+    generation: u64,
+    #[cfg(feature = "live")]
+    at: dst::time::Instant,
+}
+
+impl ConvertScopeTouch {
+    #[cfg(feature = "live")]
+    fn new(generation: u64) -> Self {
+        Self {
+            generation,
+            at: dst::time::Instant::now(),
+        }
+    }
+
+    #[cfg(not(feature = "live"))]
+    const fn new(generation: u64) -> Self {
+        Self { generation }
+    }
+}
+
+/// The monotonic Convert transition generation observed at a position-report request start.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConvertScopeCheck {
+    account_id: AccountId,
+    instrument_id: Option<InstrumentId>,
+    generation: u64,
+}
+
+fn convert_record_holds_scope(record: &ConvertOperationRecord) -> bool {
+    record.dispatched
+        && !record.applied
+        && !record.historical_gap
+        && !record.authorization_invalid
+        && !convert_rejection_is_pre_sign(record)
+}
+
+fn convert_record_is_terminal(record: &ConvertOperationRecord) -> bool {
+    record.applied
+        || record.authorization_invalid
+        || record.historical_gap
+        || convert_rejection_is_pre_sign(record)
+}
+
+fn convert_rejection_is_pre_sign(record: &ConvertOperationRecord) -> bool {
+    matches!(record.status, Some(ConvertExecutionStatus::Rejected)) && record.transaction.is_none()
+}
+
+fn desired_convert_scope(
+    record: &ConvertOperationRecord,
+    normalized: &[InstrumentId],
+) -> anyhow::Result<Option<ConvertOperationScope>> {
+    if !convert_record_holds_scope(record) {
+        return Ok(None);
+    }
+
+    anyhow::ensure!(!normalized.is_empty(), "active Convert scope was empty");
+    Ok(Some(ConvertOperationScope {
+        account_id: record.account_id,
+        client_id: record.client_id,
+        instruments: normalized.to_vec(),
+    }))
+}
+
+fn normalized_convert_instruments(
+    affected_instruments: &[InstrumentId],
+) -> anyhow::Result<Vec<InstrumentId>> {
+    let mut instruments = affected_instruments.to_vec();
+    instruments.sort_unstable();
+    anyhow::ensure!(
+        instruments.windows(2).all(|pair| pair[0] != pair[1]),
+        "Convert operation scope contained duplicate instruments",
+    );
+    Ok(instruments)
+}
 
 /// A common in-memory `Cache` for market and execution related data.
 #[cfg_attr(
@@ -139,6 +225,10 @@ pub struct Cache {
     currencies: AHashMap<Ustr, Currency>,
     instruments: AHashMap<InstrumentId, InstrumentAny>,
     instrument_closes: AHashMap<InstrumentId, InstrumentClose>,
+    convert_operation_scopes: AHashMap<UUID4, ConvertOperationScope>,
+    convert_scope_generation: u64,
+    convert_scope_account_touches: AHashMap<AccountId, ConvertScopeTouch>,
+    convert_scope_instrument_touches: AHashMap<(InstrumentId, AccountId), ConvertScopeTouch>,
     convert_events: AHashMap<[u8; 32], CtfNegRiskEvent>,
     convert_event_index: AHashMap<InstrumentId, [u8; 32]>,
     synthetics: AHashMap<InstrumentId, SyntheticInstrument>,
@@ -192,6 +282,16 @@ impl Debug for Cache {
             .field("funding_rates", &self.funding_rates)
             .field("instrument_statuses", &self.instrument_statuses)
             .field("instrument_closes", &self.instrument_closes)
+            .field("convert_operation_scopes", &self.convert_operation_scopes)
+            .field("convert_scope_generation", &self.convert_scope_generation)
+            .field(
+                "convert_scope_account_touches",
+                &self.convert_scope_account_touches,
+            )
+            .field(
+                "convert_scope_instrument_touches",
+                &self.convert_scope_instrument_touches,
+            )
             .field("bars", &self.bars)
             .field("custom_data", &self.custom_data)
             .field("greeks", &self.greeks)
@@ -257,6 +357,10 @@ impl Cache {
             currencies: AHashMap::new(),
             instruments: AHashMap::new(),
             instrument_closes: AHashMap::new(),
+            convert_operation_scopes: AHashMap::new(),
+            convert_scope_generation: 0,
+            convert_scope_account_touches: AHashMap::new(),
+            convert_scope_instrument_touches: AHashMap::new(),
             convert_events: AHashMap::new(),
             convert_event_index: AHashMap::new(),
             synthetics: AHashMap::new(),
@@ -2408,6 +2512,10 @@ impl Cache {
         self.funding_rates.clear();
         self.instrument_statuses.clear();
         self.instrument_closes.clear();
+        self.convert_operation_scopes.clear();
+        self.convert_scope_generation = 0;
+        self.convert_scope_account_touches.clear();
+        self.convert_scope_instrument_touches.clear();
         self.bars.clear();
         self.accounts.clear();
         self.orders.clear();
@@ -2565,12 +2673,186 @@ impl Cache {
         Ok(Some(record))
     }
 
+    /// Returns whether every affected instrument has a formal contract-expiration close.
+    #[must_use]
+    pub fn convert_scope_is_expired(&self, affected_instruments: &[InstrumentId]) -> bool {
+        !affected_instruments.is_empty()
+            && affected_instruments.iter().all(|instrument_id| {
+                self.instrument_close(instrument_id)
+                    .is_some_and(|close| close.close_type == InstrumentCloseType::ContractExpired)
+            })
+    }
+
+    /// Returns whether an unresolved Convert scope includes the instrument and account.
+    #[must_use]
+    pub fn convert_scope_is_active(
+        &self,
+        instrument_id: InstrumentId,
+        account_id: AccountId,
+    ) -> bool {
+        self.convert_operation_scopes.values().any(|scope| {
+            scope.account_id == account_id && scope.instruments.contains(&instrument_id)
+        })
+    }
+
+    /// Returns whether any unresolved Convert scope exists for the account.
+    #[must_use]
+    pub fn convert_scope_account_is_active(&self, account_id: AccountId) -> bool {
+        self.convert_operation_scopes
+            .values()
+            .any(|scope| scope.account_id == account_id)
+    }
+
+    /// Returns the monotonic generation of Convert scope transitions.
+    #[must_use]
+    pub fn convert_scope_generation(&self) -> u64 {
+        self.convert_scope_generation
+    }
+
+    /// Returns the generation when an account last changed Convert scope.
+    #[must_use]
+    pub fn convert_scope_account_generation(&self, account_id: AccountId) -> u64 {
+        self.convert_scope_account_touches
+            .get(&account_id)
+            .map_or(0, |touch| touch.generation)
+    }
+
+    /// Returns the generation when an instrument and account last changed Convert scope.
+    #[must_use]
+    pub fn convert_scope_instrument_generation(
+        &self,
+        instrument_id: InstrumentId,
+        account_id: AccountId,
+    ) -> u64 {
+        self.convert_scope_instrument_touches
+            .get(&(instrument_id, account_id))
+            .map_or(0, |touch| touch.generation)
+    }
+
+    /// Returns instrument keys touched after the supplied Convert generation.
+    #[cfg(feature = "live")]
+    #[must_use]
+    pub fn convert_scope_changes_since(
+        &self,
+        generation: u64,
+    ) -> Vec<(InstrumentId, AccountId, dst::time::Instant)> {
+        self.convert_scope_instrument_touches
+            .iter()
+            .filter(|(_, touch)| touch.generation > generation)
+            .map(|((instrument_id, account_id), touch)| (*instrument_id, *account_id, touch.at))
+            .collect()
+    }
+
+    /// Retains historical gaps for active operations whose complete scope formally expired.
+    ///
+    /// This stops automatic position accounting for each operation without changing its execution
+    /// evidence or wallet transaction context. Callers must only invoke it after the core cache
+    /// required by the operation is fully loaded.
+    fn settle_expired_convert_operations(&mut self) -> usize {
+        let expired = self
+            .convert_operation_scopes
+            .iter()
+            .filter(|(_, scope)| self.convert_scope_is_expired(&scope.instruments))
+            .map(|(operation_id, _)| *operation_id)
+            .collect::<Vec<_>>();
+        let mut settled = 0;
+
+        for operation_id in expired {
+            let mut record = match self.load_convert_operation(operation_id) {
+                Ok(Some(record)) => record,
+                Ok(None) => {
+                    log::error!(
+                        "Cannot settle Convert operation {operation_id}: retained record is missing"
+                    );
+                    continue;
+                }
+                Err(e) => {
+                    log::error!("Cannot load Convert operation {operation_id}: {e}");
+                    continue;
+                }
+            };
+
+            record.mark_historical_gap();
+            log::warn!(
+                "Convert operation {} retains a historical accounting gap for {} after complete formal settlement",
+                operation_id,
+                record.account_id,
+            );
+
+            if let Err(e) = self.add_convert_operation(&record) {
+                log::error!(
+                    "Cannot persist historical Convert gap for operation {operation_id}: {e}"
+                );
+            } else {
+                settled += 1;
+            }
+        }
+
+        settled
+    }
+
+    /// Prepares a position-report request against the account's fixed Convert scope.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if an affected Convert scope remains unresolved for the requested account.
+    pub fn prepare_convert_position_report(
+        &self,
+        account_id: AccountId,
+        instrument_id: Option<InstrumentId>,
+    ) -> anyhow::Result<ConvertScopeCheck> {
+        let blocking = self
+            .convert_operation_scopes
+            .iter()
+            .filter(|(_, scope)| {
+                scope.account_id == account_id
+                    && instrument_id.is_none_or(|id| scope.instruments.contains(&id))
+            })
+            .map(|(operation_id, _)| operation_id.to_string())
+            .collect::<Vec<_>>();
+
+        if !blocking.is_empty() {
+            anyhow::bail!(
+                "position reports are deferred while Convert operation(s) {} hold an unresolved scope for account {account_id}",
+                blocking.join(", "),
+            );
+        }
+
+        Ok(ConvertScopeCheck {
+            account_id,
+            instrument_id,
+            generation: self.convert_scope_generation,
+        })
+    }
+
+    /// Returns whether the Convert scope observed by a position-report request is unchanged.
+    #[must_use]
+    pub fn convert_position_report_is_current(&self, check: &ConvertScopeCheck) -> bool {
+        match check.instrument_id {
+            Some(instrument_id) => {
+                !self.convert_scope_is_active(instrument_id, check.account_id)
+                    && self.convert_scope_instrument_generation(instrument_id, check.account_id)
+                        <= check.generation
+            }
+            None => {
+                !self.convert_scope_account_is_active(check.account_id)
+                    && self.convert_scope_account_generation(check.account_id) <= check.generation
+            }
+        }
+    }
+
     /// Stores a Convert operation record in general cache state.
     ///
     /// # Errors
     ///
-    /// Returns an error if the record cannot be encoded or the cache write fails.
+    /// Returns an error if the record cannot be encoded, conflicts with a fixed active scope,
+    /// or the cache write fails.
     pub fn add_convert_operation(&mut self, record: &ConvertOperationRecord) -> anyhow::Result<()> {
+        let previous = self.load_convert_operation(record.operation_id)?;
+        let normalized = normalized_convert_instruments(&record.affected_instruments)?;
+        let (active, desired) =
+            self.convert_scope_transition(record, previous.as_ref(), &normalized)?;
+
         let key = ConvertOperationRecord::cache_key(record.operation_id);
         let value = serde_json::to_vec(record).map_err(|e| {
             anyhow::anyhow!(
@@ -2578,7 +2860,129 @@ impl Cache {
                 record.operation_id,
             )
         })?;
-        self.add(&key, value.into())
+        let persist_result = self.add(&key, value.into());
+        self.apply_convert_scope_transition(record.operation_id, active, desired);
+        persist_result
+    }
+
+    /// Restores one retained Convert operation after the core cache is fully loaded.
+    ///
+    /// The restored fixed scope is classified immediately against cached formal closes.
+    /// This performs no remote query or wallet-authorization recovery.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the retained record conflicts with its fixed identity or scope.
+    pub fn restore_convert_operation_scope(
+        &mut self,
+        record: &ConvertOperationRecord,
+    ) -> anyhow::Result<()> {
+        self.add_convert_operation(record)?;
+        self.settle_expired_convert_operations();
+        Ok(())
+    }
+
+    fn convert_scope_transition(
+        &self,
+        record: &ConvertOperationRecord,
+        previous: Option<&ConvertOperationRecord>,
+        normalized: &[InstrumentId],
+    ) -> anyhow::Result<(Option<ConvertOperationScope>, Option<ConvertOperationScope>)> {
+        if let Some(previous) = previous {
+            anyhow::ensure!(
+                !(convert_record_is_terminal(previous) && convert_record_holds_scope(record)),
+                "Convert operation {} cannot reopen an ended operation",
+                record.operation_id,
+            );
+            anyhow::ensure!(
+                previous.account_id == record.account_id,
+                "Convert operation {} cannot move from account {} to {}",
+                record.operation_id,
+                previous.account_id,
+                record.account_id,
+            );
+            anyhow::ensure!(
+                previous.client_id == record.client_id,
+                "Convert operation {} cannot move from client {} to {}",
+                record.operation_id,
+                previous.client_id,
+                record.client_id,
+            );
+
+            if !previous.affected_instruments.is_empty() {
+                let previous_scope =
+                    normalized_convert_instruments(&previous.affected_instruments)?;
+                anyhow::ensure!(
+                    previous_scope == normalized,
+                    "Convert operation {} cannot change its fixed admitted scope",
+                    record.operation_id,
+                );
+            }
+        }
+
+        let Some(existing) = self.convert_operation_scopes.get(&record.operation_id) else {
+            let desired = desired_convert_scope(record, normalized)?;
+            return Ok((None, desired));
+        };
+
+        anyhow::ensure!(
+            existing.account_id == record.account_id,
+            "Convert operation {} cannot move from account {} to {}",
+            record.operation_id,
+            existing.account_id,
+            record.account_id,
+        );
+        anyhow::ensure!(
+            existing.client_id == record.client_id,
+            "Convert operation {} cannot move from client {} to {}",
+            record.operation_id,
+            existing.client_id,
+            record.client_id,
+        );
+
+        let desired = desired_convert_scope(record, normalized)?;
+        if let Some(desired) = &desired {
+            anyhow::ensure!(
+                existing.instruments == desired.instruments,
+                "Convert operation {} cannot change its fixed active scope",
+                record.operation_id,
+            );
+        }
+
+        Ok((Some(existing.clone()), desired))
+    }
+
+    fn apply_convert_scope_transition(
+        &mut self,
+        operation_id: UUID4,
+        active: Option<ConvertOperationScope>,
+        desired: Option<ConvertOperationScope>,
+    ) {
+        match (active, desired) {
+            (Some(_), Some(_)) => {}
+            (Some(existing), None) => {
+                self.convert_operation_scopes.remove(&operation_id);
+                self.bump_convert_scope_generation(&existing);
+            }
+            (None, Some(desired)) => {
+                self.convert_operation_scopes
+                    .insert(operation_id, desired.clone());
+                self.bump_convert_scope_generation(&desired);
+            }
+            (None, None) => {}
+        }
+    }
+
+    fn bump_convert_scope_generation(&mut self, scope: &ConvertOperationScope) {
+        self.convert_scope_generation = self.convert_scope_generation.saturating_add(1);
+        let touch = ConvertScopeTouch::new(self.convert_scope_generation);
+        self.convert_scope_account_touches
+            .insert(scope.account_id, touch);
+
+        for instrument_id in &scope.instruments {
+            self.convert_scope_instrument_touches
+                .insert((*instrument_id, scope.account_id), touch);
+        }
     }
 
     /// Adds an `OrderBook` to the cache.
@@ -2756,6 +3160,7 @@ impl Cache {
     /// Returns an error if the backing reports a DeFi currency integrity error.
     pub fn add_instrument_close(&mut self, close: InstrumentClose) -> anyhow::Result<()> {
         log::debug!("Adding `InstrumentClose` for {}", close.instrument_id);
+        let contract_expired = close.close_type == InstrumentCloseType::ContractExpired;
 
         if let Some(database) = &self.database {
             handle_persistence_result(
@@ -2765,6 +3170,10 @@ impl Cache {
         }
 
         self.instrument_closes.insert(close.instrument_id, close);
+
+        if contract_expired {
+            self.settle_expired_convert_operations();
+        }
         Ok(())
     }
 

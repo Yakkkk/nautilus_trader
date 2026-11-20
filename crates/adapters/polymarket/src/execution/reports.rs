@@ -18,6 +18,7 @@ use std::sync::Arc;
 use ahash::{AHashMap, AHashSet};
 use anyhow::Context;
 use nautilus_common::{
+    cache::ConvertScopeCheck,
     clients::ExecutionReportTask,
     messages::execution::{
         GenerateFillReports, GenerateOrderStatusReport, GenerateOrderStatusReports,
@@ -52,10 +53,11 @@ use super::{
         apply_fill_time_filters, apply_logical_order_quantity, build_fill_reports_from_trades,
         build_reconciliation_position_reports, build_target_order_report,
         cap_order_report_filled_qty, collect_fill_reports_from_trades, filter_unsupported_orders,
-        filter_unsupported_positions, instrument_id_from_market_token,
-        normalize_terminal_order_report_quantity, order_status_recovery_status,
-        order_status_scope_awaits_application, position_in_report_scope, trade_touches_venue_order,
-        venue_leg_filled_before_and_quantity, without_order_status_pending_trades,
+        filter_unsupported_positions, normalize_terminal_order_report_quantity,
+        order_status_recovery_status, order_status_scope_awaits_application,
+        polymarket_instrument_ids_equivalent, resolve_polymarket_instrument_id,
+        trade_touches_venue_order, venue_leg_filled_before_and_quantity,
+        without_order_status_pending_trades,
     },
     responses::confirm_modify_replacement,
     settlement::{SettlementRegistry, registry::CollectedFillReports},
@@ -258,22 +260,29 @@ impl PolymarketExecutionClient {
         let command = cmd.clone();
         let instrument_id = cmd.instrument_id;
         let scope = self.resolved_balance_scope();
+        let convert_scope = self
+            .prepare_convert_position_report_scope(instrument_id)
+            .map_err(|e| e.to_string());
+        let collection_convert_scope = convert_scope.clone();
+        let finish_convert_scope = convert_scope;
         let gate = self
             .settlement
             .ensure_resolved(instrument_id, "position status reports");
 
         ExecutionReportTask::new(
             async move {
+                let _scope = collection_convert_scope.map_err(anyhow::Error::msg)?;
                 gate?;
                 client
                     .collect_position_status_reports(&command, scope)
                     .await
             },
             move |collected| {
+                let convert_scope = finish_convert_scope.map_err(anyhow::Error::msg)?;
                 state
                     .settlement
                     .ensure_resolved(instrument_id, "position status reports")?;
-                state.finish_position_status_reports(collected)
+                state.finish_position_status_reports(collected, &convert_scope)
             },
         )
     }
@@ -927,13 +936,14 @@ impl PolymarketExecutionClient {
     pub(super) async fn generate_position_status_reports_impl(
         &self,
         cmd: &GeneratePositionStatusReports,
+        convert_scope: ConvertScopeCheck,
     ) -> anyhow::Result<Vec<PositionStatusReport>> {
         let collected = self
             .report_client()
             .collect_position_status_reports(cmd, self.resolved_balance_scope())
             .await?;
         self.report_state()
-            .finish_position_status_reports(collected)
+            .finish_position_status_reports(collected, &convert_scope)
     }
 
     pub(super) async fn generate_mass_status_impl(
@@ -1005,6 +1015,27 @@ impl PolymarketExecutionClient {
             settlement: self.settlement.clone(),
             ws_dispatch_state: self.ws_dispatch_state.clone(),
         }
+    }
+
+    pub(super) fn prepare_convert_position_report_scope(
+        &self,
+        instrument_id: Option<InstrumentId>,
+    ) -> anyhow::Result<ConvertScopeCheck> {
+        self.flush_pending_instruments();
+        let instrument_id = instrument_id.map(|id| {
+            let resolved = resolve_polymarket_instrument_id(id, &self.shared_token_instruments);
+            if resolved != id {
+                return resolved;
+            }
+
+            let cache = self.core.cache();
+            cache
+                .instruments(&id.venue, None)
+                .into_iter()
+                .find(|instrument| polymarket_instrument_ids_equivalent(instrument.id(), id))
+                .map_or(id, |instrument| instrument.id())
+        });
+        self.core.prepare_convert_position_report(instrument_id)
     }
 
     fn resolved_balance_scope(&self) -> ResolvedBalanceScope {
@@ -1345,7 +1376,7 @@ impl PolymarketReportClient {
             &scope,
         )
         .await?;
-        let reports = build_reconciliation_position_reports(
+        let collected = build_reconciliation_position_reports(
             &positions,
             self.account_id,
             ts_now,
@@ -1354,35 +1385,10 @@ impl PolymarketReportClient {
             self.load_ids.as_deref(),
             &scope,
         )?;
-
-        let balances: AHashMap<_, _> = positions
-            .iter()
-            .filter(|position| {
-                position_in_report_scope(position, cmd.instrument_id, self.load_ids.as_deref())
-            })
-            .map(|position| {
-                (
-                    instrument_id_from_market_token(&position.condition_id, &position.asset),
-                    position.redeemable,
-                )
-            })
-            .collect();
-
-        let excluded = balances
-            .iter()
-            .filter(|(id, redeemable)| scope.excludes_balance(**id, **redeemable))
-            .map(|(id, redeemable)| (*id, *redeemable))
-            .collect();
-
-        let reports = reports
-            .into_iter()
-            .map(|report| {
-                let redeemable = balances[&report.instrument_id];
-                (report, redeemable)
-            })
-            .collect();
-
-        Ok(CollectedPositionReports { reports, excluded })
+        Ok(CollectedPositionReports {
+            reports: collected.reports,
+            excluded: collected.excluded,
+        })
     }
 
     fn fill_context(&self) -> FillContext<'_> {
@@ -1730,7 +1736,13 @@ impl ReportState {
     fn finish_position_status_reports(
         &self,
         collected: CollectedPositionReports,
+        convert_scope: &ConvertScopeCheck,
     ) -> anyhow::Result<Vec<PositionStatusReport>> {
+        anyhow::ensure!(
+            self.core.convert_position_report_is_current(convert_scope),
+            "Polymarket Convert scope changed or remained unresolved during position report collection"
+        );
+
         let scope = ResolvedBalanceScope::from_cache(
             &self.core.cache(),
             self.core.venue,
