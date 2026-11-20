@@ -43,14 +43,14 @@ use async_trait::async_trait;
 use nautilus_common::{
     clients::{ExecutionClient, ExecutionReportTask},
     messages::execution::{
-        BatchCancelOrders, CancelAllOrders, CancelOrder, GenerateFillReports,
+        BatchCancelOrders, CancelAllOrders, CancelOrder, ConvertTransaction, GenerateFillReports,
         GenerateOrderStatusReport, GenerateOrderStatusReports, GeneratePositionStatusReports,
         ModifyOrder, QueryAccount, QueryOrder, SubmitOrder, SubmitOrderList,
     },
     msgbus::TypedHandler,
 };
 use nautilus_core::{
-    Params, UnixNanos,
+    Params, UUID4, UnixNanos,
     collections::AtomicMap,
     time::{AtomicTime, get_atomic_clock_realtime},
 };
@@ -441,6 +441,29 @@ impl ExecutionClient for PolymarketExecutionClient {
     fn query_order(&self, cmd: QueryOrder) -> anyhow::Result<()> {
         self.query_order_command(&cmd);
         Ok(())
+    }
+
+    async fn restore_convert_context(
+        &self,
+        operation_id: UUID4,
+        transaction: &ConvertTransaction,
+    ) -> anyhow::Result<()> {
+        let expected_wallet = self.secrets.funder.as_deref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "Polymarket Convert recovery requires a configured Deposit Wallet funder"
+            )
+        })?;
+        let expected_wallet = parse_address(expected_wallet, "funder")?;
+        let retained_wallet = parse_address(&transaction.wallet, "convert wallet")?;
+        anyhow::ensure!(
+            expected_wallet == retained_wallet,
+            "retained Convert wallet {retained_wallet:#x} does not match the execution client \
+             Deposit Wallet {expected_wallet:#x}",
+        );
+
+        crate::positions::restore_convert_wallet_context(operation_id, transaction)
+            .await
+            .map_err(anyhow::Error::from)
     }
 
     fn retain_unresolved_submissions(&self) -> bool {

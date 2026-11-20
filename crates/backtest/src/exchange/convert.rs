@@ -73,6 +73,7 @@ impl SimulatedExchange {
                     operation_id: command.operation_id,
                     account_id: command.account_id,
                     client_id: command.client_id,
+                    run_id: None,
                     outcome: ConvertExecutionOutcome::Confirmed {
                         verified: Box::new(verified),
                         pending_inputs: Vec::new(),
@@ -85,6 +86,7 @@ impl SimulatedExchange {
                     operation_id: command.operation_id,
                     account_id: command.account_id,
                     client_id: command.client_id,
+                    run_id: None,
                     outcome: ConvertExecutionOutcome::Rejected(reason),
                 };
                 self.dispatch_convert_event(event);

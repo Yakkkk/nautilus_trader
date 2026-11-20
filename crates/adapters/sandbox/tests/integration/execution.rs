@@ -12285,6 +12285,11 @@ impl SandboxConvertHarness {
 #[case::delayed(CONVERT_DELAY_NS)]
 fn test_sandbox_convert_strategy_round_trip(#[case] delay_ns: u64) {
     let mut harness = SandboxConvertHarness::new(delay_ns, true, true);
+    harness
+        .kernel
+        .exec_engine
+        .borrow_mut()
+        .begin_convert_live_run();
     let operation_id = UUID4::new();
     harness.submit(operation_id);
     harness.submit(operation_id);

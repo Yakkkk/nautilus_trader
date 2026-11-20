@@ -146,6 +146,7 @@ pub struct ExecutionEngine {
     report_count: u64,
     filtered_unclaimed_external_order_count: u64,
     snapshot_anchorer: Option<SnapshotAnchorer>,
+    convert_live_run: convert::ConvertLiveRunState,
 }
 
 impl Debug for ExecutionEngine {
@@ -208,6 +209,7 @@ impl ExecutionEngine {
             report_count: 0,
             filtered_unclaimed_external_order_count: 0,
             snapshot_anchorer: None,
+            convert_live_run: convert::ConvertLiveRunState::default(),
         }
     }
 
@@ -2168,6 +2170,8 @@ impl ExecutionEngine {
 
     /// Stops all registered execution clients without stopping the engine itself.
     pub fn stop_clients(&mut self) {
+        self.stop_convert_live_run_if_active();
+
         for client in self.get_clients_mut() {
             if client.stop().is_err() {
                 log::error!("Failed to stop execution client {}", client.client_id());
@@ -2180,6 +2184,8 @@ impl ExecutionEngine {
     /// Cancels engine-owned timers (snapshot, purge) but leaves timers owned by
     /// other components on the shared clock untouched.
     pub fn reset(&mut self) {
+        self.stop_convert_live_run_if_active();
+
         for client in self.get_clients_mut() {
             if client.reset().is_err() {
                 log::error!("Failed to reset execution client {}", client.client_id());
@@ -2253,7 +2259,6 @@ impl ExecutionEngine {
                 return;
             }
             TradingCommand::QueryConvert(cmd) => {
-                let cmd = cmd.clone();
                 self.handle_query_convert(cmd);
                 return;
             }

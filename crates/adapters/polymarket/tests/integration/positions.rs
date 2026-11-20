@@ -16,8 +16,10 @@
 //! Integration tests for Deposit Wallet split, merge, and redeem operations.
 
 use std::{
+    cell::RefCell,
     collections::{HashMap, VecDeque},
     net::SocketAddr,
+    rc::Rc,
     sync::{
         Arc, Once,
         atomic::{AtomicUsize, Ordering},
@@ -34,10 +36,25 @@ use axum::{
     routing::{get, post},
 };
 use log::{Level, LevelFilter, Log, Metadata, Record};
-use nautilus_common::testing::wait_until_async;
+use nautilus_common::{
+    cache::Cache, clients::ExecutionClient, messages::execution::ConvertTransaction,
+    testing::wait_until_async,
+};
+use nautilus_core::UUID4;
+use nautilus_live::ExecutionClientCore;
+use nautilus_model::{
+    enums::{AccountType, OmsType},
+    identifiers::{AccountId, TraderId},
+};
 use nautilus_network::http::HttpClient;
 use nautilus_polymarket::{
-    common::credential::{EvmPrivateKey, RelayerApiKey},
+    common::{
+        consts::{POLYMARKET_CLIENT_ID, POLYMARKET_VENUE},
+        credential::{EvmPrivateKey, RelayerApiKey},
+        enums::PolymarketSignatureType,
+    },
+    config::PolymarketExecutionClientConfig,
+    execution::PolymarketExecutionClient,
     http::{
         error::Error,
         relayer::{PolymarketRelayerHttpClient, RelayerWalletSubmit},
@@ -828,6 +845,32 @@ fn wallet_address(addr: &SocketAddr) -> String {
     format!("0x{:040x}", addr.port())
 }
 
+async fn restore_convert_via_exec_client(
+    addr: SocketAddr,
+    operation_id: UUID4,
+    transaction: &ConvertTransaction,
+) -> anyhow::Result<()> {
+    let mut config: PolymarketExecutionClientConfig = crate::mock_venue::execution_config(addr);
+    config.funder = Some(wallet_address(&addr));
+    config.signature_type = PolymarketSignatureType::PolyProxy;
+
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    let core = ExecutionClientCore::new(
+        TraderId::from("TESTER-001"),
+        *POLYMARKET_CLIENT_ID,
+        *POLYMARKET_VENUE,
+        OmsType::Netting,
+        AccountId::from("POLYMARKET-001"),
+        AccountType::Cash,
+        None,
+        cache,
+    );
+    let client = PolymarketExecutionClient::new(core, config)?;
+    client
+        .restore_convert_context(operation_id, transaction)
+        .await
+}
+
 #[rstest]
 #[case("split", "cancelled")]
 #[case("merge", "omitted_id")]
@@ -1206,6 +1249,105 @@ async fn test_terminal_submission_allows_advanced_nonce(#[values(false, true)] v
         state.last_submit.lock().await.as_ref().unwrap()["nonce"],
         "8"
     );
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_restored_convert_submission_requires_terminal_nonce_and_keeps_newer_guard() {
+    let state = TestServerState::default();
+    let restored_transaction = json!({
+        "transaction_id": "tx-restored",
+        "transaction_hash": "0xabc",
+        "state": "STATE_CONFIRMED",
+        "error_msg": null
+    });
+    *state.poll_pages.lock().await = VecDeque::from([restored_transaction.clone()]);
+    let addr = start_mock_server(state.clone()).await;
+    let wallet = wallet_address(&addr);
+    let transaction = ConvertTransaction {
+        wallet: wallet.clone(),
+        relayer_transaction_id: Some("tx-restored".to_string()),
+        transaction_hash: None,
+        nonce: Some("7".to_string()),
+        call_summary: None,
+    };
+    let operation_id = UUID4::new();
+    restore_convert_via_exec_client(addr, operation_id, &transaction)
+        .await
+        .unwrap();
+
+    let err = position_client(&addr)
+        .split_position(CONDITION_ID, dec!(1))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("nonce has not advanced"));
+    assert_eq!(state.submit_count.load(Ordering::SeqCst), 0);
+
+    *state.nonce.lock().await = json!({"nonce":"8"});
+    *state.poll_pages.lock().await = VecDeque::from([restored_transaction]);
+    position_client(&addr)
+        .split_position(CONDITION_ID, dec!(1))
+        .await
+        .unwrap();
+    assert_eq!(state.submit_count.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        state.last_submit.lock().await.as_ref().unwrap()["nonce"],
+        "8"
+    );
+
+    restore_convert_via_exec_client(addr, operation_id, &transaction)
+        .await
+        .unwrap();
+    let err = position_client(&addr)
+        .merge_positions(CONDITION_ID, dec!(1))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("still pending"));
+    assert_eq!(state.submit_count.load(Ordering::SeqCst), 1);
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_restored_convert_submission_blocks_without_locator_and_enriches_it() {
+    let state = TestServerState::default();
+    let addr = start_mock_server(state.clone()).await;
+    let operation_id = UUID4::new();
+    let transaction = ConvertTransaction {
+        wallet: wallet_address(&addr),
+        relayer_transaction_id: None,
+        transaction_hash: None,
+        nonce: Some("7".to_string()),
+        call_summary: None,
+    };
+    restore_convert_via_exec_client(addr, operation_id, &transaction)
+        .await
+        .unwrap();
+
+    let err = position_client(&addr)
+        .split_position(CONDITION_ID, dec!(1))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("outcome is unknown"));
+    assert_eq!(state.submit_count.load(Ordering::SeqCst), 0);
+
+    let mut located = transaction;
+    located.relayer_transaction_id = Some("tx-restored".to_string());
+    *state.poll_pages.lock().await = VecDeque::from([json!({
+        "transaction_id": "tx-restored",
+        "transaction_hash": "0xabc",
+        "state": "STATE_CONFIRMED",
+        "error_msg": null
+    })]);
+    restore_convert_via_exec_client(addr, operation_id, &located)
+        .await
+        .unwrap();
+    *state.nonce.lock().await = json!({"nonce":"8"});
+
+    position_client(&addr)
+        .split_position(CONDITION_ID, dec!(1))
+        .await
+        .unwrap();
+    assert_eq!(state.submit_count.load(Ordering::SeqCst), 1);
 }
 
 #[rstest]

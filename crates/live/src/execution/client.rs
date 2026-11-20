@@ -53,7 +53,7 @@ use nautilus_common::{
         SubmitConvert, SubmitOrder, SubmitOrderList,
     },
 };
-use nautilus_core::{Params, UnixNanos};
+use nautilus_core::{Params, UUID4, UnixNanos};
 use nautilus_model::{
     accounts::AccountAny,
     enums::{LiquiditySide, OmsType},
@@ -510,12 +510,49 @@ impl ExecutionClient for LiveExecutionClient {
         self.client.borrow().submit_convert(cmd, scope)
     }
 
+    fn submit_convert_for_run(
+        &self,
+        cmd: SubmitConvert,
+        scope: ConvertScope,
+        run_id: Option<UUID4>,
+    ) -> anyhow::Result<()> {
+        self.client
+            .borrow()
+            .submit_convert_for_run(cmd, scope, run_id)
+    }
+
     fn query_convert(
         &self,
         cmd: QueryConvert,
         transaction: &ConvertTransaction,
     ) -> anyhow::Result<()> {
         self.client.borrow().query_convert(cmd, transaction)
+    }
+
+    fn query_convert_for_run(
+        &self,
+        cmd: QueryConvert,
+        transaction: &ConvertTransaction,
+        run_id: Option<UUID4>,
+    ) -> anyhow::Result<()> {
+        self.client
+            .borrow()
+            .query_convert_for_run(cmd, transaction, run_id)
+    }
+
+    #[expect(
+        clippy::await_holding_refcell_ref,
+        reason = "wallet reservation restoration runs on the single-threaded live runtime"
+    )]
+    async fn restore_convert_context(
+        &self,
+        operation_id: UUID4,
+        transaction: &ConvertTransaction,
+    ) -> anyhow::Result<()> {
+        self.client
+            .borrow()
+            .restore_convert_context(operation_id, transaction)
+            .await
     }
 
     fn modify_order(&self, cmd: ModifyOrder) -> anyhow::Result<()> {

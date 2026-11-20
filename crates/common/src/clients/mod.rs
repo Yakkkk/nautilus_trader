@@ -28,8 +28,8 @@ use std::{
 
 pub use data::{DataClient, execute_bar_subscriptions, execute_instrument_subscriptions};
 pub use execution::{
-    DEFAULT_POSITION_RECONCILIATION_TOLERANCE, ExecutionClient, ExecutionReportTask,
-    generate_mass_status,
+    ConvertQueryDispatchError, DEFAULT_POSITION_RECONCILIATION_TOLERANCE, ExecutionClient,
+    ExecutionReportTask, generate_mass_status,
 };
 use nautilus_model::identifiers::ClientId;
 

@@ -640,8 +640,14 @@ impl ExecutionEngine {
             let plan_is_sticky = record.plan_fixed
                 || record.applied
                 || self.convert_has_replay_evidence(&record.verified);
+            let reason = if plan_is_sticky {
+                "missing original Convert plan; recovery cannot reconstruct it"
+            } else {
+                "Convert accounting plan has not been established; recovery remains pending until \
+                 execution activity clears"
+            };
             record.block(
-                "missing original Convert plan; recovery cannot reconstruct it".to_string(),
+                reason.to_string(),
                 sorted_instruments(&record.verified.affected_instruments),
             );
             record.plan_fixed = plan_is_sticky;
