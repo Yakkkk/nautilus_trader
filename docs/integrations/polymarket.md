@@ -772,6 +772,45 @@ the [Polymarket contract registry](https://docs.polymarket.com/resources/contrac
 the deployed contracts and the [JSON-RPC reference](https://ethereum.org/en/developers/docs/apis/json-rpc/)
 for block-specific calls.
 
+## Convert queries
+
+The execution client can query a retained, already-dispatched CTF negative-risk Convert operation
+against finalized Polygon evidence. This path is read-only: it never signs, submits, or rebinds a
+transaction. New Convert submissions remain unsupported.
+
+Configure `rpc_url` with a Polygon RPC endpoint that supports the `finalized` block tag. The adapter
+uses only that endpoint for finalized execution evidence; it does not fall back to `latest` or
+another RPC. Validate `finalized` support against the deployed provider before enabling queries. The
+optional `base_url_relayer` selects the host for the public, credential-free
+`GET /transaction?id=...` lookup
+used when only the original Relayer transaction ID was retained. Existing Relayer API credentials
+remain specific to Deposit Wallet position submissions. When both locator forms are retained, a
+Relayer response hash must match the retained chain hash; a conflict remains `Unknown`.
+
+The loaded event mapping must contain the complete negative-risk event, all condition indices, and
+both outcome tokens. Convert queries do not repair a missing or partial mapping. The retained record
+must include the original wallet, wallet nonce, and a Relayer transaction ID or chain hash; local
+operation IDs are not chain locators.
+
+A query verifies the original transaction and receipt, the canonical finalized block, the Deposit
+Wallet Factory batch for the retained wallet and nonce, and the exact adapter calldata. It then
+requires the wallet's `Execution` and `BatchExecuted` evidence, the adapter's `PositionsConverted`
+amount and fee-adjusted output, and independently attributable CTF token and pUSD effects. Outer
+transaction success alone is insufficient. A finalized reverted receipt can produce `Failed`;
+authorization validity remains governed separately by the wallet nonce and lifecycle rules.
+
+Only one batch for the retained wallet, containing exactly the expected Convert call, is supported.
+Other wallets may appear in independent batches, but their outputs are not attributed to this
+operation. Same-wallet multi-batch transactions, extra calls in the retained wallet batch, mixed
+calls whose effects cannot be isolated, or missing/extra token and cash movements remain `Unknown`.
+The verified Factory and wallet implementations execute batches sequentially, and a failed call
+reverts the whole transaction; the verifier does not attempt debug-trace-level splitting. An opaque
+`call_summary` is not treated as evidence.
+
+Queries use bounded retry and elapsed-time limits. If the Relayer or RPC is temporarily unavailable,
+or finality has not arrived, the query reports `Unknown` with a reason after its budget. Known
+confirmation or failure evidence is retained; a query timeout does not rerun a new transaction.
+
 ## Configuration
 
 Configure signing and authentication through these parameters or their environment-variable fallbacks:
@@ -783,6 +822,10 @@ Configure signing and authentication through these parameters or their environme
 | `api_key`     | `POLYMARKET_API_KEY`    | CLOB L2 API key                                              |
 | `api_secret`  | `POLYMARKET_API_SECRET` | CLOB L2 API secret                                           |
 | `passphrase`  | `POLYMARKET_PASSPHRASE` | CLOB L2 API passphrase                                       |
+
+The execution client also accepts the `base_url_http`, `base_url_ws`, `base_url_data_api`,
+`rpc_url`, and `base_url_relayer` transport overrides. `rpc_url` is required for retained Convert
+queries.
 
 In owner mode, omit a parameter or pass `None` to read its environment variable. An explicitly supplied
 empty or whitespace-only value fails configuration validation; it never selects an environment fallback.

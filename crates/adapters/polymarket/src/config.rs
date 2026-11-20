@@ -694,6 +694,10 @@ pub struct PolymarketExecutionClientConfig {
     pub base_url_http: Option<String>,
     pub base_url_ws: Option<String>,
     pub base_url_data_api: Option<String>,
+    /// Polygon RPC URL for retained Convert queries. The RPC must support `finalized`.
+    pub rpc_url: Option<SecretString>,
+    /// Optional base URL for read-only Relayer transaction queries.
+    pub base_url_relayer: Option<String>,
     /// Optional HTTP or HTTPS proxy URL for all HTTP and WebSocket transports.
     pub proxy_url: Option<SecretString>,
     #[builder(default = 60)]
@@ -728,6 +732,7 @@ nautilus_core::impl_pyo3_config_getters!(PolymarketExecutionClientConfig {
     base_url_http: Option<String>,
     base_url_ws: Option<String>,
     base_url_data_api: Option<String>,
+    base_url_relayer: Option<String>,
     http_timeout_secs: u64,
     max_retries: u32,
     retry_delay_initial_ms: u64,

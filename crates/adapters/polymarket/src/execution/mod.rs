@@ -28,6 +28,7 @@ pub(crate) mod types;
 
 mod cancellations;
 mod collateral;
+mod convert;
 mod lifecycle;
 mod orders;
 mod reports;
@@ -45,7 +46,7 @@ use nautilus_common::{
     messages::execution::{
         BatchCancelOrders, CancelAllOrders, CancelOrder, ConvertTransaction, GenerateFillReports,
         GenerateOrderStatusReport, GenerateOrderStatusReports, GeneratePositionStatusReports,
-        ModifyOrder, QueryAccount, QueryOrder, SubmitOrder, SubmitOrderList,
+        ModifyOrder, QueryAccount, QueryConvert, QueryOrder, SubmitOrder, SubmitOrderList,
     },
     msgbus::TypedHandler,
 };
@@ -441,6 +442,23 @@ impl ExecutionClient for PolymarketExecutionClient {
     fn query_order(&self, cmd: QueryOrder) -> anyhow::Result<()> {
         self.query_order_command(&cmd);
         Ok(())
+    }
+
+    fn query_convert(
+        &self,
+        cmd: QueryConvert,
+        transaction: &ConvertTransaction,
+    ) -> anyhow::Result<()> {
+        self.query_convert_for_run(cmd, transaction, None)
+    }
+
+    fn query_convert_for_run(
+        &self,
+        cmd: QueryConvert,
+        transaction: &ConvertTransaction,
+        run_id: Option<UUID4>,
+    ) -> anyhow::Result<()> {
+        self.query_convert_command(&cmd, transaction, run_id)
     }
 
     async fn restore_convert_context(

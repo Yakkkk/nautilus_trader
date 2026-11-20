@@ -40,6 +40,7 @@ use crate::{
 const PATH_NONCE: &str = "/v1/account/transactions/params";
 const PATH_SUBMIT: &str = "/submit";
 const PATH_TRANSACTION: &str = "/v1/account/transactions";
+const PATH_PUBLIC_TRANSACTION: &str = "/transaction";
 
 /// Relayer transaction lifecycle state.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -366,6 +367,72 @@ impl PolymarketRelayerHttpClient {
             .await
             .map_err(Error::from_http_client)?;
         decode_response(&response)
+    }
+}
+
+/// Read-only Relayer client for the public transaction endpoint.
+///
+/// The official `GET /transaction?id=...` endpoint does not require API credentials. It is
+/// separate from the authenticated `/v1/account/transactions/{id}` polling used by Deposit Wallet
+/// position submissions.
+#[derive(Debug, Clone)]
+pub(crate) struct PolymarketRelayerPublicClient {
+    client: HttpClient,
+    base_url: String,
+}
+
+impl PolymarketRelayerPublicClient {
+    /// Creates a public Relayer transaction client.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP client cannot be created.
+    pub(crate) fn new(
+        base_url: Option<String>,
+        timeout_secs: u64,
+        proxy_url: Option<ProxyUrl>,
+    ) -> StdResult<Self, HttpClientError> {
+        Ok(Self {
+            client: HttpClient::builder()
+                .headers(PolymarketRelayerHttpClient::default_headers())
+                .redirect_policy(HttpRedirectPolicy::Reject)
+                .redact_url(true)
+                .timeout_secs(timeout_secs)
+                .maybe_proxy_url(proxy_url.map(|url| url.expose().to_string()))
+                .build()?,
+            base_url: base_url
+                .unwrap_or_else(|| relayer_http_url().to_string())
+                .trim_end_matches('/')
+                .to_string(),
+        })
+    }
+
+    /// Fetches a Relayer transaction by its original ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the Relayer rejects the request, the body cannot be decoded, or the
+    /// response does not identify the requested transaction.
+    pub(crate) async fn get_transaction(&self, transaction_id: &str) -> Result<RelayerTransaction> {
+        if transaction_id.trim().is_empty() {
+            return Err(Error::bad_request("transaction_id must not be empty"));
+        }
+
+        let url = format!("{}{PATH_PUBLIC_TRANSACTION}", self.base_url);
+        let params = [("id", transaction_id)];
+        let response = self
+            .client
+            .request_with_params(Method::GET, url, Some(&params), None, None, None, None)
+            .await
+            .map_err(Error::from_http_client)?;
+        let transaction = decode_relayer_transaction(&response)?;
+        if transaction.transaction_id.as_deref() != Some(transaction_id) {
+            return Err(Error::decode(format!(
+                "Relayer response did not match transaction {transaction_id}; transaction outcome is unknown"
+            )));
+        }
+
+        Ok(transaction)
     }
 }
 

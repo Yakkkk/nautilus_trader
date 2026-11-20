@@ -24,7 +24,6 @@ use nautilus_network::{
     http::{HttpClient, HttpRedirectPolicy, Method, create_standard_nautilus_headers},
     websocket::proxy::ProxyUrl,
 };
-use serde::Deserialize;
 use serde_json::json;
 
 use crate::{
@@ -236,7 +235,17 @@ impl WalletVerifier {
         ])).await
     }
 
-    async fn rpc(&self, method: &str, params: serde_json::Value) -> Result<Bytes> {
+    /// Executes a read-only Polygon JSON-RPC request and returns its raw result.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the transport fails, the response is malformed, or the RPC reports an
+    /// error.
+    pub(super) async fn rpc_json(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value> {
         let body = serde_json::to_vec(
             &json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}),
         )?;
@@ -259,27 +268,47 @@ impl WalletVerifier {
                 b"Polygon RPC request failed",
             ));
         }
-        let response: RpcResponse = serde_json::from_slice(&response.body)
-            .map_err(|_| Error::decode("Polygon RPC returned an invalid response"))?;
-        if response.jsonrpc != "2.0" || response.id != 1 {
-            return Err(Error::decode(
-                "Polygon RPC did not return a successful matching response",
-            ));
-        }
-
-        if let Some(error) = response.error {
-            let message = match error.get("code").and_then(serde_json::Value::as_i64) {
-                Some(code) => format!("Polygon RPC {method} failed (code {code})"),
-                None => format!("Polygon RPC {method} failed"),
-            };
-
-            return Err(Error::decode(message));
-        }
-
-        response
-            .result
-            .ok_or_else(|| Error::decode("Polygon RPC omitted its result"))
+        decode_rpc_response(&response.body, method)
     }
+
+    async fn rpc(&self, method: &str, params: serde_json::Value) -> Result<Bytes> {
+        serde_json::from_value(self.rpc_json(method, params).await?)
+            .map_err(|_| Error::decode(format!("Invalid Polygon RPC result for {method}")))
+    }
+}
+
+fn decode_rpc_response(body: &[u8], method: &str) -> Result<serde_json::Value> {
+    let response: serde_json::Value = serde_json::from_slice(body)
+        .map_err(|_| Error::decode("Polygon RPC returned an invalid response"))?;
+    let object = response
+        .as_object()
+        .ok_or_else(|| Error::decode("Polygon RPC response was not an object"))?;
+    let Some(id) = object.get("id").and_then(serde_json::Value::as_u64) else {
+        return Err(Error::decode("Polygon RPC returned an invalid response"));
+    };
+    let Some(jsonrpc) = object.get("jsonrpc").and_then(serde_json::Value::as_str) else {
+        return Err(Error::decode("Polygon RPC returned an invalid response"));
+    };
+
+    if jsonrpc != "2.0" || id != 1 {
+        return Err(Error::decode(
+            "Polygon RPC did not return a successful matching response",
+        ));
+    }
+
+    if let Some(error) = object.get("error").filter(|e| !e.is_null()) {
+        let message = match error.get("code").and_then(serde_json::Value::as_i64) {
+            Some(code) => format!("Polygon RPC {method} failed (code {code})"),
+            None => format!("Polygon RPC {method} failed"),
+        };
+
+        return Err(Error::decode(message));
+    }
+
+    object
+        .get("result")
+        .cloned()
+        .ok_or_else(|| Error::decode("Polygon RPC omitted its result"))
 }
 
 impl Debug for WalletVerifier {
@@ -288,14 +317,6 @@ impl Debug for WalletVerifier {
             .field("rpc_url", &REDACTED)
             .finish_non_exhaustive()
     }
-}
-
-#[derive(Deserialize)]
-struct RpcResponse {
-    jsonrpc: String,
-    id: u64,
-    result: Option<Bytes>,
-    error: Option<serde_json::Value>,
 }
 
 #[cfg(test)]
@@ -317,6 +338,28 @@ mod tests {
             format!("{verifier:?}"),
             "WalletVerifier { rpc_url: \"<redacted>\", .. }"
         );
+    }
+
+    #[rstest]
+    fn test_rpc_response_distinguishes_null_from_omitted_result() {
+        let null_result = decode_rpc_response(
+            br#"{"jsonrpc":"2.0","id":1,"result":null}"#,
+            "eth_getTransactionReceipt",
+        )
+        .unwrap();
+        assert_eq!(null_result, serde_json::Value::Null);
+
+        let missing_result =
+            decode_rpc_response(br#"{"jsonrpc":"2.0","id":1}"#, "eth_getTransactionReceipt")
+                .unwrap_err();
+        assert!(missing_result.to_string().contains("omitted its result"));
+
+        let null_error = decode_rpc_response(
+            br#"{"jsonrpc":"2.0","id":1,"result":"0x","error":null}"#,
+            "eth_call",
+        )
+        .unwrap();
+        assert_eq!(null_error, serde_json::Value::from("0x"));
     }
 
     #[tokio::test]

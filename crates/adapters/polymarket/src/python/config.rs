@@ -246,7 +246,7 @@ impl PolymarketExecutionClientConfig {
     /// Configuration for the Polymarket execution client.
     #[new]
     #[expect(clippy::too_many_arguments)]
-    #[pyo3(signature = (account_id=None, private_key=None, api_key=None, api_secret=None, passphrase=None, funder=None, signature_type=None, base_url_http=None, base_url_ws=None, base_url_data_api=None, http_timeout_secs=None, max_retries=None, retry_delay_initial_ms=None, retry_delay_max_ms=None, heartbeat_enabled=None, transport_backend=None, proxy_url=None, instrument_config=None, signer_type=None))]
+    #[pyo3(signature = (account_id=None, private_key=None, api_key=None, api_secret=None, passphrase=None, funder=None, signature_type=None, base_url_http=None, base_url_ws=None, base_url_data_api=None, http_timeout_secs=None, max_retries=None, retry_delay_initial_ms=None, retry_delay_max_ms=None, heartbeat_enabled=None, transport_backend=None, proxy_url=None, instrument_config=None, signer_type=None, rpc_url=None, base_url_relayer=None))]
     fn py_new(
         account_id: Option<String>,
         private_key: Option<String>,
@@ -267,6 +267,8 @@ impl PolymarketExecutionClientConfig {
         proxy_url: Option<String>,
         instrument_config: Option<PolymarketInstrumentProviderConfig>,
         signer_type: Option<PolymarketSignerType>,
+        rpc_url: Option<String>,
+        base_url_relayer: Option<String>,
     ) -> PyResult<Self> {
         let default = Self::default();
         let config = Self {
@@ -281,6 +283,8 @@ impl PolymarketExecutionClientConfig {
             base_url_http,
             base_url_ws,
             base_url_data_api,
+            rpc_url: rpc_url.map(SecretString::from),
+            base_url_relayer,
             proxy_url: proxy_url.map(SecretString::from),
             http_timeout_secs: http_timeout_secs.unwrap_or(default.http_timeout_secs),
             max_retries: max_retries.unwrap_or(default.max_retries),
@@ -298,6 +302,12 @@ impl PolymarketExecutionClientConfig {
             .validated_proxy_url()
             .map_err(|e| to_pyvalue_err(format!("Invalid Polymarket proxy URL: {e}")))?;
         Ok(config)
+    }
+
+    #[getter]
+    #[pyo3(name = "has_rpc_url")]
+    const fn py_has_rpc_url(&self) -> bool {
+        self.rpc_url.is_some()
     }
 
     #[getter]
