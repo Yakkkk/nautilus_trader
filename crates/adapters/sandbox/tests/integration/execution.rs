@@ -24,16 +24,23 @@ use std::{
 };
 
 use nautilus_common::{
+    actor::{
+        DataActor,
+        registry::{ActorRef, get_actor_unchecked},
+    },
     cache::Cache,
     clients::ExecutionClient,
     clock::{Clock, VirtualClock},
     config::ConfigError,
+    enums::Environment,
     factories::SimulatedExecutionClientFactory,
-    live::set_exec_event_sender,
+    live::{runner::replace_exec_event_sender, set_exec_event_sender},
+    logging::config::LoggerConfig,
     messages::{
         ExecutionEvent,
         execution::{
             BatchCancelOrders, BatchModifyOrders, CancelAllOrders, CancelOrder,
+            ConvertExecutionOutcome, ConvertExecutionStatus, ConvertResult, ConvertTokenAmount,
             GenerateOrderStatusReportBuilder, GenerateOrderStatusReportsBuilder, ModifyOrder,
             SubmitOrder, SubmitOrderList, TradingCommand,
         },
@@ -56,17 +63,21 @@ use nautilus_execution::python::{
 };
 use nautilus_execution::{
     client::core::ExecutionClientCore,
-    engine::ExecutionEngine,
+    engine::{ExecutionEngine, polymarket_convert::convert_position_id},
     matching_engine::config::OrderPriorityResetPolicy,
     models::{
         fee::{
-            FeeModel, FeeModelAny, FeeModelHandle, MakerTakerFeeModel, ProbabilityPriceFeeModel,
+            FeeModel, FeeModelAny, FeeModelHandle, MakerTakerFeeModel, PerContractFeeModel,
+            ProbabilityPriceFeeModel,
         },
         fill::{DefaultFillModel, FillModel, FillModelAny, FillModelHandle},
         latency::{LatencyModelAny, StaticLatencyModel},
     },
 };
-use nautilus_live::manager::{ExecutionManager, ExecutionManagerConfig};
+use nautilus_live::{
+    manager::{ExecutionManager, ExecutionManagerConfig},
+    runner::AsyncRunner,
+};
 use nautilus_model::{
     accounts::{
         AccountAny, MarginAccount,
@@ -77,9 +88,9 @@ use nautilus_model::{
         QuoteTick, TradeTick,
     },
     enums::{
-        AccountType, AggressorSide, BookType, ContingencyType, InstrumentCloseType, LiquiditySide,
-        MarketStatusAction, OmsType, OrderSide, OrderStatus, OrderType, PositionSide, RecordFlag,
-        TimeInForce, TrailingOffsetType, TriggerType,
+        AccountType, AggressorSide, AssetClass, BookType, ContingencyType, InstrumentCloseType,
+        LiquiditySide, MarketStatusAction, OmsType, OrderSide, OrderStatus, OrderType,
+        PositionSide, RecordFlag, TimeInForce, TradingState, TrailingOffsetType, TriggerType,
     },
     events::{
         AccountState, OrderDenied, OrderEventAny, OrderEventType, OrderFilled, OrderPendingCancel,
@@ -89,20 +100,27 @@ use nautilus_model::{
     },
     identifiers::{
         AccountId, ClientId, ClientOrderId, InstrumentId, OrderListId, PositionId, StrategyId,
-        TradeId, TraderId, Venue, VenueOrderId,
+        Symbol, TradeId, TraderId, Venue, VenueOrderId,
     },
     instruments::{
-        CryptoPerpetual, Instrument, InstrumentAny,
+        BinaryOption, CryptoPerpetual, Instrument, InstrumentAny,
+        neg_risk::{CtfNegRiskEvent, NegRiskCondition, NegRiskOutcome},
         stubs::{binary_option, crypto_perpetual_ethusdt, futures_contract_es},
     },
     orders::{Order, OrderAny, OrderList, OrderTestBuilder, stubs::TestOrderEventStubs},
     position::Position,
     reports::OrderStatusReport,
-    types::{Currency, Money, Price, Quantity},
+    types::{AccountBalance, Currency, Money, Price, Quantity, money::MONEY_RAW_MAX},
 };
 use nautilus_sandbox::{
     SandboxExecutionClient, SandboxExecutionClientConfig, SandboxExecutionClientFactory,
 };
+use nautilus_system::{
+    ClockFactory,
+    config::KernelConfig,
+    kernel::{NautilusKernel, NautilusKernelDependencies},
+};
+use nautilus_trading::{Strategy, StrategyConfig, StrategyCore, nautilus_strategy};
 #[cfg(feature = "python")]
 use pyo3::{
     IntoPyObjectExt, Py, PyAny, Python,
@@ -111,6 +129,7 @@ use pyo3::{
 };
 use rstest::{fixture, rstest};
 use rust_decimal::Decimal;
+use rust_decimal_macros::dec;
 use ustr::Ustr;
 
 #[fixture]
@@ -11905,4 +11924,802 @@ fn create_depth(instrument_id: InstrumentId, asks: &[(&str, &str)]) -> OrderBook
         1.into(),
         1.into(),
     )
+}
+
+const CONVERT_STRATEGY_ID: &str = "CONVERT-001";
+const CONVERT_DELAY_NS: u64 = 1_000;
+
+#[derive(Debug)]
+struct SandboxConvertStrategy {
+    core: StrategyCore,
+    client_id: ClientId,
+    output: InstrumentId,
+    sell_on_applied: bool,
+    results: Rc<RefCell<Vec<ConvertResult>>>,
+    output_on_applied: Rc<RefCell<Option<Position>>>,
+}
+
+impl DataActor for SandboxConvertStrategy {}
+
+nautilus_strategy!(SandboxConvertStrategy, {
+    fn on_convert_result(&mut self, result: ConvertResult) {
+        if result.applied && self.output_on_applied.borrow().is_none() {
+            let position_id =
+                convert_position_id(self.output, StrategyId::from(CONVERT_STRATEGY_ID));
+            let position = self.cache().position(&position_id).unwrap();
+            self.output_on_applied.replace(Some(position));
+
+            if self.sell_on_applied {
+                self.market(self.output, OrderSide::Sell);
+            }
+        }
+        self.results.borrow_mut().push(result);
+    }
+});
+
+impl SandboxConvertStrategy {
+    fn market(&mut self, instrument: InstrumentId, side: OrderSide) -> ClientOrderId {
+        let order = self.order().market(
+            instrument,
+            side,
+            Quantity::from("100.000000"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        let order_id = order.client_order_id();
+        self.submit_order(order, None, Some(self.client_id), None)
+            .unwrap();
+        order_id
+    }
+
+    fn resting_limit(
+        &mut self,
+        instrument: InstrumentId,
+        side: OrderSide,
+        price: Price,
+    ) -> ClientOrderId {
+        let order = self.order().limit(
+            instrument,
+            side,
+            Quantity::from("100.000000"),
+            price,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        let order_id = order.client_order_id();
+        self.submit_order(order, None, Some(self.client_id), None)
+            .unwrap();
+        order_id
+    }
+}
+
+struct SandboxConvertHarness {
+    kernel: NautilusKernel,
+    clock: Rc<RefCell<VirtualClock>>,
+    rx: tokio::sync::mpsc::UnboundedReceiver<ExecutionEvent>,
+    account_id: AccountId,
+    client_id: ClientId,
+    instruments: Vec<InstrumentAny>,
+    mapping: CtfNegRiskEvent,
+    inputs: [InstrumentId; 2],
+    output: InstrumentId,
+    delay_ns: u64,
+    frozen: bool,
+    results: Rc<RefCell<Vec<ConvertResult>>>,
+    output_on_applied: Rc<RefCell<Option<Position>>>,
+}
+
+impl SandboxConvertHarness {
+    fn new(delay_ns: u64, mapped: bool, sell_on_applied: bool) -> Self {
+        Self::new_with_frozen(delay_ns, mapped, sell_on_applied, false)
+    }
+
+    fn new_with_frozen(delay_ns: u64, mapped: bool, sell_on_applied: bool, frozen: bool) -> Self {
+        replace_exec_cmd_sender(Arc::new(SyncTradingCommandSender));
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        replace_exec_event_sender(tx);
+
+        let config = KernelConfig::builder()
+            .environment(Environment::Sandbox)
+            .logging(LoggerConfig {
+                bypass_logging: true,
+                ..Default::default()
+            })
+            .build();
+        let mut kernel = NautilusKernel::new_with_dependencies(
+            "Sandbox Convert".to_string(),
+            config,
+            NautilusKernelDependencies::default()
+                .with_clock_factory(Some(ClockFactory::test_default())),
+        )
+        .unwrap();
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
+        let venue = Venue::new("POLYMARKET");
+        let account_id = AccountId::from("POLYMARKET-001");
+        let client_id = ClientId::new("SANDBOX");
+        let currency = Currency::pUSD();
+        let mut config = create_config(kernel.trader_id(), account_id, venue);
+        config.account_type = AccountType::Cash;
+        config.base_currency = Some(currency);
+        config.starting_balances = vec![Money::from_decimal_exact(dec!(1000), currency).unwrap()];
+        config.fee_model = Some(FeeModelAny::PerContract(
+            PerContractFeeModel::new(Money::from_decimal_exact(dec!(0.01), currency).unwrap())
+                .unwrap(),
+        ));
+        config.latency_model = (delay_ns != 0).then(|| static_latency_model(delay_ns, 0, 0));
+        config.frozen_account = frozen;
+
+        let core = ExecutionClientCore::new(
+            kernel.trader_id(),
+            client_id,
+            venue,
+            config.oms_type,
+            account_id,
+            config.account_type,
+            config.base_currency,
+            kernel.cache(),
+        );
+        let sandbox =
+            SandboxExecutionClient::new(core, config, clock.clone(), kernel.cache()).unwrap();
+        kernel
+            .exec_engine
+            .borrow_mut()
+            .register_client(Box::new(sandbox))
+            .unwrap();
+
+        let mut instruments = Vec::new();
+        let mut outcome = |name: &str, token: u8| {
+            let instrument_id = InstrumentId::from(format!("{name}.POLYMARKET"));
+            let instrument = BinaryOption::builder()
+                .instrument_id(instrument_id)
+                .raw_symbol(Symbol::new(name))
+                .asset_class(AssetClass::Alternative)
+                .currency(currency)
+                .activation_ns(UnixNanos::default())
+                .expiration_ns(UnixNanos::from(60_000_000_000_u64))
+                .price_precision(2)
+                .size_precision(6)
+                .price_increment(Price::from("0.01"))
+                .size_increment(Quantity::from("0.000001"))
+                .ts_event(UnixNanos::default())
+                .ts_init(UnixNanos::default())
+                .build()
+                .unwrap();
+            instruments.push(instrument.into());
+            NegRiskOutcome {
+                token_id: [token; 32],
+                instrument_id,
+            }
+        };
+        let conditions: Vec<_> = (0_u8..3)
+            .map(|index| NegRiskCondition {
+                index,
+                condition_id: [index + 1; 32],
+                no: outcome(&format!("NO-{index}"), 2 * index + 1),
+                yes: outcome(&format!("YES-{index}"), 2 * index + 2),
+            })
+            .collect();
+        let inputs = [
+            conditions[0].no.instrument_id,
+            conditions[1].no.instrument_id,
+        ];
+        let output = conditions[2].yes.instrument_id;
+        let mut market_id = [0; 32];
+        market_id[0] = 1;
+        let mapping = CtfNegRiskEvent::new_checked(market_id, 0, conditions).unwrap();
+        let results = Rc::new(RefCell::new(Vec::new()));
+        let output_on_applied = Rc::new(RefCell::new(None));
+        kernel
+            .trader
+            .borrow_mut()
+            .add_strategy(SandboxConvertStrategy {
+                core: StrategyCore::new(StrategyConfig {
+                    strategy_id: Some(StrategyId::from(CONVERT_STRATEGY_ID)),
+                    oms_type: Some(OmsType::Netting),
+                    ..Default::default()
+                }),
+                client_id,
+                output,
+                sell_on_applied,
+                results: results.clone(),
+                output_on_applied: output_on_applied.clone(),
+            })
+            .unwrap();
+        kernel.start();
+        kernel.start_trader().unwrap();
+
+        let mut harness = Self {
+            kernel,
+            clock,
+            rx,
+            account_id,
+            client_id,
+            instruments,
+            mapping,
+            inputs,
+            output,
+            delay_ns,
+            frozen,
+            results,
+            output_on_applied,
+        };
+        harness.seed_inputs(mapped);
+        harness
+    }
+
+    fn seed_inputs(&mut self, mapped: bool) {
+        {
+            let mut cache = self.kernel.cache.borrow_mut();
+            for instrument in &self.instruments {
+                cache.add_instrument(instrument.clone()).unwrap();
+            }
+
+            if mapped {
+                cache.add_convert_event(self.mapping.clone()).unwrap();
+            }
+        }
+        self.set_cash(Money::from_decimal_exact(dec!(1000), Currency::pUSD()).unwrap());
+
+        for (instrument_id, bid, ask) in [
+            (self.inputs[0], "0.79", "0.80"),
+            (self.inputs[1], "0.69", "0.70"),
+            (self.output, "0.70", "0.71"),
+        ] {
+            self.quote(instrument_id, bid, ask);
+        }
+
+        for input in self.inputs {
+            Self::strategy().market(input, OrderSide::Buy);
+        }
+        drain_trading_cmd_queue();
+        self.advance(self.delay_ns);
+        self.drain_events();
+        let expected_cash = if self.frozen { dec!(1000) } else { dec!(848) };
+        assert_eq!(self.cash(), expected_cash);
+    }
+
+    fn quote(&self, instrument_id: InstrumentId, bid: &str, ask: &str) {
+        let size = Quantity::from("200.000000");
+        let now = self.clock.borrow().timestamp_ns();
+        self.kernel
+            .data_engine
+            .borrow_mut()
+            .process_data(Data::Quote(QuoteTick::new(
+                instrument_id,
+                Price::from(bid),
+                Price::from(ask),
+                size,
+                size,
+                now,
+                now,
+            )));
+    }
+
+    fn set_cash(&self, total: Money) {
+        self.kernel
+            .exec_engine
+            .borrow()
+            .get_client(&self.client_id)
+            .unwrap()
+            .generate_account_state(
+                vec![AccountBalance::new(
+                    total,
+                    Money::zero(total.currency),
+                    total,
+                )],
+                Vec::new(),
+                false,
+                self.clock.borrow().timestamp_ns(),
+                None,
+            )
+            .unwrap();
+    }
+
+    fn strategy() -> ActorRef<SandboxConvertStrategy> {
+        get_actor_unchecked(&Ustr::from(CONVERT_STRATEGY_ID))
+    }
+
+    fn submit(&self, operation_id: UUID4) {
+        self.submit_quantity(operation_id, dec!(100));
+    }
+
+    fn submit_quantity(&self, operation_id: UUID4, quantity: Decimal) {
+        let inputs = self
+            .inputs
+            .map(|instrument_id| ConvertTokenAmount {
+                instrument_id,
+                quantity,
+            })
+            .to_vec();
+        Self::strategy()
+            .submit_convert(inputs, self.account_id, self.client_id, Some(operation_id))
+            .unwrap();
+    }
+
+    fn advance(&self, elapsed: u64) -> usize {
+        let due = self.clock.borrow().timestamp_ns().as_u64() + elapsed;
+        advance_and_fire(&self.clock, UnixNanos::from(due))
+    }
+
+    fn drain_events(&mut self) {
+        while let Ok(event) = self.rx.try_recv() {
+            AsyncRunner::handle_exec_event(event);
+        }
+    }
+
+    fn cash(&self) -> Decimal {
+        self.kernel
+            .cache
+            .borrow()
+            .account(&self.account_id)
+            .unwrap()
+            .balance(Some(Currency::pUSD()))
+            .unwrap()
+            .total
+            .as_decimal()
+    }
+
+    fn position(&self, instrument_id: InstrumentId) -> Option<Position> {
+        let position_id = convert_position_id(instrument_id, CONVERT_STRATEGY_ID.into());
+        self.kernel.cache.borrow().position_owned(&position_id)
+    }
+}
+
+#[rstest]
+#[case::inline(0)]
+#[case::delayed(CONVERT_DELAY_NS)]
+fn test_sandbox_convert_strategy_round_trip(#[case] delay_ns: u64) {
+    let mut harness = SandboxConvertHarness::new(delay_ns, true, true);
+    let operation_id = UUID4::new();
+    harness.submit(operation_id);
+    harness.submit(operation_id);
+    drain_trading_cmd_queue();
+
+    if delay_ns != 0 {
+        assert_eq!(harness.advance(delay_ns - 1), 0);
+        assert!(harness.rx.try_recv().is_err());
+        assert_eq!(harness.advance(1), 1);
+    }
+    let ExecutionEvent::SimulatedConvert(emitted) = harness.rx.try_recv().unwrap() else {
+        panic!("Sandbox must emit its own queued Convert evidence");
+    };
+    let mut wrong_account = emitted.clone();
+    wrong_account.event.account_id = AccountId::from("POLYMARKET-002");
+    AsyncRunner::handle_exec_event(ExecutionEvent::SimulatedConvert(wrong_account));
+    assert!(harness.position(harness.output).is_none());
+    assert_eq!(harness.cash(), dec!(848));
+    AsyncRunner::handle_exec_event(ExecutionEvent::SimulatedConvert(emitted.clone()));
+    harness.drain_events();
+    assert_eq!(harness.cash(), dec!(948));
+    let opened = harness.output_on_applied.borrow().clone().unwrap();
+    assert_eq!(opened.quantity.as_decimal(), dec!(100));
+    assert_eq!(opened.cost_open, dec!(50));
+    assert_eq!(opened.opening_operation_id, Some(operation_id));
+    assert!(opened.opening_order_id.is_none());
+    assert!(opened.events.is_empty());
+    drain_trading_cmd_queue();
+    harness.advance(delay_ns);
+    harness.drain_events();
+
+    let record = harness
+        .kernel
+        .exec_engine
+        .borrow()
+        .convert_record(operation_id)
+        .unwrap()
+        .unwrap();
+    let plan = record.plan.unwrap();
+    assert_eq!(
+        plan.iter()
+            .find(|leg| leg.instrument_id == harness.inputs[0])
+            .unwrap()
+            .cost,
+        dec!(80)
+    );
+    assert_eq!(
+        plan.iter()
+            .find(|leg| leg.instrument_id == harness.inputs[1])
+            .unwrap()
+            .cost,
+        dec!(70)
+    );
+    AsyncRunner::handle_exec_event(ExecutionEvent::SimulatedConvert(emitted));
+    harness.submit(operation_id);
+    SandboxConvertHarness::strategy()
+        .query_convert(operation_id, harness.account_id, harness.client_id)
+        .unwrap();
+    drain_trading_cmd_queue();
+    harness.drain_events();
+
+    let output = harness.position(harness.output).unwrap();
+    assert!(output.is_closed());
+    assert_eq!(output.events.len(), 1);
+    assert_eq!(output.events[0].last_px, Price::from("0.70"));
+    assert_eq!(output.events[0].last_qty.as_decimal(), dec!(100));
+    assert_eq!(output.commissions()[0].as_decimal(), dec!(1));
+    assert_eq!(output.realized_pnl.unwrap().as_decimal(), dec!(19));
+    for input in harness.inputs {
+        let position = harness.position(input).unwrap();
+        assert!(position.is_closed());
+        assert_eq!(position.events.len(), 1);
+        assert_eq!(position.commissions()[0].as_decimal(), dec!(1));
+    }
+    assert_eq!(harness.cash(), dec!(1017));
+    assert_eq!(
+        harness
+            .kernel
+            .cache
+            .borrow()
+            .orders_refs(None, None, None, None, None)
+            .len(),
+        3
+    );
+}
+
+#[rstest]
+fn test_sandbox_convert_shares_due_ordering_and_protects_inventory_before_core() {
+    let mut harness = SandboxConvertHarness::new(CONVERT_DELAY_NS, true, false);
+    let first = UUID4::new();
+    let competing = UUID4::new();
+    harness.submit(first);
+    harness.submit(competing);
+    let sale = SandboxConvertHarness::strategy().market(harness.inputs[0], OrderSide::Sell);
+    drain_trading_cmd_queue();
+    harness.drain_events();
+    assert_eq!(harness.advance(CONVERT_DELAY_NS - 1), 0);
+    assert!(harness.rx.try_recv().is_err());
+    assert_eq!(harness.advance(1), 1);
+    assert_eq!(
+        harness.position(harness.inputs[0]).unwrap().signed_qty,
+        dec!(100)
+    );
+    assert!(harness.position(harness.output).is_none());
+    let events: Vec<_> = std::iter::from_fn(|| harness.rx.try_recv().ok()).collect();
+    assert!(matches!(
+        &events[..],
+        [
+            ExecutionEvent::SimulatedConvert(accepted),
+            ExecutionEvent::SimulatedConvert(rejected),
+            ExecutionEvent::Order(OrderEventAny::Rejected(order)),
+        ] if accepted.event.operation_id == first
+            && matches!(accepted.event.outcome, ConvertExecutionOutcome::Confirmed { .. })
+            && rejected.event.operation_id == competing
+            && matches!(rejected.event.outcome, ConvertExecutionOutcome::Rejected(_))
+            && order.client_order_id == sale
+    ));
+
+    for event in events {
+        AsyncRunner::handle_exec_event(event);
+    }
+
+    let cache = harness.kernel.cache.borrow();
+    let first = cache.load_convert_operation(first).unwrap().unwrap();
+    let competing = cache.load_convert_operation(competing).unwrap().unwrap();
+    assert!(first.applied, "{first:?}");
+    assert!(competing.dispatched, "{competing:?}");
+    assert_eq!(competing.status, Some(ConvertExecutionStatus::Rejected));
+    assert!(competing.reason.unwrap().contains("inventory"));
+    assert_eq!(cache.order(&sale).unwrap().status(), OrderStatus::Rejected);
+    drop(cache);
+    assert_eq!(harness.cash(), dec!(948));
+    assert_eq!(
+        harness.position(harness.output).unwrap().signed_qty,
+        dec!(100)
+    );
+}
+
+#[rstest]
+fn test_sandbox_convert_releases_inventory_for_resting_sell_after_applied() {
+    let mut harness = SandboxConvertHarness::new(0, true, false);
+    let input = harness.inputs[0];
+    SandboxConvertHarness::strategy().market(input, OrderSide::Buy);
+    drain_trading_cmd_queue();
+    harness.drain_events();
+    let sale = SandboxConvertHarness::strategy().resting_limit(
+        input,
+        OrderSide::Sell,
+        Price::from("0.85"),
+    );
+    drain_trading_cmd_queue();
+    harness.drain_events();
+
+    let operation_id = UUID4::new();
+    harness.submit(operation_id);
+    drain_trading_cmd_queue();
+    harness.drain_events();
+    assert!(harness.results.borrow().iter().any(|result| result.applied));
+    assert_eq!(harness.position(input).unwrap().signed_qty, dec!(100));
+
+    harness.advance(1);
+    harness.quote(input, "0.85", "0.86");
+    harness.drain_events();
+
+    let cache = harness.kernel.cache.borrow();
+    let order = cache.order(&sale).unwrap();
+    assert_eq!(order.status(), OrderStatus::Filled);
+    assert_eq!(order.filled_qty().as_decimal(), dec!(100));
+    assert_eq!(harness.position(input).unwrap().signed_qty, Decimal::ZERO);
+    assert_eq!(harness.cash(), dec!(951));
+}
+
+#[rstest]
+fn test_sandbox_convert_conflicting_duplicate_keeps_original_inventory_consumed() {
+    let mut harness = SandboxConvertHarness::new(0, true, false);
+    let original = UUID4::new();
+    let competing = UUID4::new();
+    harness.submit(original);
+    drain_trading_cmd_queue();
+    assert_eq!(
+        harness.position(harness.inputs[0]).unwrap().signed_qty,
+        dec!(100),
+    );
+
+    harness.submit_quantity(original, dec!(50));
+    harness.submit(competing);
+    drain_trading_cmd_queue();
+    harness.drain_events();
+
+    let results = harness.results.borrow();
+    assert!(results.iter().any(|result| {
+        result.operation_id == original
+            && result.status == ConvertExecutionStatus::Rejected
+            && result
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("conflicts"))
+    }));
+    let cache = harness.kernel.cache.borrow();
+    assert!(
+        cache
+            .load_convert_operation(original)
+            .unwrap()
+            .unwrap()
+            .applied
+    );
+    let competing = cache.load_convert_operation(competing).unwrap().unwrap();
+    assert!(competing.dispatched);
+    assert_eq!(competing.status, Some(ConvertExecutionStatus::Rejected));
+    assert!(competing.reason.unwrap().contains("inventory"));
+    assert_eq!(harness.cash(), dec!(948));
+}
+
+#[rstest]
+fn test_sandbox_convert_cash_credit_preserves_pending_buy_reservation() {
+    let mut harness = SandboxConvertHarness::new(0, true, false);
+    let buy = SandboxConvertHarness::strategy().resting_limit(
+        harness.output,
+        OrderSide::Buy,
+        Price::from("0.30"),
+    );
+    drain_trading_cmd_queue();
+    harness.drain_events();
+    let currency = Currency::pUSD();
+    let buy_lock = (harness.output, currency);
+    let cache = harness.kernel.cache();
+    let account_id = harness.account_id;
+    let account = || cache.borrow().account_owned(&account_id).unwrap();
+    let AccountAny::Cash(before) = account() else {
+        panic!("expected a cash account");
+    };
+    assert_eq!(before.balances_locked[&buy_lock].as_decimal(), dec!(30));
+    assert_eq!(
+        harness.kernel.cache.borrow().order(&buy).unwrap().status(),
+        OrderStatus::Accepted,
+    );
+
+    harness.submit(UUID4::new());
+    drain_trading_cmd_queue();
+    harness.drain_events();
+    let AccountAny::Cash(after) = account() else {
+        panic!("expected a cash account");
+    };
+    assert_eq!(after.balances_locked, before.balances_locked);
+    assert_eq!(harness.cash(), dec!(948));
+}
+
+#[rstest]
+fn test_sandbox_convert_cash_overflow_rejects_without_retaining_inventory() {
+    let mut harness = SandboxConvertHarness::new(CONVERT_DELAY_NS, true, false);
+    let operation_id = UUID4::new();
+    harness.submit(operation_id);
+    drain_trading_cmd_queue();
+    assert_eq!(harness.advance(CONVERT_DELAY_NS), 1);
+    let max_cash = Money::from_raw(MONEY_RAW_MAX, Currency::pUSD());
+    harness.set_cash(max_cash);
+    let ExecutionEvent::SimulatedConvert(emitted) = harness.rx.try_recv().unwrap() else {
+        panic!("Sandbox must emit its own queued Convert evidence");
+    };
+    AsyncRunner::handle_exec_event(ExecutionEvent::SimulatedConvert(emitted.clone()));
+
+    let result = harness.results.borrow().last().cloned().unwrap();
+    assert_eq!(result.operation_id, operation_id);
+    assert_eq!(result.status, ConvertExecutionStatus::Rejected);
+    assert!(result.reason.unwrap().contains("overflow"));
+    assert!(!result.applied);
+    assert_eq!(harness.cash(), max_cash.as_decimal());
+    assert!(harness.position(harness.output).is_none());
+
+    harness.set_cash(Money::from_decimal_exact(dec!(848), Currency::pUSD()).unwrap());
+    AsyncRunner::handle_exec_event(ExecutionEvent::SimulatedConvert(emitted));
+    assert_eq!(harness.cash(), dec!(848));
+    assert!(harness.position(harness.output).is_none());
+    let fresh = UUID4::new();
+    harness.submit(fresh);
+    drain_trading_cmd_queue();
+    assert_eq!(harness.advance(CONVERT_DELAY_NS), 1);
+    harness.drain_events();
+    let result = harness.results.borrow().last().cloned().unwrap();
+    assert_eq!(result.operation_id, fresh);
+    assert!(result.applied);
+    assert_eq!(harness.cash(), dec!(948));
+}
+
+#[rstest]
+fn test_sandbox_convert_frozen_account_skips_cash_credit() {
+    let mut harness = SandboxConvertHarness::new_with_frozen(0, true, false, true);
+    harness.set_cash(Money::from_decimal_exact(dec!(848), Currency::pUSD()).unwrap());
+
+    let operation_id = UUID4::new();
+    harness.submit(operation_id);
+    drain_trading_cmd_queue();
+    harness.advance(0);
+    harness.drain_events();
+
+    let result = harness.results.borrow().last().cloned().unwrap();
+    assert_eq!(result.operation_id, operation_id);
+    assert!(result.applied);
+    assert_eq!(harness.cash(), dec!(848));
+    for input in harness.inputs {
+        assert!(harness.position(input).unwrap().is_closed());
+    }
+    assert_eq!(
+        harness.position(harness.output).unwrap().signed_qty,
+        dec!(100)
+    );
+}
+
+#[rstest]
+#[case::stopped(false)]
+#[case::runner_closed(true)]
+fn test_sandbox_convert_dispatch_rejection(#[case] close_runner: bool) {
+    let mut harness = SandboxConvertHarness::new(CONVERT_DELAY_NS, true, false);
+    if close_runner {
+        harness.rx.close();
+    } else {
+        harness.kernel.exec_engine.borrow_mut().stop();
+    }
+
+    let operation_id = UUID4::new();
+    harness.submit(operation_id);
+    drain_trading_cmd_queue();
+    assert_eq!(harness.advance(CONVERT_DELAY_NS), 0);
+    harness.drain_events();
+
+    let result = harness.results.borrow().last().cloned().unwrap();
+    assert_eq!(result.operation_id, operation_id);
+    assert_eq!(result.status, ConvertExecutionStatus::Rejected);
+    assert!(!result.applied);
+    assert_eq!(harness.cash(), dec!(848));
+    assert!(harness.position(harness.output).is_none());
+}
+
+#[rstest]
+#[case::missing_mapping(false, TradingState::Active, "mapping")]
+#[case::halted(true, TradingState::Halted, "Halted")]
+fn test_sandbox_convert_risk_rejection(
+    #[case] mapped: bool,
+    #[case] trading_state: TradingState,
+    #[case] reason: &str,
+) {
+    let mut harness = SandboxConvertHarness::new(0, mapped, false);
+    harness
+        .kernel
+        .risk_engine
+        .borrow_mut()
+        .set_trading_state(trading_state);
+    let operation_id = UUID4::new();
+    harness.submit(operation_id);
+    drain_trading_cmd_queue();
+    harness.drain_events();
+
+    let results = harness.results.borrow();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].operation_id, operation_id);
+    assert_eq!(results[0].status, ConvertExecutionStatus::Rejected);
+    let actual = results[0].reason.as_deref().unwrap();
+    assert!(
+        actual.to_lowercase().contains(&reason.to_lowercase()),
+        "{actual}"
+    );
+    assert!(!results[0].applied);
+    assert!(harness.position(harness.output).is_none());
+    assert_eq!(harness.cash(), dec!(848));
+}
+
+#[rstest]
+#[case::stop_before_due(false, false)]
+#[case::stop_after_due(false, true)]
+#[case::reset_before_due(true, false)]
+#[case::reset_after_due(true, true)]
+fn test_sandbox_convert_lifecycle_discards_old_effects(#[case] reset: bool, #[case] due: bool) {
+    let mut harness = SandboxConvertHarness::new(CONVERT_DELAY_NS, true, false);
+    let old = UUID4::new();
+    harness.submit(old);
+    drain_trading_cmd_queue();
+    let alert = format!("{}-sandbox-inbound-alert", harness.client_id);
+    assert!(harness.clock.borrow().next_time_ns(&alert).is_some());
+
+    let held: Vec<_> = if due {
+        assert_eq!(harness.advance(CONVERT_DELAY_NS), 1);
+        let held: Vec<_> = std::iter::from_fn(|| harness.rx.try_recv().ok()).collect();
+        assert!(!held.is_empty());
+        held
+    } else {
+        Vec::new()
+    };
+
+    if reset {
+        harness.kernel.exec_engine.borrow_mut().reset();
+        harness.seed_inputs(true);
+    } else {
+        harness.kernel.exec_engine.borrow_mut().stop();
+        harness.drain_events();
+        if !due {
+            let results = harness.results.borrow();
+            assert_eq!(results.len(), 1);
+            assert_eq!(results[0].operation_id, old);
+            assert_eq!(results[0].status, ConvertExecutionStatus::Rejected);
+        }
+        harness.kernel.exec_engine.borrow_mut().start();
+    }
+    assert!(harness.clock.borrow().next_time_ns(&alert).is_none());
+
+    let fresh = if reset { old } else { UUID4::new() };
+    harness.submit(fresh);
+    drain_trading_cmd_queue();
+
+    for event in held {
+        AsyncRunner::handle_exec_event(event);
+    }
+    assert!(harness.position(harness.output).is_none());
+    assert_eq!(harness.cash(), dec!(848));
+    assert!(
+        harness
+            .results
+            .borrow()
+            .iter()
+            .all(|result| !result.applied)
+    );
+
+    assert_eq!(harness.advance(CONVERT_DELAY_NS), 1);
+    harness.drain_events();
+    assert_eq!(harness.cash(), dec!(948));
+    assert_eq!(
+        harness.position(harness.output).unwrap().signed_qty,
+        dec!(100)
+    );
+    let results = harness.results.borrow();
+    assert_eq!(
+        results
+            .iter()
+            .filter(|result| result.applied)
+            .map(|result| result.operation_id)
+            .collect::<Vec<_>>(),
+        vec![fresh],
+    );
 }

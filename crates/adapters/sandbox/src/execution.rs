@@ -15,7 +15,7 @@
 
 //! Sandbox execution client implementation.
 
-use std::{cell::RefCell, collections::BinaryHeap, fmt::Debug, rc::Rc};
+use std::{cell::RefCell, collections::BinaryHeap, fmt::Debug, rc::Rc, sync::Arc};
 
 use ahash::{AHashMap, AHashSet};
 use async_trait::async_trait;
@@ -29,9 +29,11 @@ use nautilus_common::{
         ExecutionEvent,
         execution::{
             BatchCancelOrders, BatchModifyOrders, CancelAllOrders, CancelOrder,
-            GenerateFillReports, GenerateOrderStatusReport, GenerateOrderStatusReports,
-            GeneratePositionStatusReports, ModifyOrder, QueryAccount, QueryOrder, SubmitOrder,
-            SubmitOrderList, TradingCommand,
+            ConvertExecutionEvent, ConvertExecutionOutcome, ConvertExecutionStatus, ConvertResult,
+            ConvertTransaction, GenerateFillReports, GenerateOrderStatusReport,
+            GenerateOrderStatusReports, GeneratePositionStatusReports, ModifyOrder, QueryAccount,
+            QueryOrder, SimulatedConvertExecutionEvent, SubmitConvert, SubmitOrder,
+            SubmitOrderList, TradingCommand, VerifiedConvert,
         },
     },
     msgbus::{
@@ -43,6 +45,10 @@ use nautilus_common::{
 use nautilus_core::{DurationNanos, Params, UUID4, UnixNanos, WeakCell};
 use nautilus_execution::{
     client::core::ExecutionClientCore,
+    engine::polymarket_convert::{
+        ConvertPendingInventory, calculate_convert_effect, convert_position_id,
+        validate_simulated_convert_effect,
+    },
     matching_engine::{
         OrderMatchingEngine,
         inflight::InflightOrders,
@@ -59,11 +65,12 @@ use nautilus_model::{
     enums::OmsType,
     events::{OrderCancelDenied, OrderEventAny, OrderModifyDenied, OrderRejected, PositionEvent},
     identifiers::{AccountId, ClientId, ClientOrderId, InstrumentId, Venue},
-    instruments::{Instrument, InstrumentAny},
+    instruments::{Instrument, InstrumentAny, neg_risk::ConvertScope},
     orders::{Order, OrderAny},
     reports::{ExecutionMassStatus, FillReport, OrderStatusReport, PositionStatusReport},
     types::{AccountBalance, MarginBalance, Money},
 };
+use rust_decimal::Decimal;
 use ustr::Ustr;
 
 use crate::config::SandboxExecutionClientConfig;
@@ -106,6 +113,8 @@ struct RegisteredHandlers {
     close_handler: ShareableMessageHandler,
     position_pattern: MStr<Pattern>,
     position_handler: TypedHandler<PositionEvent>,
+    convert_pattern: MStr<Pattern>,
+    convert_handler: ShareableMessageHandler,
 }
 
 impl Debug for SandboxExecutionClient {
@@ -194,6 +203,8 @@ impl SandboxExecutionClient {
                 inbound_seq: 0,
                 client_id: core.client_id,
                 account_id: core.account_id,
+                run_lease: Arc::new(()),
+                convert_inventory: Rc::new(RefCell::new(ConvertPendingInventory::default())),
                 self_weak: WeakCell::from(weak.clone()),
             })
         });
@@ -316,9 +327,18 @@ impl SandboxExecutionClient {
         };
 
         let position_handler = {
+            let inner = inner_weak.clone();
             TypedHandler::from(move |event: &PositionEvent| {
-                if let Some(inner_rc) = inner_weak.upgrade() {
+                if let Some(inner_rc) = inner.upgrade() {
                     SandboxInner::on_position_event(&inner_rc, event);
+                }
+            })
+        };
+
+        let convert_handler = {
+            ShareableMessageHandler::from_typed(move |result: &ConvertResult| {
+                if let Some(inner_rc) = inner_weak.upgrade() {
+                    SandboxInner::on_convert_result(&inner_rc, result);
                 }
             })
         };
@@ -331,6 +351,7 @@ impl SandboxExecutionClient {
         let status_pattern: MStr<Pattern> = format!("data.status.{venue}.*").into();
         let close_pattern: MStr<Pattern> = format!("data.close.{venue}.*").into();
         let position_pattern: MStr<Pattern> = "events.position.*".into();
+        let convert_pattern: MStr<Pattern> = "events.convert.*".into();
 
         msgbus::subscribe_book_deltas(deltas_pattern, deltas_handler.clone(), Some(10));
         msgbus::subscribe_book_depth(depth_pattern, depth_handler.clone(), Some(10));
@@ -340,6 +361,7 @@ impl SandboxExecutionClient {
         msgbus::subscribe_any(status_pattern, status_handler.clone(), Some(10));
         msgbus::subscribe_instrument_close(close_pattern, close_handler.clone(), Some(10));
         msgbus::subscribe_position_events(position_pattern, position_handler.clone(), Some(10));
+        msgbus::subscribe_any(convert_pattern, convert_handler.clone(), Some(10));
 
         *self.handlers.borrow_mut() = Some(RegisteredHandlers {
             deltas_pattern,
@@ -358,6 +380,8 @@ impl SandboxExecutionClient {
             close_handler,
             position_pattern,
             position_handler,
+            convert_pattern,
+            convert_handler,
         });
 
         log::debug!(
@@ -379,6 +403,7 @@ impl SandboxExecutionClient {
                 handlers.position_pattern,
                 &handlers.position_handler,
             );
+            msgbus::unsubscribe_any(handlers.convert_pattern, &handlers.convert_handler);
 
             log::debug!(
                 "Sandbox deregistered message handlers for venue={}",
@@ -574,6 +599,9 @@ impl SandboxExecutionClient {
     /// Resets the sandbox to its initial state.
     pub fn reset(&self) {
         let mut inner = self.inner.borrow_mut();
+        inner.replace_run_lease();
+        inner.clear_convert_runtime();
+
         for engine in inner.matching_engines.values_mut() {
             engine.reset();
         }
@@ -697,7 +725,11 @@ impl ExecutionClient for SandboxExecutionClient {
             }
         }
 
-        self.inner.borrow_mut().load_open_orders();
+        {
+            let mut inner = self.inner.borrow_mut();
+            inner.replace_run_lease();
+            inner.load_open_orders();
+        }
 
         self.register_message_handlers();
         self.register_expiry_sweep_timer();
@@ -719,6 +751,7 @@ impl ExecutionClient for SandboxExecutionClient {
             return Ok(());
         }
 
+        self.inner.borrow_mut().replace_run_lease();
         self.deregister_message_handlers();
         self.cancel_expiry_sweep_timer();
         self.cancel_inbound_alert();
@@ -731,6 +764,7 @@ impl ExecutionClient for SandboxExecutionClient {
             let mut inner = self.inner.borrow_mut();
             let discarded = inner.take_inbound_queue();
             inner.refuse_discarded(discarded);
+            inner.clear_convert_runtime();
         }
 
         self.core.borrow().set_stopped();
@@ -817,6 +851,22 @@ impl ExecutionClient for SandboxExecutionClient {
         } else {
             inner.defer_or_apply(TradingCommand::SubmitOrderList(cmd));
         }
+        Ok(())
+    }
+
+    fn submit_convert(&self, cmd: SubmitConvert, scope: ConvertScope) -> anyhow::Result<()> {
+        if self.core.borrow().is_stopped() {
+            anyhow::bail!("Sandbox execution client is stopped");
+        }
+        let sender = try_get_exec_event_sender()
+            .ok_or_else(|| anyhow::anyhow!("execution event sender is not initialized"))?;
+        if sender.is_closed() {
+            anyhow::bail!("execution event channel is closed");
+        }
+
+        self.inner
+            .borrow_mut()
+            .defer_or_apply_scoped(TradingCommand::SubmitConvert(cmd), Some(scope));
         Ok(())
     }
 
@@ -1003,6 +1053,8 @@ struct SandboxInner {
     inbound_seq: u64,
     client_id: ClientId,
     account_id: AccountId,
+    run_lease: Arc<()>,
+    convert_inventory: Rc<RefCell<ConvertPendingInventory>>,
     self_weak: WeakCell<Self>,
 }
 
@@ -1013,6 +1065,7 @@ struct DelayedCommand {
     due_ns: UnixNanos,
     seq: u64,
     command: TradingCommand,
+    convert_scope: Option<ConvertScope>,
 }
 
 impl Ord for DelayedCommand {
@@ -1112,6 +1165,7 @@ impl SandboxInner {
 
             engine.set_inflight_orders(self.inflight_orders.clone());
             engine.set_matching_orders(self.matching_orders.clone());
+            engine.set_pending_convert_inventory(Rc::clone(&self.convert_inventory));
             self.matching_engines.insert(instrument_id, engine);
         }
     }
@@ -1341,7 +1395,11 @@ impl SandboxInner {
     }
 
     /// Routes a deferred [`TradingCommand`] to its venue-side apply helper.
-    fn apply_trading_command(&mut self, cmd: &TradingCommand) -> anyhow::Result<()> {
+    fn apply_trading_command(
+        &mut self,
+        cmd: &TradingCommand,
+        convert_scope: Option<&ConvertScope>,
+    ) -> anyhow::Result<()> {
         self.inflight_orders.remove(cmd);
 
         // Only a deferred command can overtake the submit that would have created the engine, so
@@ -1372,11 +1430,229 @@ impl SandboxInner {
             TradingCommand::CancelOrders(cmd) => self.apply_batch_cancel_orders(cmd),
             TradingCommand::CancelAllOrders(cmd) => self.apply_cancel_all_orders(cmd),
             TradingCommand::QueryOrder(_) | TradingCommand::QueryAccount(_) => {}
-            TradingCommand::SubmitConvert(_) | TradingCommand::QueryConvert(_) => {
-                anyhow::bail!("Sandbox execution does not support Convert")
-            }
+            TradingCommand::SubmitConvert(cmd) => self.apply_convert(
+                cmd,
+                convert_scope.expect("a submitted conversion carries its admitted scope"),
+            )?,
+            TradingCommand::QueryConvert(_) => {}
         }
         Ok(())
+    }
+
+    fn apply_convert(&mut self, cmd: &SubmitConvert, scope: &ConvertScope) -> anyhow::Result<()> {
+        if cmd.client_id != self.client_id || cmd.account_id != self.account_id {
+            anyhow::bail!(
+                "conversion belongs to client {} and account {}, expected client {} and account {}",
+                cmd.client_id,
+                cmd.account_id,
+                self.client_id,
+                self.account_id,
+            );
+        }
+
+        let first_input = cmd
+            .inputs
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("a conversion requires at least one NO input"))?;
+        let event = {
+            let cache = self.cache.borrow();
+            cache
+                .convert_event_for_instrument(&first_input.instrument_id)
+                .cloned()
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "no complete negative-risk event mapping for input {}",
+                        first_input.instrument_id,
+                    )
+                })?
+        };
+        let effect = calculate_convert_effect(&event, &cmd.inputs).map_err(anyhow::Error::msg)?;
+        let currency = {
+            let cache = self.cache.borrow();
+            validate_simulated_convert_effect(&cache, cmd, scope, &effect)
+                .map_err(anyhow::Error::msg)?
+        };
+        let net_cash = Money::from_decimal_exact(effect.net_cash, currency).map_err(|e| {
+            anyhow::anyhow!("conversion net cash cannot be represented exactly: {e}")
+        })?;
+
+        for instrument_id in effect
+            .inputs
+            .iter()
+            .chain(effect.outputs.iter())
+            .map(|leg| leg.instrument_id)
+        {
+            if !self.ensure_engine_for(instrument_id) {
+                anyhow::bail!("no matching engine for conversion instrument {instrument_id}");
+            }
+        }
+
+        for output in &effect.outputs {
+            let position_id = convert_position_id(output.instrument_id, cmd.strategy_id);
+            let matching_engine = self
+                .matching_engines
+                .get_mut(&output.instrument_id)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "no matching engine for conversion output {}",
+                        output.instrument_id,
+                    )
+                })?;
+            let actual = matching_engine
+                .available_position_quantity(position_id)
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "cannot read simulated inventory for conversion output {}: {e}",
+                        output.instrument_id,
+                    )
+                })?;
+
+            if actual < Decimal::ZERO {
+                anyhow::bail!(
+                    "conversion output {} would be short after pending fills: signed quantity {actual}",
+                    output.instrument_id,
+                );
+            }
+        }
+
+        for input in &effect.inputs {
+            let position_id = convert_position_id(input.instrument_id, cmd.strategy_id);
+            let matching_engine = self
+                .matching_engines
+                .get_mut(&input.instrument_id)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "no matching engine for conversion input {}",
+                        input.instrument_id,
+                    )
+                })?;
+
+            if matching_engine.has_unapplied_fills_for_position(position_id) {
+                anyhow::bail!(
+                    "conversion input {} has fill activity which the core has not applied",
+                    input.instrument_id,
+                );
+            }
+
+            let available = matching_engine
+                .available_position_quantity(position_id)
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "cannot read simulated inventory for conversion input {}: {e}",
+                        input.instrument_id,
+                    )
+                })?;
+            let committed = matching_engine
+                .arrived_sell_remaining(cmd.strategy_id, cmd.account_id)
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "cannot read committed sell inventory for conversion input {}: {e}",
+                        input.instrument_id,
+                    )
+                })?;
+            let required = committed.checked_add(input.quantity).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "conversion inventory requirement overflow for {}",
+                    input.instrument_id,
+                )
+            })?;
+
+            if available < required {
+                anyhow::bail!(
+                    "insufficient uncommitted simulated NO inventory for {}: available {available}, committed sell {committed}, required {}",
+                    input.instrument_id,
+                    input.quantity,
+                );
+            }
+        }
+
+        let legs = effect
+            .inputs
+            .iter()
+            .map(|input| {
+                (
+                    convert_position_id(input.instrument_id, cmd.strategy_id),
+                    input.quantity,
+                )
+            })
+            .collect();
+        self.convert_inventory
+            .borrow_mut()
+            .reserve(cmd.operation_id, legs)
+            .map_err(anyhow::Error::msg)?;
+
+        let transaction = ConvertTransaction {
+            wallet: format!("sim-wallet-{}", cmd.account_id),
+            relayer_transaction_id: Some(format!("sim-{}", cmd.operation_id)),
+            transaction_hash: None,
+            nonce: None,
+            call_summary: Some("simulated negative-risk conversion".to_string()),
+        };
+        let affected_instruments = effect
+            .inputs
+            .iter()
+            .chain(effect.outputs.iter())
+            .map(|leg| leg.instrument_id)
+            .collect();
+        let ts_event = self.clock.borrow().timestamp_ns();
+        let verified = VerifiedConvert {
+            operation_id: cmd.operation_id,
+            trader_id: cmd.trader_id,
+            strategy_id: cmd.strategy_id,
+            account_id: cmd.account_id,
+            transaction,
+            inputs: effect.inputs,
+            outputs: effect.outputs,
+            affected_instruments,
+            net_cash,
+            ts_event,
+        };
+        let event = ConvertExecutionEvent {
+            operation_id: cmd.operation_id,
+            account_id: cmd.account_id,
+            client_id: cmd.client_id,
+            outcome: ConvertExecutionOutcome::Confirmed {
+                verified: Box::new(verified),
+                pending_inputs: Vec::new(),
+            },
+        };
+
+        if let Err(e) = self.dispatch_convert_event(event) {
+            self.convert_inventory
+                .borrow_mut()
+                .release(cmd.operation_id);
+            return Err(e);
+        }
+
+        log::debug!(
+            "Simulated conversion {} consumed inputs and is awaiting ordered delivery",
+            cmd.operation_id,
+        );
+        Ok(())
+    }
+
+    fn refuse_convert(&self, cmd: &SubmitConvert, reason: &str) {
+        let event = ConvertExecutionEvent {
+            operation_id: cmd.operation_id,
+            account_id: cmd.account_id,
+            client_id: cmd.client_id,
+            outcome: ConvertExecutionOutcome::Rejected(reason.to_string()),
+        };
+
+        if let Err(e) = self.dispatch_convert_event(event) {
+            log::error!(
+                "Cannot dispatch rejected conversion {}: {e}",
+                cmd.operation_id,
+            );
+        }
+    }
+
+    fn refuse_apply_error(&self, command: &TradingCommand, error: &anyhow::Error) {
+        if matches!(command, TradingCommand::SubmitConvert(_)) {
+            self.refuse_command(command, error.to_string().as_str());
+        } else {
+            self.refuse_command(command, "Command could not be applied at the venue");
+        }
     }
 
     fn refuse_command(&self, command: &TradingCommand, reason: &str) {
@@ -1463,7 +1739,8 @@ impl SandboxInner {
             // Cancel-all carries no individual command IDs to deny
             TradingCommand::CancelAllOrders(_) => {}
             TradingCommand::QueryOrder(_) | TradingCommand::QueryAccount(_) => {}
-            TradingCommand::SubmitConvert(_) | TradingCommand::QueryConvert(_) => {}
+            TradingCommand::SubmitConvert(cmd) => self.refuse_convert(cmd, reason.as_str()),
+            TradingCommand::QueryConvert(_) => {}
         }
     }
 
@@ -1507,6 +1784,32 @@ impl SandboxInner {
         } else {
             msgbus::send_order_event(MessagingSwitchboard::exec_engine_process(), event);
         }
+    }
+
+    fn replace_run_lease(&mut self) {
+        self.run_lease = Arc::new(());
+    }
+
+    fn clear_convert_runtime(&self) {
+        self.convert_inventory.borrow_mut().clear();
+    }
+
+    fn dispatch_convert_event(&self, event: ConvertExecutionEvent) -> anyhow::Result<()> {
+        let sender = try_get_exec_event_sender()
+            .ok_or_else(|| anyhow::anyhow!("execution event sender is not initialized"))?;
+        sender
+            .send(ExecutionEvent::SimulatedConvert(
+                SimulatedConvertExecutionEvent {
+                    lease: Arc::downgrade(&self.run_lease),
+                    apply_cash: !self.config.frozen_account,
+                    event,
+                },
+            ))
+            .map_err(|e| anyhow::anyhow!("failed to send simulated Convert outcome: {e:?}"))
+    }
+
+    fn release_convert_inventory(&self, operation_id: UUID4) {
+        self.convert_inventory.borrow_mut().release(operation_id);
     }
 
     /// Creates the matching engine from the cached instrument when it does not exist yet, so it can
@@ -1736,7 +2039,13 @@ impl SandboxInner {
 
     /// Enqueues a trading command to be applied after its inbound latency elapses, as backtest
     /// `generate_inflight_command` does, but keyed off arrival rather than `command.ts_init()`.
-    fn enqueue(&mut self, command: TradingCommand, now_ns: UnixNanos, due_ns: UnixNanos) {
+    fn enqueue(
+        &mut self,
+        command: TradingCommand,
+        convert_scope: Option<ConvertScope>,
+        now_ns: UnixNanos,
+        due_ns: UnixNanos,
+    ) {
         let seq = self.inbound_seq;
         self.inbound_seq += 1;
 
@@ -1745,16 +2054,25 @@ impl SandboxInner {
             due_ns,
             seq,
             command,
+            convert_scope,
         });
 
         self.arm_inbound_alert(now_ns);
+    }
+
+    fn defer_or_apply(&mut self, command: TradingCommand) {
+        self.defer_or_apply_scoped(command, None);
     }
 
     /// Defers `command` by its inbound latency leg, or applies it inline when that leg is zero.
     ///
     /// A zero-leg command is still queued behind a head already due, so the two apply in
     /// `(due_ns, seq)` order.
-    fn defer_or_apply(&mut self, command: TradingCommand) {
+    fn defer_or_apply_scoped(
+        &mut self,
+        command: TradingCommand,
+        convert_scope: Option<ConvertScope>,
+    ) {
         let now_ns = self.clock.borrow().timestamp_ns();
 
         let leg_latency = match self.command_leg_latency(&command, now_ns) {
@@ -1779,13 +2097,13 @@ impl SandboxInner {
             .peek()
             .is_some_and(|delayed| delayed.due_ns <= now_ns);
         if head_is_due || leg_latency > DurationNanos::ZERO {
-            self.enqueue(command, now_ns, due_ns);
+            self.enqueue(command, convert_scope, now_ns, due_ns);
             return;
         }
 
-        if let Err(e) = self.apply_trading_command(&command) {
+        if let Err(e) = self.apply_trading_command(&command, convert_scope.as_ref()) {
             log::error!("Error applying command: {e}");
-            self.refuse_command(&command, "Command could not be applied at the venue");
+            self.refuse_apply_error(&command, &e);
         }
     }
 
@@ -1800,9 +2118,9 @@ impl SandboxInner {
         };
 
         match command {
-            TradingCommand::SubmitOrder(_) | TradingCommand::SubmitOrderList(_) => {
-                latency_model.get_insert_latency(command, ts_now)
-            }
+            TradingCommand::SubmitOrder(_)
+            | TradingCommand::SubmitOrderList(_)
+            | TradingCommand::SubmitConvert(_) => latency_model.get_insert_latency(command, ts_now),
             TradingCommand::ModifyOrder(_) | TradingCommand::ModifyOrders(_) => {
                 latency_model.get_update_latency(command, ts_now)
             }
@@ -1811,12 +2129,9 @@ impl SandboxInner {
             | TradingCommand::CancelAllOrders(_) => {
                 latency_model.get_delete_latency(command, ts_now)
             }
-            TradingCommand::QueryOrder(_) | TradingCommand::QueryAccount(_) => {
-                Ok(DurationNanos::ZERO)
-            }
-            TradingCommand::SubmitConvert(_) | TradingCommand::QueryConvert(_) => {
-                Ok(DurationNanos::ZERO)
-            }
+            TradingCommand::QueryOrder(_)
+            | TradingCommand::QueryAccount(_)
+            | TradingCommand::QueryConvert(_) => Ok(DurationNanos::ZERO),
         }
     }
 
@@ -1894,6 +2209,45 @@ impl SandboxInner {
         inner.drain_oto_commands();
     }
 
+    fn on_convert_result(inner: &Rc<RefCell<Self>>, result: &ConvertResult) {
+        let Ok(inner) = inner.try_borrow() else {
+            log::debug!("Skipping convert result inventory release due to active sandbox borrow",);
+            return;
+        };
+
+        if result.client_id != inner.client_id || result.account_id != inner.account_id {
+            return;
+        }
+
+        let release = match inner
+            .cache
+            .borrow()
+            .load_convert_operation(result.operation_id)
+        {
+            Ok(Some(record))
+                if record.account_id == inner.account_id && record.client_id == inner.client_id =>
+            {
+                record.applied
+                    || matches!(
+                        record.status,
+                        Some(ConvertExecutionStatus::Rejected | ConvertExecutionStatus::Failed)
+                    )
+            }
+            Ok(_) => false,
+            Err(e) => {
+                log::error!(
+                    "Cannot read Convert operation {} for inventory release: {e}",
+                    result.operation_id,
+                );
+                false
+            }
+        };
+
+        if release {
+            inner.release_convert_inventory(result.operation_id);
+        }
+    }
+
     /// Applies every inbound command whose latency has elapsed, in `(due_ns, seq)` order, then
     /// arms the alert for the earliest command still queued.
     ///
@@ -1915,12 +2269,11 @@ impl SandboxInner {
         let now_ns = this.clock.borrow().timestamp_ns();
 
         while let Some(delayed) = this.pop_due(now_ns) {
-            if let Err(e) = this.apply_trading_command(&delayed.command) {
+            if let Err(e) =
+                this.apply_trading_command(&delayed.command, delayed.convert_scope.as_ref())
+            {
                 log::error!("Error applying deferred command: {e}");
-                this.refuse_command(
-                    &delayed.command,
-                    "Command could not be applied at the venue",
-                );
+                this.refuse_apply_error(&delayed.command, &e);
             }
         }
 

@@ -54,6 +54,7 @@ static EXEC_QUEUE_COMMAND_ENDPOINT: OnceLock<MStr<Endpoint>> = OnceLock::new();
 static EXEC_EXECUTE_ENDPOINT: OnceLock<MStr<Endpoint>> = OnceLock::new();
 static EXEC_PROCESS_ENDPOINT: OnceLock<MStr<Endpoint>> = OnceLock::new();
 static EXEC_PROCESS_CONVERT_ENDPOINT: OnceLock<MStr<Endpoint>> = OnceLock::new();
+static EXEC_PROCESS_SIMULATED_CONVERT_ENDPOINT: OnceLock<MStr<Endpoint>> = OnceLock::new();
 static EXEC_RECONCILE_REPORT_ENDPOINT: OnceLock<MStr<Endpoint>> = OnceLock::new();
 static RISK_EXECUTE_ENDPOINT: OnceLock<MStr<Endpoint>> = OnceLock::new();
 static RISK_QUEUE_EXECUTE_ENDPOINT: OnceLock<MStr<Endpoint>> = OnceLock::new();
@@ -196,6 +197,13 @@ macro_rules! define_switchboard {
             pub fn exec_engine_process_convert() -> MStr<Endpoint> {
                 *EXEC_PROCESS_CONVERT_ENDPOINT
                     .get_or_init(|| "ExecEngine.process_convert".into())
+            }
+
+            #[inline]
+            #[must_use]
+            pub fn exec_engine_process_simulated_convert() -> MStr<Endpoint> {
+                *EXEC_PROCESS_SIMULATED_CONVERT_ENDPOINT
+                    .get_or_init(|| "ExecEngine.process_simulated_convert".into())
             }
 
             #[inline]

@@ -37,7 +37,8 @@ pub use self::{
     convert::{
         ConvertExecutionEvent, ConvertExecutionOutcome, ConvertExecutionStatus,
         ConvertOperationRecord, ConvertResult, ConvertTokenAmount, ConvertTransaction,
-        QueryConvert, SubmitConvert, VerifiedConvert, has_unique_inputs, normalized_inputs,
+        QueryConvert, SimulatedConvertExecutionEvent, SubmitConvert, VerifiedConvert,
+        has_unique_inputs, normalized_inputs,
     },
     modify::{BatchModifyOrders, ModifyOrder},
     query::{QueryAccount, QueryOrder},
