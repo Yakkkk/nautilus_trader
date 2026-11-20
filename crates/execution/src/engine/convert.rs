@@ -551,10 +551,11 @@ impl ExecutionEngine {
         transaction: Option<ConvertTransaction>,
         reason: String,
     ) {
-        if !self.can_set_unknown(record) {
+        if !self.can_apply_unknown_evidence(record) {
             return;
         }
 
+        let was_submitted = record.status == Some(ConvertExecutionStatus::Submitted);
         if let Some(transaction) = transaction {
             let Some(merged) = self.merge_event_transaction_or_ignore(record, &transaction) else {
                 return;
@@ -562,7 +563,10 @@ impl ExecutionEngine {
             record.transaction = Some(merged);
         }
 
-        record.status = Some(ConvertExecutionStatus::Unknown);
+        if !was_submitted {
+            record.status = Some(ConvertExecutionStatus::Unknown);
+        }
+
         if !record.historical_gap {
             record.reason = Some(reason);
         }
@@ -1046,8 +1050,12 @@ impl ExecutionEngine {
             .filter(|client| client.client_id() == client_id && client.account_id() == account_id)
     }
 
-    fn can_set_unknown(&self, record: &ConvertOperationRecord) -> bool {
-        !record.applied && matches!(record.status, None | Some(ConvertExecutionStatus::Unknown))
+    fn can_apply_unknown_evidence(&self, record: &ConvertOperationRecord) -> bool {
+        !record.applied
+            && matches!(
+                record.status,
+                None | Some(ConvertExecutionStatus::Unknown | ConvertExecutionStatus::Submitted)
+            )
     }
 
     fn merge_event_transaction(

@@ -1994,6 +1994,7 @@ ADAPTER_CONFIG_SECRET_FIELDS = {
     "password",
     "passphrase",
     "private_key",
+    "rpc_url",
     "session_key",
     "tardis_http_url",
     "tardis_ws_url",
@@ -2022,6 +2023,11 @@ ADAPTER_CONFIG_FIELD_READBACK_REPLACEMENTS = {
         "DockerizedIBGatewayConfig",
         "password",
     ): "has_password",
+    (
+        "nautilus_trader.adapters.polymarket",
+        "PolymarketExecutionClientConfig",
+        "rpc_url",
+    ): "has_rpc_url",
 }
 
 ADAPTER_CONFIG_CONSTRUCTOR_ONLY_FIELDS = {

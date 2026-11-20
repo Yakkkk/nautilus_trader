@@ -13,6 +13,7 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
+mod convert;
 mod data_client;
 mod exec_client;
 mod harness;

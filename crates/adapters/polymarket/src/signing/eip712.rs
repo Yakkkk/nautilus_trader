@@ -163,7 +163,7 @@ pub fn approval_plan_v2(collateral_allowance: U256) -> [PolymarketApproval; 2] {
 const DOMAIN_NAME: &str = "Polymarket CTF Exchange";
 const DOMAIN_VERSION: &str = "2";
 const DOMAIN_VERSION_V3: &str = "3";
-const POLYGON_CHAIN_ID: u64 = 137;
+pub(crate) const POLYGON_CHAIN_ID: u64 = 137;
 const ORDER_TYPE_STRING: &str = concat!(
     "Order(uint256 salt,address maker,address signer,uint256 tokenId,",
     "uint256 makerAmount,uint256 takerAmount,uint8 side,uint8 signatureType,",

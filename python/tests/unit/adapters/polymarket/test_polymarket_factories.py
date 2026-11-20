@@ -71,6 +71,23 @@ def test_polymarket_signature_type_exposes_poly_1271() -> None:
     assert int(PolymarketSignatureType.Poly1271) == 3
 
 
+def test_convert_rpc_configuration_exposes_only_url_presence() -> None:
+    """
+    Convert RPC configuration exposes only URL presence.
+    """
+    rpc_url = "https://polygon.example.test/convert-rpc-credential"
+    relayer_url = "https://relayer.example.test"
+    default = PolymarketExecutionClientConfig()
+    configured = PolymarketExecutionClientConfig(rpc_url=rpc_url, base_url_relayer=relayer_url)
+
+    assert default.has_rpc_url is False
+    assert configured.has_rpc_url is True
+    assert configured.base_url_relayer == relayer_url
+    assert not hasattr(configured, "rpc_url")
+    assert rpc_url not in repr(configured)
+    assert rpc_url not in str(configured)
+
+
 def test_live_node_builder_accepts_polymarket_data_factory() -> None:
     """
     Test live node builder accepts polymarket data factory.
