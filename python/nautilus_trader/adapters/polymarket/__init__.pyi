@@ -6,6 +6,7 @@ import decimal
 import enum
 import typing
 
+from nautilus_trader import common
 from nautilus_trader import execution
 from nautilus_trader import model
 from nautilus_trader import network
@@ -33,6 +34,7 @@ __all__ = [
     "PolymarketSignatureType",
     "PolymarketSignerType",
     "PolymarketUpDownEventSlugConfig",
+    "register_convert_event",
 ]
 
 POLYMARKET: str
@@ -243,6 +245,8 @@ class PolymarketExecutionClientConfig:
     @property
     def funder(self) -> str | None: ...
     @property
+    def relayer_signer_address(self) -> str | None: ...
+    @property
     def signature_type(self) -> PolymarketSignatureType: ...
     @property
     def signer_type(self) -> PolymarketSignerType: ...
@@ -291,9 +295,13 @@ class PolymarketExecutionClientConfig:
         signer_type: PolymarketSignerType | None = None,
         rpc_url: str | None = None,
         base_url_relayer: str | None = None,
+        relayer_api_key: str | None = None,
+        relayer_signer_address: str | None = None,
     ) -> None: ...
     @property
     def has_rpc_url(self) -> bool: ...
+    @property
+    def has_relayer_api_key(self) -> bool: ...
     @property
     def has_proxy_url(self) -> bool: ...
 
@@ -528,3 +536,12 @@ class PolymarketSignerType(enum.Enum):
     Session = ...
 
     def __hash__(self) -> int: ...
+
+def register_convert_event(
+    cache: common.Cache,
+    anchor: model.InstrumentId,
+    market_id: str,
+    question_count: int,
+    fee_bps: int,
+    token_ids: typing.Sequence[tuple[str, str]],
+) -> None: ...

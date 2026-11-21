@@ -29,7 +29,8 @@ use serde_json::json;
 use crate::{
     http::error::{Error, Result},
     signing::eip712::{
-        DEPOSIT_WALLET_FACTORY, POLYMARKET_COLLATERAL_TOKEN, POSITION_MANAGER, ROUTER,
+        CONDITIONAL_TOKENS, DEPOSIT_WALLET_FACTORY, NEG_RISK_CTF_COLLATERAL_ADAPTER,
+        POLYMARKET_COLLATERAL_TOKEN, POSITION_MANAGER, ROUTER,
     },
 };
 
@@ -50,7 +51,7 @@ sol! {
     function getPayout(uint256 positionId, uint256 amount) external view returns (uint256);
 }
 
-pub(super) struct WalletVerifier {
+pub(crate) struct WalletVerifier {
     client: HttpClient,
     rpc_url: String,
 }
@@ -198,6 +199,46 @@ impl WalletVerifier {
             if balance < amount {
                 return Err(Error::bad_request(format!(
                     "Deposit Wallet has insufficient V2 position balance for {id}"
+                )));
+            }
+        }
+
+        Ok(())
+    }
+
+    pub(super) async fn verify_ctf_convert(
+        &self,
+        owner: Address,
+        token_ids: &[U256],
+        amount: U256,
+    ) -> Result<()> {
+        let approved = self
+            .read(
+                CONDITIONAL_TOKENS,
+                isApprovedForAllCall {
+                    owner,
+                    operator: NEG_RISK_CTF_COLLATERAL_ADAPTER,
+                },
+            )
+            .await?;
+
+        if !approved {
+            return Err(Error::bad_request(
+                "Deposit Wallet must approve the NegRisk collateral adapter as a Conditional Tokens operator",
+            ));
+        }
+
+        for &id in token_ids {
+            let balance = self
+                .read(
+                    CONDITIONAL_TOKENS,
+                    PositionLedger::balanceOfCall { owner, id },
+                )
+                .await?;
+
+            if balance < amount {
+                return Err(Error::bad_request(format!(
+                    "Deposit Wallet has insufficient NO balance for CTF token {id}"
                 )));
             }
         }

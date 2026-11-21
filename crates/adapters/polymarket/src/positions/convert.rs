@@ -58,6 +58,65 @@ use crate::{
     },
 };
 
+/// Verifies that the configured RPC is Polygon and can serve `finalized` block reads.
+///
+/// Admission reuses this RPC for wallet reads, and the original-transaction verifier uses the
+/// same endpoint for receipt finality. Rejecting an incompatible endpoint before signing avoids
+/// authorizing a batch whose execution evidence could never be verified.
+///
+/// # Errors
+///
+/// Returns an error if the RPC reports another chain, does not support `finalized`, or returns a
+/// malformed block.
+pub(crate) async fn verify_convert_rpc(rpc: &WalletVerifier) -> Result<(), HttpError> {
+    let chain_id = rpc
+        .rpc_json("eth_chainId", json!([]))
+        .await
+        .map_err(|e| rpc_config_error(&e))?;
+    let chain_id =
+        parse_u64_hex_value(&chain_id, "chain ID").map_err(|e| HttpError::exchange(e.reason))?;
+    if chain_id != POLYGON_CHAIN_ID {
+        return Err(HttpError::exchange(format!(
+            "configured RPC reported chain {chain_id}, expected {POLYGON_CHAIN_ID}"
+        )));
+    }
+
+    let block = rpc
+        .rpc_json("eth_getBlockByNumber", json!(["finalized", false]))
+        .await
+        .map_err(|e| rpc_config_error(&e))?;
+    if block.is_null() {
+        return Err(HttpError::exchange(
+            "configured RPC did not serve a finalized block",
+        ));
+    }
+
+    let block: RpcBlock = serde_json::from_value(block)
+        .map_err(|e| HttpError::decode(format!("invalid finalized block response: {e}")))?;
+    let number = parse_u64_hex(&block.number, "finalized block number")
+        .map_err(|e| HttpError::exchange(e.reason))?;
+    let hash = parse_bytes32(&block.hash, "finalized block hash")
+        .map_err(|e| HttpError::exchange(e.to_string()))?;
+    if number == 0 {
+        return Err(HttpError::exchange(
+            "configured RPC returned a finalized block without a positive number",
+        ));
+    }
+    log::debug!("Polymarket Convert RPC finalized block: number={number}, hash={hash:#x}");
+
+    Ok(())
+}
+
+fn rpc_config_error(error: &HttpError) -> HttpError {
+    if error.is_retryable() {
+        HttpError::exchange(format!(
+            "configured Convert RPC is temporarily unavailable: {error}"
+        ))
+    } else {
+        HttpError::exchange(format!("configured Convert RPC is not usable: {error}"))
+    }
+}
+
 const FEE_DENOMINATOR: u64 = 10_000;
 const USDC_E: Address = address!("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174");
 const QUERY_ELAPSED_BUDGET_MS: u64 = 180_000;
@@ -174,26 +233,23 @@ pub(crate) async fn query_original_convert(
     }
 }
 
-struct ExpectedConvert {
+pub(crate) struct ExpectedConvert {
     wallet: Address,
-    market_id: B256,
-    index_set: U256,
-    amount: U256,
+    pub(crate) market_id: B256,
+    pub(crate) index_set: U256,
+    pub(crate) amount: U256,
     amount_out: U256,
     net_cash: U256,
-    inputs: Vec<ConvertTokenAmount>,
-    outputs: Vec<ConvertTokenAmount>,
-    affected_instruments: Vec<InstrumentId>,
+    pub(crate) inputs: Vec<ConvertTokenAmount>,
+    pub(crate) outputs: Vec<ConvertTokenAmount>,
+    pub(crate) affected_instruments: Vec<InstrumentId>,
+    pub(crate) input_token_ids: Vec<U256>,
     token_expectations: HashMap<U256, TokenExpectation>,
-    calldata: Bytes,
+    pub(crate) calldata: Bytes,
 }
 
 impl ExpectedConvert {
     fn new(record: &ConvertOperationRecord, mapping: &CtfNegRiskEvent) -> Result<Self, Failure> {
-        if record.inputs.is_empty() {
-            return Err(Failure::unknown("retained Convert operation has no inputs"));
-        }
-
         let wallet = parse_address(
             &record
                 .transaction
@@ -203,6 +259,28 @@ impl ExpectedConvert {
             "wallet",
         )
         .map_err(|e| Failure::unknown(format!("invalid retained Convert wallet: {e}")))?;
+        Self::new_with_wallet(record, mapping, wallet)
+    }
+
+    /// Builds the same retained Convert call used by execution verification.
+    ///
+    /// The submission path supplies the configured wallet before any transaction context exists.
+    pub(crate) fn new_for_submission(
+        record: &ConvertOperationRecord,
+        mapping: &CtfNegRiskEvent,
+        wallet: Address,
+    ) -> Result<Self, Failure> {
+        Self::new_with_wallet(record, mapping, wallet)
+    }
+
+    fn new_with_wallet(
+        record: &ConvertOperationRecord,
+        mapping: &CtfNegRiskEvent,
+        wallet: Address,
+    ) -> Result<Self, Failure> {
+        if record.inputs.is_empty() {
+            return Err(Failure::unknown("retained Convert operation has no inputs"));
+        }
 
         let input_ids = record
             .inputs
@@ -265,6 +343,7 @@ impl ExpectedConvert {
             .map_err(|e| Failure::unknown(format!("invalid Convert output amount: {e}")))?;
         let mut inputs = Vec::with_capacity(scope.inputs.len());
         let mut outputs = Vec::with_capacity(scope.outputs.len());
+        let mut input_token_ids = Vec::with_capacity(scope.inputs.len());
         let mut affected_instruments = Vec::with_capacity(mapping.conditions().len());
         let mut token_expectations =
             HashMap::with_capacity(mapping.conditions().len().saturating_mul(2));
@@ -273,6 +352,7 @@ impl ExpectedConvert {
             let no_token = U256::from_be_bytes(condition.no.token_id);
             let yes_token = U256::from_be_bytes(condition.yes.token_id);
             if selected.contains(&condition.no.instrument_id) {
+                input_token_ids.push(no_token);
                 inputs.push(ConvertTokenAmount {
                     instrument_id: condition.no.instrument_id,
                     quantity: input_quantity,
@@ -311,6 +391,7 @@ impl ExpectedConvert {
             inputs,
             outputs,
             affected_instruments,
+            input_token_ids,
             token_expectations,
             calldata: encode_convert_positions(market_id, index_set, amount),
         })
@@ -1296,9 +1377,9 @@ enum FailureKind {
 }
 
 #[derive(Debug)]
-struct Failure {
+pub(crate) struct Failure {
     kind: FailureKind,
-    reason: String,
+    pub(crate) reason: String,
 }
 
 impl Failure {

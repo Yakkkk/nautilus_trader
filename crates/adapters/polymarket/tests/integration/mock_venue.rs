@@ -113,7 +113,7 @@ impl RequestGate {
         self.started.load(Ordering::Acquire)
     }
 
-    async fn wait(&self) {
+    pub(super) async fn wait(&self) {
         if !self.enabled.load(Ordering::Acquire) {
             return;
         }

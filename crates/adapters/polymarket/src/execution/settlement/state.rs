@@ -185,6 +185,10 @@ pub(crate) struct SettlementRecord {
     /// evidence after a terminal REST result, or a provisional trade from an earlier stream
     /// session.
     pub refresh_requested: bool,
+    /// Whether a Convert plan requested reproof of a retained provisional fill. This is narrower
+    /// than `refresh_requested` and can be cleared by validated matching stream
+    /// confirmation without releasing the normal session-resolution obligation.
+    pub convert_reproof: bool,
 }
 
 impl SettlementRecord {
@@ -197,6 +201,7 @@ impl SettlementRecord {
             hard_fault: None,
             terminal_rest_legs: None,
             refresh_requested: false,
+            convert_reproof: false,
         }
     }
 
@@ -221,7 +226,9 @@ impl SettlementRecord {
     /// across a stream session change.
     pub(crate) fn awaits_resolution(&self) -> bool {
         self.hard_fault.is_none()
-            && (self.settlement == SettlementState::Quarantined || self.refresh_requested)
+            && (self.settlement == SettlementState::Quarantined
+                || self.refresh_requested
+                || self.convert_reproof)
     }
 
     /// Returns `true` while the record holds evidence that fill, position, and mass-status reports

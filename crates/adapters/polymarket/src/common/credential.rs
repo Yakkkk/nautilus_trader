@@ -271,6 +271,29 @@ impl RelayerApiKey {
         Self::new(key, &address)
     }
 
+    /// Resolves from explicit values or environment, falling back to a default signer address.
+    ///
+    /// The explicit address and `POLYMARKET_RELAYER_SIGNER_ADDRESS` take precedence. The default
+    /// is used only when neither is supplied.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the key is missing or invalid, or the resolved address is invalid.
+    pub fn resolve_with_default_address(
+        key: Option<SecretString>,
+        address: Option<String>,
+        default_address: &str,
+    ) -> Result<Self> {
+        let key = key.filter(|value| !value.expose_secret().trim().is_empty());
+        let key = resolve_secret(key, "relayer_api_key", RELAYER_API_KEY_VAR)?;
+        let address = address
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| get_or_env_var_opt(None, RELAYER_SIGNER_ADDRESS_VAR))
+            .unwrap_or_else(|| default_address.to_string());
+
+        Self::new(key, &address)
+    }
+
     /// Resolves Relayer credentials from the environment.
     ///
     /// # Errors

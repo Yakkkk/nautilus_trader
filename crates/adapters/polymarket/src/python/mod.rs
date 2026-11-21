@@ -24,6 +24,7 @@
 )]
 
 pub mod config;
+pub mod convert;
 pub mod factories;
 pub mod loader;
 pub mod positions;
@@ -560,6 +561,10 @@ pub fn polymarket(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
         m
     )?)?;
     m.add_function(pyo3::wrap_pyfunction!(sort::py_polymarket_trade_id, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(
+        convert::py_register_convert_event,
+        m
+    )?)?;
 
     register_polymarket_custom_data();
     let _result = ensure_rust_extractor_registered::<PolymarketCryptoPrice>();

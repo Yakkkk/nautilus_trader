@@ -772,11 +772,126 @@ the [Polymarket contract registry](https://docs.polymarket.com/resources/contrac
 the deployed contracts and the [JSON-RPC reference](https://ethereum.org/en/developers/docs/apis/json-rpc/)
 for block-specific calls.
 
+## Convert submissions
+
+The execution client submits CTF negative-risk Convert calls from a Deposit Wallet
+(`PolymarketSignatureType::Poly1271`). Split, merge, and redeem remain available through
+`PolymarketPositionClient` and share the same process-local wallet nonce protection. A Convert consumes
+the selected NO outcomes and returns pUSD plus YES shares for every unselected condition.
+
+Before signing, the adapter requires:
+
+- A complete event mapping in the shared cache. Register it from Rust with
+  `Cache::add_convert_event` after `nautilus_polymarket::convert::build_neg_risk_event`.
+- The input positions' current CLOB fills to be both `CONFIRMED` and applied by the core. WebSocket
+  confirmation is sufficient; the adapter does not issue an extra REST trade read for this check.
+- A deployed canonical Deposit Wallet owned by the signer, sufficient NO balances, and Conditional
+  Tokens operator approval for the Neg Risk collateral adapter.
+- The configured `rpc_url` to report Polygon chain ID `137` and serve a `finalized` block. Admission
+  wallet reads use the same endpoint; execution evidence is read only from that endpoint after finality.
+
+The request is admitted by the risk engine first. An explicit rejection before any signed submission
+releases the Convert position-report scope. A signed submission reserves the wallet nonce before the
+Relayer POST; an unknown, missing-ID, or canceled response keeps that reservation. Recreating clients
+does not bypass it, and queries or callbacks never sign a replacement transaction.
+
+```rust tab="Rust"
+use nautilus_common::messages::execution::ConvertTokenAmount;
+use nautilus_core::UUID4;
+use nautilus_model::identifiers::ClientId;
+use rust_decimal_macros::dec;
+
+let operation_id = UUID4::new();
+strategy.submit_convert(
+    vec![
+        ConvertTokenAmount { instrument_id: no_a, quantity: dec!(100) },
+        ConvertTokenAmount { instrument_id: no_b, quantity: dec!(100) },
+    ],
+    account_id,
+    ClientId::from("POLYMARKET"),
+    Some(operation_id),
+)?;
+```
+
+```python tab="Python"
+from decimal import Decimal
+
+from nautilus_trader.core import UUID4
+from nautilus_trader.model import ClientId
+
+operation_id = UUID4()
+self.submit_convert(
+    [(no_a, Decimal("100")), (no_b, Decimal("100"))],
+    account_id,
+    ClientId("POLYMARKET"),
+    operation_id,
+)
+```
+
+`submit_convert` returns the stable operation ID. Repeated delivery of the same ID returns the
+retained result; a different request under the same ID is a conflict. Results arrive in
+`on_convert_result(ConvertResult)`:
+
+| Status      | Meaning                                                                    |
+| ----------- | -------------------------------------------------------------------------- |
+| `REJECTED`  | Refused before a signed wallet batch was dispatched.                       |
+| `SUBMITTED` | Original Relayer ID retained; execution is still being confirmed.          |
+| `UNKNOWN`   | Evidence is insufficient to decide whether the original batch executed.    |
+| `FAILED`    | The original attempt failed; authorization validity is tracked separately. |
+| `CONFIRMED` | Finalized wallet execution and net effects were verified.                  |
+
+`applied` is independent of `status`. It becomes true only after the core has validated and applied all
+position changes and published their lifecycle events through the normal cache path. Applied is not a
+durable-transaction acknowledgement; the operation record and positions are separately persisted. Wait
+for `CONFIRMED` with `applied=True` before selling the received YES shares. Account cash arrives through
+the ordinary asynchronous `AccountState` refresh; Applied does not wait for it. A later explicit
+`query_convert(operation_id, account_id, client_id)` reuses the retained original transaction and never
+signs.
+
+When an input has a known provisional, voiding, or not-yet-applied fill, confirmation can arrive while
+`applied` remains false and `unapplied_instruments` names the blocked input. Resolve the fill evidence,
+then query again; the accounting plan is fixed only once the required evidence is available and is
+retained after that point. Competition after submission, an output position
+that became short, or a formally expired affected instrument can leave a permanent accounting gap. The
+adapter does not rewrite settled cycles or cross zero to repair it. If the complete affected scope
+expires with `ContractExpired`, the operation keeps its confirmed execution evidence, stops automatic
+accounting repair, and no longer defers unrelated reconciliation.
+
+To stop safely, cancel ordinary orders, stop the strategy, and leave the process running long enough for
+the status to settle. Stopping does not cancel an already signed wallet batch. Use the retained Relayer
+ID or transaction hash, wallet, nonce, call summary, and `unapplied_instruments` for offline review before
+restarting or retrying anything. Existing flatten logic does not cover YES shares that arrive after it
+runs.
+
+### Python mapping registration
+
+Python strategies can reuse the explicit chain-metadata mapping path without adding discovery. Load the complete
+parent event and every YES/NO instrument, read the chain market metadata, then register once before
+submitting:
+
+```python
+from nautilus_trader.adapters import polymarket
+
+polymarket.register_convert_event(
+    self.cache,
+    anchor_instrument_id,
+    market_id,
+    question_count,
+    fee_bps,
+    [(yes_token_id, no_token_id), ...],
+)
+```
+
+`token_ids` is `(YES, NO)` in chain condition-index order, matching
+`CtfNegRiskMarketMetadata`. For recovery, register with `node.cache` before `node.run()` because the
+event mapping is not persisted; Redis/PostgreSQL retain operations and positions. The helper validates
+the supplied metadata and loaded definitions but performs no extra Gamma or Polygon reads.
+
 ## Convert queries
 
 The execution client can query a retained, already-dispatched CTF negative-risk Convert operation
 against finalized Polygon evidence. This path is read-only: it never signs, submits, or rebinds a
-transaction. New Convert submissions remain unsupported.
+transaction.
 
 Configure `rpc_url` with a Polygon RPC endpoint that supports the `finalized` block tag. The adapter
 uses only that endpoint for finalized execution evidence; it does not fall back to `latest` or
@@ -815,17 +930,19 @@ confirmation or failure evidence is retained; a query timeout does not rerun a n
 
 Configure signing and authentication through these parameters or their environment-variable fallbacks:
 
-| Parameter     | Environment variable    | Purpose                                                      |
-| ------------- | ----------------------- | ------------------------------------------------------------ |
-| `private_key` | `POLYMARKET_PK`         | Wallet key used to sign orders according to `signature_type` |
-| `funder`      | `POLYMARKET_FUNDER`     | pUSD funding wallet address                                  |
-| `api_key`     | `POLYMARKET_API_KEY`    | CLOB L2 API key                                              |
-| `api_secret`  | `POLYMARKET_API_SECRET` | CLOB L2 API secret                                           |
-| `passphrase`  | `POLYMARKET_PASSPHRASE` | CLOB L2 API passphrase                                       |
+| Parameter                | Environment variable                | Purpose                                                      |
+| ------------------------ | ----------------------------------- | ------------------------------------------------------------ |
+| `private_key`            | `POLYMARKET_PK`                     | Wallet key used to sign orders according to `signature_type` |
+| `funder`                 | `POLYMARKET_FUNDER`                 | pUSD funding wallet address                                  |
+| `api_key`                | `POLYMARKET_API_KEY`                | CLOB L2 API key                                              |
+| `api_secret`             | `POLYMARKET_API_SECRET`             | CLOB L2 API secret                                           |
+| `passphrase`             | `POLYMARKET_PASSPHRASE`             | CLOB L2 API passphrase                                       |
+| `relayer_api_key`        | `POLYMARKET_RELAYER_API_KEY`        | Relayer key for Convert and Deposit Wallet submissions       |
+| `relayer_signer_address` | `POLYMARKET_RELAYER_SIGNER_ADDRESS` | Relayer key signer; defaults to the CLOB signer              |
 
 The execution client also accepts the `base_url_http`, `base_url_ws`, `base_url_data_api`,
 `rpc_url`, and `base_url_relayer` transport overrides. `rpc_url` is required for retained Convert
-queries.
+queries and new submissions, and must report Polygon chain `137` and support `finalized`.
 
 In owner mode, omit a parameter or pass `None` to read its environment variable. An explicitly supplied
 empty or whitespace-only value fails configuration validation; it never selects an environment fallback.

@@ -28,7 +28,7 @@
 //! are held as unbound legs keyed by their deterministic leg trade ID, and move into their trade
 //! record once venue evidence for that trade is admitted.
 
-use std::fmt::Debug;
+use std::{fmt::Debug, str::FromStr};
 
 use ahash::{AHashMap, AHashSet};
 use nautilus_common::cache::fifo::FifoCache;
@@ -988,6 +988,171 @@ impl SettlementRegistry {
         })
     }
 
+    /// Fails unless every applied input fill is confirmed and no newer input evidence is unresolved.
+    ///
+    /// New Convert submissions use this strict form so an applied provisional fill cannot be used
+    /// as confirmed CLOB inventory.
+    pub(crate) fn ensure_convert_input_evidence(
+        &self,
+        instrument_id: InstrumentId,
+        applied_trade_ids: &[TradeId],
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !applied_trade_ids.is_empty(),
+            "input {instrument_id} has no applied CLOB fill evidence"
+        );
+        anyhow::ensure!(
+            !self.client_faulted(),
+            "Polymarket execution client is faulted closed"
+        );
+        self.ensure_no_blockers(
+            &format!("Convert input {instrument_id} evidence"),
+            |leg| leg.instrument_id == instrument_id,
+            |_, order| order.instrument_id == instrument_id,
+            |record| convert_input_record_blocks(record, instrument_id, applied_trade_ids),
+        )?;
+
+        let inner = self.inner.lock();
+        for trade_id in applied_trade_ids {
+            let record = inner
+                .leg_trade_ids
+                .get(trade_id)
+                .and_then(|key| inner.records.get(key))
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "input {instrument_id} applied fill {trade_id} has no CONFIRMED \
+                         settlement evidence"
+                    )
+                })?;
+            let retained_confirmed = record
+                .legs
+                .iter()
+                .find(|leg| leg.trade_id == *trade_id)
+                .is_some_and(|leg| {
+                    !leg.venue_evidence
+                        && retained_leg_status(leg).is_some_and(|status| status.is_finalized())
+                });
+            anyhow::ensure!(
+                record_is_confirmed(record) || retained_confirmed,
+                "input {instrument_id} applied fill {trade_id} is not CONFIRMED",
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Requests a targeted terminal REST read for retained provisional input fills.
+    ///
+    /// Hydrated fills retain their original venue status snapshot but are not themselves
+    /// authoritative settlement evidence. When a Convert plan references such a fill, targeted
+    /// reproof lets the normal resolution sweeper establish matching terminal evidence or apply
+    /// the corresponding void. Confirmed snapshots and unknown process records are left alone.
+    pub(crate) fn request_convert_input_resolution(
+        &self,
+        instrument_id: InstrumentId,
+        applied_trade_ids: &[TradeId],
+    ) {
+        let mut inner = self.inner.lock();
+        if inner.client_fault.is_some() {
+            return;
+        }
+
+        let mut requested = false;
+
+        for trade_id in applied_trade_ids {
+            let Some(key) = inner.leg_trade_ids.get(trade_id).cloned() else {
+                continue;
+            };
+            let Some(record) = inner.records.get_mut(&key) else {
+                continue;
+            };
+
+            if record.hard_fault.is_some()
+                || !matches!(
+                    record.settlement,
+                    SettlementState::Provisional | SettlementState::StreamConfirmed
+                )
+            {
+                continue;
+            }
+            let Some(leg) = record.legs.iter().find(|leg| leg.trade_id == *trade_id) else {
+                continue;
+            };
+
+            if leg.instrument_id != instrument_id || !retained_leg_is_pending(leg) {
+                continue;
+            }
+
+            if !record.convert_reproof {
+                record.convert_reproof = true;
+                requested = true;
+            }
+        }
+
+        if requested {
+            self.resolution_wakeup.notify_one();
+        }
+    }
+
+    /// Returns whether known input evidence would leave a Convert plan incomplete.
+    ///
+    /// Missing process-local records are unavailable rather than pending. This lets a retained
+    /// original transaction apply after a cold start without inventing confirmation from unrelated
+    /// fills, while a known provisional, unresolved, voiding, or not-yet-applied fill still blocks
+    /// the plan.
+    pub(crate) fn convert_input_evidence_pending(
+        &self,
+        instrument_id: InstrumentId,
+        applied_trade_ids: &[TradeId],
+    ) -> bool {
+        if self.client_faulted() {
+            return true;
+        }
+
+        if self
+            .ensure_no_blockers(
+                &format!("Convert input {instrument_id} evidence"),
+                |leg| leg.instrument_id == instrument_id,
+                |_, order| order.instrument_id == instrument_id,
+                |record| convert_input_record_blocks(record, instrument_id, applied_trade_ids),
+            )
+            .is_err()
+        {
+            return true;
+        }
+
+        let inner = self.inner.lock();
+        convert_applied_evidence_blocks(&inner, applied_trade_ids)
+    }
+
+    /// Runs a scoped final evidence check and event enqueue under one settlement lock.
+    ///
+    /// Admission, fill application and stream emission all pass through this registry lock. Holding
+    /// it while the caller enqueues the Convert result prevents a fill admitted concurrently from
+    /// becoming an unseen pending input after the check and before the core receives the result.
+    pub(crate) fn with_convert_input_pending<R>(
+        &self,
+        evidence: &[(InstrumentId, Vec<TradeId>)],
+        action: impl FnOnce(&[InstrumentId]) -> R,
+    ) -> R {
+        let inner = self.inner.lock();
+        let pending = if inner.client_fault.is_some() {
+            evidence
+                .iter()
+                .map(|(instrument_id, _)| *instrument_id)
+                .collect::<Vec<_>>()
+        } else {
+            evidence
+                .iter()
+                .filter_map(|(instrument_id, trade_ids)| {
+                    convert_input_evidence_pending_locked(&inner, *instrument_id, trade_ids)
+                        .then_some(*instrument_id)
+                })
+                .collect::<Vec<_>>()
+        };
+        action(&pending)
+    }
+
     /// Fails report generation while evidence touching one venue order is unresolved.
     pub(crate) fn ensure_order_resolved(
         &self,
@@ -1177,6 +1342,159 @@ impl ConfirmedFills<'_> {
     }
 }
 
+fn record_is_confirmed(record: &SettlementRecord) -> bool {
+    record.hard_fault.is_none()
+        && matches!(
+            record.settlement,
+            SettlementState::StreamConfirmed | SettlementState::RestConfirmed
+        )
+}
+
+fn retained_leg_status(leg: &SettlementLeg) -> Option<PolymarketTradeStatus> {
+    let status = leg
+        .applied_fill
+        .as_ref()?
+        .info
+        .as_ref()?
+        .get(&Ustr::from("status"))?;
+    PolymarketTradeStatus::from_str(status.as_str()).ok()
+}
+
+fn retained_leg_is_pending(leg: &SettlementLeg) -> bool {
+    !leg.venue_evidence
+        && retained_leg_status(leg).is_some_and(|status| status.is_pending_settlement())
+}
+
+fn stream_retained_terminal_conflicts(record: &SettlementRecord, admitted: &AdmittedTrade) -> bool {
+    admitted.status == PolymarketTradeStatus::Confirmed
+        && record.legs.iter().any(|leg| {
+            retained_leg_is_pending(leg)
+                && admitted
+                    .legs
+                    .iter()
+                    .find(|incoming| incoming.venue_order_id == leg.venue_order_id)
+                    .is_none_or(|incoming| leg_evidence_conflicts(leg, incoming, true))
+        })
+}
+
+fn mark_retained_terminal_legs(record: &mut SettlementRecord, admitted: &[AdmittedLeg]) {
+    for leg in record
+        .legs
+        .iter_mut()
+        .filter(|leg| retained_leg_is_pending(leg))
+    {
+        if admitted
+            .iter()
+            .any(|incoming| incoming.venue_order_id == leg.venue_order_id)
+        {
+            leg.venue_evidence = true;
+        }
+    }
+}
+
+fn convert_input_record_blocks(
+    record: &SettlementRecord,
+    instrument_id: InstrumentId,
+    applied_trade_ids: &[TradeId],
+) -> bool {
+    if record.legs.is_empty() {
+        return record.is_unresolved();
+    }
+
+    if !record.legs.iter().any(|leg| {
+        leg.instrument_id == instrument_id && (leg.venue_evidence || retained_leg_is_pending(leg))
+    }) {
+        return false;
+    }
+
+    if record.hard_fault.is_some()
+        || record.awaits_resolution()
+        || record.settlement == SettlementState::Provisional
+    {
+        return true;
+    }
+
+    if record.is_unresolved() {
+        let only_applied_application_state = !record.legs.is_empty()
+            && record
+                .legs
+                .iter()
+                .all(|leg| applied_trade_ids.contains(&leg.trade_id));
+        if !only_applied_application_state {
+            return true;
+        }
+    }
+
+    record
+        .legs
+        .iter()
+        .filter(|leg| leg.instrument_id == instrument_id)
+        .any(|leg| {
+            retained_leg_is_pending(leg)
+                || leg.application == LegApplication::VoidPending
+                || (leg.venue_evidence
+                    && !applied_trade_ids.contains(&leg.trade_id)
+                    && !matches!(
+                        leg.application,
+                        LegApplication::FillObserved | LegApplication::VoidObserved
+                    ))
+        })
+}
+
+fn convert_applied_evidence_blocks(inner: &RegistryInner, applied_trade_ids: &[TradeId]) -> bool {
+    applied_trade_ids.iter().any(|trade_id| {
+        inner.leg_trade_ids.get(trade_id).is_some_and(|key| {
+            let Some(record) = inner.records.get(key) else {
+                return false;
+            };
+            let Some(leg) = record.legs.iter().find(|leg| leg.trade_id == *trade_id) else {
+                return !record_is_confirmed(record);
+            };
+
+            if retained_leg_is_pending(leg) {
+                return true;
+            }
+
+            if leg.application == LegApplication::VoidObserved {
+                return false;
+            }
+
+            if !leg.venue_evidence {
+                return false;
+            }
+            !record_is_confirmed(record)
+        })
+    })
+}
+
+fn convert_input_evidence_pending_locked(
+    inner: &RegistryInner,
+    instrument_id: InstrumentId,
+    applied_trade_ids: &[TradeId],
+) -> bool {
+    if inner.client_fault.is_some() {
+        return true;
+    }
+
+    if inner
+        .uncertain_orders
+        .values()
+        .any(|order| order.instrument_id == instrument_id)
+    {
+        return true;
+    }
+
+    if inner
+        .records
+        .values()
+        .any(|record| convert_input_record_blocks(record, instrument_id, applied_trade_ids))
+    {
+        return true;
+    }
+
+    convert_applied_evidence_blocks(inner, applied_trade_ids)
+}
+
 fn stream_transition(
     inner: &mut RegistryInner,
     key: &str,
@@ -1187,7 +1505,8 @@ fn stream_transition(
         return;
     };
 
-    let conflict = stream_evidence_conflicts(record, admitted);
+    let conflict = stream_evidence_conflicts(record, admitted)
+        || stream_retained_terminal_conflicts(record, admitted);
 
     let new_legs: Vec<AdmittedLeg> = admitted
         .legs
@@ -1225,6 +1544,12 @@ fn stream_transition(
             );
 
             if recorded {
+                if admitted.status == PolymarketTradeStatus::Confirmed
+                    && record.settlement != SettlementState::Quarantined
+                {
+                    record.convert_reproof = false;
+                }
+
                 for leg in &new_legs {
                     inner.leg_trade_ids.insert(leg.trade_id, key.to_string());
                 }
@@ -1267,6 +1592,10 @@ fn admit_provisional_evidence(
         .legs
         .extend(new_legs.iter().map(SettlementLeg::from_admitted));
 
+    if admitted.status == PolymarketTradeStatus::Confirmed {
+        mark_retained_terminal_legs(record, &admitted.legs);
+    }
+
     if eligible {
         apply_absent_legs(record, admitted, actions);
     } else if record.legs.iter().any(SettlementLeg::awaits_application) {
@@ -1304,6 +1633,7 @@ fn rest_transition(
         let matches = (record.settlement == SettlementState::RestFailed) == terminal_failed
             && legs_materially_equal(previous, admitted_legs);
         record.refresh_requested = false;
+        record.convert_reproof = false;
 
         if !matches {
             let reason = format!(
@@ -1340,6 +1670,7 @@ fn rest_transition(
 
     record.terminal_rest_legs = Some(admitted_legs.to_vec());
     record.refresh_requested = false;
+    record.convert_reproof = false;
     inner.account_refresh_requested = true;
 
     if terminal_failed {
@@ -1419,6 +1750,7 @@ fn enter_rest_confirmed(
         return;
     }
 
+    mark_retained_terminal_legs(record, admitted);
     inner.settled_on_arrival.extend(settled_on_arrival);
 }
 
@@ -1433,6 +1765,7 @@ fn enter_rest_failed(
     };
 
     record.settlement = SettlementState::RestFailed;
+    mark_retained_terminal_legs(record, admitted);
 
     let mut new_trade_ids = Vec::new();
 
@@ -2103,6 +2436,20 @@ pub(crate) mod tests {
             Some(leg.commission.clone()),
             info,
         )
+    }
+
+    fn fill_with_status(
+        leg: &AdmittedLeg,
+        venue_trade_id: Option<&str>,
+        status: Option<&str>,
+    ) -> OrderFilled {
+        let mut fill = applied_fill(leg, venue_trade_id);
+        if let Some(status) = status {
+            fill.info
+                .get_or_insert_with(IndexMap::new)
+                .insert(Ustr::from("status"), Ustr::from(status));
+        }
+        fill
     }
 
     #[rstest]
@@ -3719,6 +4066,286 @@ pub(crate) mod tests {
             Some(LegApplication::Absent)
         );
         assert!(registry.ensure_resolved(None, "mass status").is_ok());
+    }
+
+    #[rstest]
+    #[case::confirmed_unapplied(PolymarketTradeStatus::Confirmed, false, false)]
+    #[case::applied_unconfirmed(PolymarketTradeStatus::Matched, true, false)]
+    #[case::confirmed_applied(PolymarketTradeStatus::Confirmed, true, true)]
+    fn test_convert_requires_confirmation_and_core_application(
+        #[case] status: PolymarketTradeStatus,
+        #[case] applied: bool,
+        #[case] eligible: bool,
+        #[values(false, true)] rest: bool,
+    ) {
+        let registry = live_registry();
+        let existing = taker_leg();
+        registry.note_order_submitted(existing.venue_order_id);
+        let existing_trade = trade(PolymarketTradeStatus::Confirmed, vec![existing.clone()]);
+        if rest {
+            registry.admit_rest_result(&existing_trade);
+        } else {
+            registry.admit_stream_trade(&existing_trade);
+        }
+        registry.note_leg_enqueued(&existing.trade_id);
+        registry.observe_fill_applied(&applied_fill(&existing, Some(TRADE)));
+
+        let late = AdmittedLeg {
+            trade_id: TradeId::from("convert-late-trade"),
+            ..existing
+        };
+        let late_trade = AdmittedTrade {
+            venue_trade_id: "convert-late-trade".to_string(),
+            status,
+            legs: vec![late.clone()],
+        };
+
+        if rest {
+            registry.admit_rest_result(&late_trade);
+        } else {
+            registry.admit_stream_trade(&late_trade);
+        }
+        registry.note_leg_enqueued(&late.trade_id);
+        let mut applied_trade_ids = vec![existing.trade_id];
+
+        if applied {
+            let status = status.to_string();
+            registry.observe_fill_applied(&fill_with_status(
+                &late,
+                Some("convert-late-trade"),
+                Some(&status),
+            ));
+            applied_trade_ids.push(late.trade_id);
+        }
+
+        assert_eq!(
+            registry
+                .ensure_convert_input_evidence(existing.instrument_id, &applied_trade_ids)
+                .is_ok(),
+            eligible,
+        );
+        assert_eq!(
+            registry.convert_input_evidence_pending(existing.instrument_id, &applied_trade_ids),
+            !eligible,
+        );
+        let pending_at_enqueue = registry.with_convert_input_pending(
+            &[(existing.instrument_id, applied_trade_ids)],
+            |pending| pending.to_vec(),
+        );
+        assert!(pending_at_enqueue.is_empty() == eligible);
+    }
+
+    #[rstest]
+    #[case::mined(Some("MINED"), false, true)]
+    #[case::matched(Some("MATCHED"), false, true)]
+    #[case::retrying(Some("RETRYING"), false, true)]
+    #[case::confirmed(Some("CONFIRMED"), true, false)]
+    #[case::legacy_without_status(None, false, false)]
+    fn test_convert_hydrated_input_status_controls_cold_start_eligibility(
+        #[case] status: Option<&str>,
+        #[case] can_submit: bool,
+        #[case] blocks_query_accounting: bool,
+    ) {
+        let registry = live_registry();
+        let leg = taker_leg();
+        registry.hydrate_fill(&fill_with_status(&leg, Some(TRADE), status));
+
+        let applied_trade_ids = [leg.trade_id];
+        assert_eq!(
+            registry
+                .ensure_convert_input_evidence(leg.instrument_id, &applied_trade_ids)
+                .is_ok(),
+            can_submit,
+        );
+        assert_eq!(
+            registry.convert_input_evidence_pending(leg.instrument_id, &applied_trade_ids),
+            blocks_query_accounting,
+        );
+    }
+
+    #[rstest]
+    fn test_convert_pending_ignores_missing_process_record() {
+        let registry = live_registry();
+        let instrument_id = InstrumentId::from("TOKEN-A.POLYMARKET");
+        let applied_trade_ids = [TradeId::from("retained-cold-start-fill")];
+
+        assert!(!registry.convert_input_evidence_pending(instrument_id, &applied_trade_ids));
+        registry.request_convert_input_resolution(instrument_id, &applied_trade_ids);
+        assert!(registry.pending_resolutions().is_empty());
+        assert!(!resolution_woken(&registry));
+
+        let pending_at_enqueue = registry.with_convert_input_pending(
+            &[(instrument_id, applied_trade_ids.to_vec())],
+            |pending| pending.to_vec(),
+        );
+        assert!(pending_at_enqueue.is_empty());
+    }
+
+    #[rstest]
+    fn test_convert_hydrated_pending_requests_targeted_reproof() {
+        let registry = live_registry();
+        let leg = taker_leg();
+        registry.hydrate_fill(&fill_with_status(&leg, Some(TRADE), Some("MATCHED")));
+        let applied_trade_ids = [leg.trade_id];
+
+        assert!(registry.convert_input_evidence_pending(leg.instrument_id, &applied_trade_ids));
+        assert!(registry.pending_resolutions().is_empty());
+        assert!(!resolution_woken(&registry));
+
+        registry.request_convert_input_resolution(leg.instrument_id, &applied_trade_ids);
+
+        assert_eq!(registry.pending_resolutions(), vec![TRADE.to_string()]);
+        assert!(resolution_woken(&registry));
+    }
+
+    #[rstest]
+    fn test_convert_hydrated_confirmed_does_not_request_reproof() {
+        let registry = live_registry();
+        let leg = taker_leg();
+        registry.hydrate_fill(&fill_with_status(&leg, Some(TRADE), Some("CONFIRMED")));
+        let applied_trade_ids = [leg.trade_id];
+
+        assert!(!registry.convert_input_evidence_pending(leg.instrument_id, &applied_trade_ids));
+        registry.request_convert_input_resolution(leg.instrument_id, &applied_trade_ids);
+
+        assert!(registry.pending_resolutions().is_empty());
+        assert!(!resolution_woken(&registry));
+    }
+
+    #[rstest]
+    fn test_stream_confirmation_keeps_older_session_rest_obligation() {
+        let registry = SettlementRegistry::new(AccountId::from("POLYMARKET-001"));
+        registry.begin_session();
+        let leg = taker_leg();
+        registry.note_order_submitted(leg.venue_order_id);
+        registry.admit_stream_trade(&trade(PolymarketTradeStatus::Matched, vec![leg.clone()]));
+        registry.note_leg_enqueued(&leg.trade_id);
+        registry.observe_fill_applied(&applied_fill(&leg, Some(TRADE)));
+        registry.begin_session();
+
+        assert_eq!(registry.pending_resolutions(), vec![TRADE.to_string()]);
+        assert!(
+            registry
+                .ensure_resolved(Some(leg.instrument_id), "mass status")
+                .is_err()
+        );
+
+        let applied_trade_ids = [leg.trade_id];
+        registry.request_convert_input_resolution(leg.instrument_id, &applied_trade_ids);
+        registry.admit_stream_trade(&trade(PolymarketTradeStatus::Confirmed, vec![leg.clone()]));
+
+        {
+            let inner = registry.inner.lock();
+            let record = inner.records.get(TRADE).expect("settlement record");
+            assert!(record.refresh_requested);
+            assert!(!record.convert_reproof);
+        }
+        assert_eq!(registry.pending_resolutions(), vec![TRADE.to_string()]);
+        assert!(
+            registry
+                .ensure_resolved(Some(leg.instrument_id), "mass status")
+                .is_err()
+        );
+
+        registry.admit_rest_result(&trade(PolymarketTradeStatus::Confirmed, vec![leg.clone()]));
+
+        assert!(registry.pending_resolutions().is_empty());
+        assert!(
+            registry
+                .ensure_resolved(Some(leg.instrument_id), "mass status")
+                .is_ok()
+        );
+    }
+
+    #[rstest]
+    #[case::stream(false)]
+    #[case::rest(true)]
+    fn test_convert_hydrated_pending_releases_on_matching_confirmed(#[case] rest: bool) {
+        let registry = live_registry();
+        let leg = taker_leg();
+        registry.note_order_submitted(leg.venue_order_id);
+        registry.hydrate_fill(&fill_with_status(&leg, Some(TRADE), Some("MATCHED")));
+        let applied_trade_ids = [leg.trade_id];
+
+        assert!(registry.convert_input_evidence_pending(leg.instrument_id, &applied_trade_ids));
+        registry.request_convert_input_resolution(leg.instrument_id, &applied_trade_ids);
+        assert_eq!(registry.pending_resolutions(), vec![TRADE.to_string()]);
+
+        let admitted = trade(PolymarketTradeStatus::Confirmed, vec![leg.clone()]);
+        if rest {
+            registry.admit_rest_result(&admitted);
+        } else {
+            registry.admit_stream_trade(&admitted);
+        }
+
+        assert!(!registry.convert_input_evidence_pending(leg.instrument_id, &applied_trade_ids));
+        assert!(
+            registry
+                .ensure_convert_input_evidence(leg.instrument_id, &applied_trade_ids)
+                .is_ok()
+        );
+        assert!(registry.pending_resolutions().is_empty());
+    }
+
+    #[rstest]
+    fn test_convert_hydrated_pending_failed_releases_after_void() {
+        let registry = live_registry();
+        let leg = taker_leg();
+        registry.note_order_submitted(leg.venue_order_id);
+        registry.hydrate_fill(&fill_with_status(&leg, Some(TRADE), Some("MATCHED")));
+        let applied_trade_ids = [leg.trade_id];
+
+        registry.request_convert_input_resolution(leg.instrument_id, &applied_trade_ids);
+        let actions =
+            registry.admit_rest_result(&trade(PolymarketTradeStatus::Failed, vec![leg.clone()]));
+        let fill = voided_fill(&actions).clone();
+
+        assert_eq!(voided_trade_ids(&actions), vec![leg.trade_id]);
+        assert!(registry.convert_input_evidence_pending(leg.instrument_id, &applied_trade_ids));
+        assert!(
+            registry
+                .ensure_convert_input_evidence(leg.instrument_id, &applied_trade_ids)
+                .is_err()
+        );
+
+        registry.observe_void_applied(&applied_void(&fill));
+
+        assert!(!registry.convert_input_evidence_pending(leg.instrument_id, &applied_trade_ids));
+        assert!(
+            registry
+                .ensure_convert_input_evidence(leg.instrument_id, &applied_trade_ids)
+                .is_err()
+        );
+        assert!(registry.pending_resolutions().is_empty());
+    }
+
+    #[rstest]
+    fn test_convert_hydrated_pending_retains_rejection_on_contradiction() {
+        let registry = live_registry();
+        let leg = taker_leg();
+        registry.note_order_submitted(leg.venue_order_id);
+        registry.hydrate_fill(&fill_with_status(&leg, Some(TRADE), Some("MATCHED")));
+        let instrument_id = leg.instrument_id;
+        let applied_trade_ids = [leg.trade_id];
+        let conflicting = AdmittedLeg {
+            last_px: Price::from("0.51"),
+            ..leg
+        };
+
+        assert!(registry.convert_input_evidence_pending(instrument_id, &applied_trade_ids));
+        registry.admit_rest_result(&trade(PolymarketTradeStatus::Confirmed, vec![conflicting]));
+
+        assert!(trade_hard_fault(&registry, TRADE).is_some());
+        assert!(registry.convert_input_evidence_pending(instrument_id, &applied_trade_ids));
+        assert!(
+            registry
+                .ensure_convert_input_evidence(instrument_id, &applied_trade_ids)
+                .is_err()
+        );
+        assert!(registry.pending_resolutions().is_empty());
+
+        registry.request_convert_input_resolution(instrument_id, &applied_trade_ids);
+        assert!(registry.pending_resolutions().is_empty());
     }
 
     #[rstest]

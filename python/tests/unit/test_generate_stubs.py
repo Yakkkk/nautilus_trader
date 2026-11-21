@@ -1994,6 +1994,7 @@ ADAPTER_CONFIG_SECRET_FIELDS = {
     "password",
     "passphrase",
     "private_key",
+    "relayer_api_key",
     "rpc_url",
     "session_key",
     "tardis_http_url",
@@ -2003,6 +2004,7 @@ ADAPTER_CONFIG_SECRET_FIELDS = {
 
 ADAPTER_CONFIG_READBACK_REPLACEMENTS = {
     "proxy_url": "has_proxy_url",
+    "relayer_api_key": "has_relayer_api_key",
     "submitter_proxy_urls": "has_submitter_proxy_urls",
     "canceller_proxy_urls": "has_canceller_proxy_urls",
 }

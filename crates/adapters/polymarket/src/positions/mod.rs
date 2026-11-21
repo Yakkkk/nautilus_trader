@@ -18,9 +18,10 @@
 pub mod amounts;
 pub mod calldata;
 
-pub(super) mod convert;
+pub(crate) mod convert;
 
-mod convert_abi;
+pub(crate) mod convert_abi;
+
 mod wallet;
 
 use std::{
@@ -512,34 +513,104 @@ impl PolymarketPositionClient {
         calls: &[PositionCall],
         metadata: &str,
     ) -> Result<PolymarketPositionTransaction> {
+        let submitted = self
+            .submit_calls_with_operation(None, calls, metadata)
+            .await
+            .map_err(WalletSubmitFailure::into_error)?;
+        let Some(transaction_id) = submitted.transaction_id else {
+            return Err(Error::decode(
+                "Relayer submit response omitted transaction_id; transaction outcome is unknown",
+            ));
+        };
+
+        Ok(PolymarketPositionTransaction {
+            relayer: self.relayer.clone(),
+            transaction_id,
+            wait_timeout: self.wait_timeout,
+            poll_interval: self.poll_interval,
+        })
+    }
+
+    /// Verifies the Deposit Wallet identity, No-token balances, and adapter approval for Convert.
+    pub(crate) async fn verify_convert_wallet(
+        &self,
+        token_ids: &[U256],
+        amount: U256,
+    ) -> Result<()> {
+        self.wallet
+            .verify(self.signer.address(), self.deposit_wallet)
+            .await?;
+        self.wallet
+            .verify_ctf_convert(self.deposit_wallet, token_ids, amount)
+            .await
+    }
+
+    /// Verifies the configured RPC chain and `finalized` block capability before signing.
+    pub(crate) async fn verify_convert_rpc(&self) -> Result<()> {
+        convert::verify_convert_rpc(&self.wallet).await
+    }
+
+    /// Submits the Convert call while retaining the operation identity in the shared wallet
+    /// reservation.
+    pub(crate) async fn submit_convert_call(
+        &self,
+        operation_id: UUID4,
+        call: PositionCall,
+        metadata: &str,
+    ) -> std::result::Result<SubmittedWalletBatch, WalletSubmitFailure> {
+        self.submit_calls_with_operation(Some(operation_id), std::slice::from_ref(&call), metadata)
+            .await
+    }
+
+    async fn submit_calls_with_operation(
+        &self,
+        operation_id: Option<UUID4>,
+        calls: &[PositionCall],
+        metadata: &str,
+    ) -> std::result::Result<SubmittedWalletBatch, WalletSubmitFailure> {
         let mut submission = self.submission.lock().await;
         if let Some(previous) = submission.as_ref() {
+            if let (Some(previous_operation), Some(operation_id)) =
+                (previous.operation_id, operation_id)
+                && previous_operation == operation_id
+            {
+                return Err(WalletSubmitFailure::blocked(Error::exchange(format!(
+                    "Convert operation {operation_id} already holds a Deposit Wallet submission \
+                     reservation",
+                ))));
+            }
+
             let Some(transaction_id) = previous.transaction_id.as_deref() else {
-                return Err(Error::exchange(
+                return Err(WalletSubmitFailure::blocked(Error::exchange(
                     "Previous Deposit Wallet submit outcome is unknown; reconcile it before further operations",
-                ));
+                )));
             };
 
-            let transaction = self.relayer.get_transaction(transaction_id).await?;
+            let transaction = self
+                .relayer
+                .get_transaction(transaction_id)
+                .await
+                .map_err(WalletSubmitFailure::blocked)?;
             if !transaction.state.is_terminal() {
-                return Err(Error::exchange(format!(
+                return Err(WalletSubmitFailure::blocked(Error::exchange(format!(
                     "Deposit Wallet transaction {transaction_id} is still pending"
-                )));
+                ))));
             }
         }
 
         let nonce = self
             .wallet
             .verify(self.signer.address(), self.deposit_wallet)
-            .await?;
+            .await
+            .map_err(WalletSubmitFailure::blocked)?;
         let now = U256::from(self.clock.get_time_ns().as_u64() / 1_000_000_000);
 
         if let Some(previous) = submission.as_ref()
             && nonce <= previous.nonce
         {
-            return Err(Error::exchange(
+            return Err(WalletSubmitFailure::blocked(Error::exchange(
                 "Deposit Wallet nonce has not advanced; reconcile the previous submission before further operations",
-            ));
+            )));
         }
 
         let deadline = now.saturating_add(U256::from(self.deadline_secs));
@@ -553,16 +624,14 @@ impl PolymarketPositionClient {
             })
             .collect();
 
-        let signature = self.signer.sign_deposit_wallet_batch(
-            self.deposit_wallet,
-            nonce,
-            deadline,
-            &wallet_calls,
-        )?;
+        let signature = self
+            .signer
+            .sign_deposit_wallet_batch(self.deposit_wallet, nonce, deadline, &wallet_calls)
+            .map_err(WalletSubmitFailure::blocked)?;
         *submission = Some(WalletSubmission {
             nonce,
             transaction_id: None,
-            operation_id: None,
+            operation_id,
         });
 
         for wallet_call in &wallet_calls {
@@ -575,7 +644,7 @@ impl PolymarketPositionClient {
             );
         }
 
-        let submitted = self
+        let submitted = match self
             .relayer
             .submit_wallet_batch(RelayerWalletSubmit {
                 signer: self.signer.address(),
@@ -586,26 +655,68 @@ impl PolymarketPositionClient {
                 metadata,
                 calls: &wallet_calls,
             })
-            .await?;
-
-        let Some(transaction_id) = submitted.transaction_id else {
-            return Err(Error::decode(
-                "Relayer submit response omitted transaction_id; transaction outcome is unknown",
-            ));
+            .await
+        {
+            Ok(submitted) => submitted,
+            Err(e) => return Err(WalletSubmitFailure::ambiguous(nonce, e)),
         };
 
         *submission = Some(WalletSubmission {
             nonce,
-            transaction_id: Some(transaction_id.clone()),
-            operation_id: None,
+            transaction_id: submitted.transaction_id.clone(),
+            operation_id,
         });
+        log::info!(
+            "Deposit Wallet submit response: wallet={:#x}, nonce={nonce}, transaction_id={:?}, transaction_hash={:?}, operation={metadata}",
+            self.deposit_wallet,
+            submitted.transaction_id,
+            submitted.transaction_hash,
+        );
 
-        Ok(PolymarketPositionTransaction {
-            relayer: self.relayer.clone(),
-            transaction_id,
-            wait_timeout: self.wait_timeout,
-            poll_interval: self.poll_interval,
+        Ok(SubmittedWalletBatch {
+            nonce,
+            transaction_id: submitted.transaction_id,
+            transaction_hash: submitted.transaction_hash,
         })
+    }
+}
+
+/// A signed Deposit Wallet batch accepted by the Relayer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SubmittedWalletBatch {
+    pub nonce: U256,
+    pub transaction_id: Option<String>,
+    pub transaction_hash: Option<String>,
+}
+
+/// A failed position or Convert submission.
+#[derive(Debug)]
+pub(crate) struct WalletSubmitFailure {
+    pub error: Error,
+    pub nonce: Option<U256>,
+    /// Whether a signed batch may have reached the Relayer.
+    pub ambiguous: bool,
+}
+
+impl WalletSubmitFailure {
+    fn blocked(error: Error) -> Self {
+        Self {
+            error,
+            nonce: None,
+            ambiguous: false,
+        }
+    }
+
+    fn ambiguous(nonce: U256, error: Error) -> Self {
+        Self {
+            error,
+            nonce: Some(nonce),
+            ambiguous: true,
+        }
+    }
+
+    fn into_error(self) -> Error {
+        self.error
     }
 }
 

@@ -46,7 +46,8 @@ use nautilus_common::{
     messages::execution::{
         BatchCancelOrders, CancelAllOrders, CancelOrder, ConvertTransaction, GenerateFillReports,
         GenerateOrderStatusReport, GenerateOrderStatusReports, GeneratePositionStatusReports,
-        ModifyOrder, QueryAccount, QueryConvert, QueryOrder, SubmitOrder, SubmitOrderList,
+        ModifyOrder, QueryAccount, QueryConvert, QueryOrder, SubmitConvert, SubmitOrder,
+        SubmitOrderList,
     },
     msgbus::TypedHandler,
 };
@@ -63,7 +64,7 @@ use nautilus_model::{
     identifiers::{
         AccountId, ClientId, ClientOrderId, InstrumentId, StrategyId, Venue, VenueOrderId,
     },
-    instruments::InstrumentAny,
+    instruments::{InstrumentAny, neg_risk::ConvertScope},
     orders::{Order, OrderAny},
     reports::{ExecutionMassStatus, FillReport, OrderStatusReport, PositionStatusReport},
     types::{AccountBalance, MarginBalance, Money, Price, Quantity},
@@ -442,6 +443,19 @@ impl ExecutionClient for PolymarketExecutionClient {
     fn query_order(&self, cmd: QueryOrder) -> anyhow::Result<()> {
         self.query_order_command(&cmd);
         Ok(())
+    }
+
+    fn submit_convert(&self, cmd: SubmitConvert, scope: ConvertScope) -> anyhow::Result<()> {
+        self.submit_convert_for_run(cmd, scope, None)
+    }
+
+    fn submit_convert_for_run(
+        &self,
+        cmd: SubmitConvert,
+        scope: ConvertScope,
+        run_id: Option<UUID4>,
+    ) -> anyhow::Result<()> {
+        self.submit_convert_command(&cmd, &scope, run_id)
     }
 
     fn query_convert(

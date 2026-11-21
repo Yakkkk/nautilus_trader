@@ -45,6 +45,7 @@ __all__ = [
     "PolymarketSignatureType",
     "PolymarketSignerType",
     "PolymarketUpDownEventSlugConfig",
+    "register_convert_event",
 ]
 
 fixup_module_names(globals(), __name__)

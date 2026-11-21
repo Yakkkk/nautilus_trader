@@ -70,7 +70,7 @@ sol! {
 
 /// Encodes the verified NegRisk collateral adapter `convertPositions` call.
 #[must_use]
-pub(super) fn encode_convert_positions(market_id: B256, index_set: U256, amount: U256) -> Bytes {
+pub(crate) fn encode_convert_positions(market_id: B256, index_set: U256, amount: U256) -> Bytes {
     Bytes::from(
         convertPositionsCall {
             marketId: market_id,

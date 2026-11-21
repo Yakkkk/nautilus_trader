@@ -118,6 +118,9 @@ rstest = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 toml = { workspace = true }
 
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+nautilus-infrastructure = { workspace = true, features = ["redis"] }
+
 [[bench]]
 name = "data"
 harness = false

@@ -35,7 +35,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     common::{
-        credential::{Credential, credential_env_vars, validate_env_override},
+        credential::{
+            Credential, credential_env_vars, relayer_credential_env_vars, validate_env_override,
+        },
         enums::{PolymarketSignatureType, PolymarketSignerType},
         retry::AUTO_LOAD_RETRY_JITTER_FRACTION,
         urls,
@@ -691,6 +693,12 @@ pub struct PolymarketExecutionClientConfig {
     /// Selects owner or delegated session signing.
     #[builder(default)]
     pub signer_type: PolymarketSignerType,
+    /// Falls back to the `POLYMARKET_RELAYER_API_KEY` environment variable.
+    pub relayer_api_key: Option<SecretString>,
+    /// Relayer API key signer address. Defaults to the CLOB signing address.
+    ///
+    /// Falls back to the `POLYMARKET_RELAYER_SIGNER_ADDRESS` environment variable.
+    pub relayer_signer_address: Option<String>,
     pub base_url_http: Option<String>,
     pub base_url_ws: Option<String>,
     pub base_url_data_api: Option<String>,
@@ -727,6 +735,7 @@ pub struct PolymarketExecutionClientConfig {
 nautilus_core::impl_pyo3_config_getters!(PolymarketExecutionClientConfig {
     account_id: AccountId,
     funder: Option<String>,
+    relayer_signer_address: Option<String>,
     signature_type: PolymarketSignatureType,
     signer_type: PolymarketSignerType,
     base_url_http: Option<String>,
@@ -762,6 +771,7 @@ impl PolymarketExecutionClientConfig {
     /// is invalid.
     pub fn validate(&self) -> anyhow::Result<()> {
         let (_, _, _, private_key_var, funder_var) = credential_env_vars();
+        let (relayer_key_var, relayer_address_var) = relayer_credential_env_vars();
         validate_clob_overrides(&self.api_key, &self.api_secret, &self.passphrase)?;
         validate_env_override(
             self.private_key.as_ref().map(SecretString::expose_secret),
@@ -769,6 +779,18 @@ impl PolymarketExecutionClientConfig {
             private_key_var,
         )?;
         validate_env_override(self.funder.as_deref(), "funder", funder_var)?;
+        validate_env_override(
+            self.relayer_api_key
+                .as_ref()
+                .map(SecretString::expose_secret),
+            "relayer_api_key",
+            relayer_key_var,
+        )?;
+        validate_env_override(
+            self.relayer_signer_address.as_deref(),
+            "relayer_signer_address",
+            relayer_address_var,
+        )?;
 
         if let Some(config) = &self.instrument_config {
             config.validate()?;

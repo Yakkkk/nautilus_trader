@@ -13,6 +13,8 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
+mod submit;
+
 use std::{
     cell::RefCell,
     collections::HashMap,
@@ -206,6 +208,20 @@ struct MockChain {
 }
 
 impl MockChain {
+    fn new(sample: Value, evidence: Evidence, finalized: bool) -> Self {
+        Self {
+            sample,
+            evidence,
+            finalized: AtomicBool::new(finalized),
+            relay_reads: AtomicUsize::new(0),
+            rpc_reads: AtomicUsize::new(0),
+            transaction_reads: AtomicUsize::new(0),
+            receipt_reads: AtomicUsize::new(0),
+            finalized_reads: AtomicUsize::new(0),
+            submits: AtomicUsize::new(0),
+        }
+    }
+
     fn transaction(&self) -> Value {
         let mut transaction = self.sample["transaction"].clone();
         let mut words: Vec<String> = serde_json::from_value(self.sample["input"].clone()).unwrap();
@@ -331,6 +347,34 @@ impl MockChain {
     }
 }
 
+fn event_mapping(sample: &Value, count: usize, fee_bps: u16) -> CtfNegRiskEvent {
+    let conditions = sample["conditions"].as_array().unwrap()[..count]
+        .iter()
+        .enumerate()
+        .map(|(index, row)| {
+            let condition_id = row[0].as_str().unwrap().parse::<B256>().unwrap();
+            let outcome = |token: &Value| {
+                let token_id = token.as_str().unwrap().parse::<B256>().unwrap();
+                let token_number = U256::from_be_bytes(token_id.0);
+                NegRiskOutcome {
+                    instrument_id: InstrumentId::from(format!(
+                        "{condition_id:#x}-{token_number}.POLYMARKET"
+                    )),
+                    token_id: token_id.0,
+                }
+            };
+            NegRiskCondition {
+                index: u8::try_from(index).unwrap(),
+                condition_id: condition_id.0,
+                yes: outcome(&row[1]),
+                no: outcome(&row[2]),
+            }
+        })
+        .collect();
+    let market_id = sample["market"].as_str().unwrap().parse::<B256>().unwrap();
+    CtfNegRiskEvent::new_checked(market_id.0, fee_bps, conditions).unwrap()
+}
+
 async fn rpc(State(chain): State<Arc<MockChain>>, Json(request): Json<Value>) -> Json<Value> {
     chain.rpc_reads.fetch_add(1, Ordering::Relaxed);
     let params = &request["params"];
@@ -440,7 +484,7 @@ async fn relayer(
     .into_response()
 }
 
-async fn submit(State(chain): State<Arc<MockChain>>) -> StatusCode {
+async fn reject_submit(State(chain): State<Arc<MockChain>>) -> StatusCode {
     chain.submits.fetch_add(1, Ordering::Relaxed);
     StatusCode::METHOD_NOT_ALLOWED
 }
@@ -458,21 +502,15 @@ struct Fixture {
 
 impl Fixture {
     async fn new(evidence: Evidence, relayer_id: bool, finalized: bool) -> Self {
-        let chain = Arc::new(MockChain {
-            sample: serde_json::from_str(SAMPLE).unwrap(),
+        let chain = Arc::new(MockChain::new(
+            serde_json::from_str(SAMPLE).unwrap(),
             evidence,
-            finalized: AtomicBool::new(finalized),
-            relay_reads: AtomicUsize::new(0),
-            rpc_reads: AtomicUsize::new(0),
-            transaction_reads: AtomicUsize::new(0),
-            receipt_reads: AtomicUsize::new(0),
-            finalized_reads: AtomicUsize::new(0),
-            submits: AtomicUsize::new(0),
-        });
+            finalized,
+        ));
         let router = Router::new()
             .route("/", post(rpc))
             .route("/transaction", get(relayer))
-            .route("/submit", post(submit))
+            .route("/submit", post(reject_submit))
             .with_state(chain.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
@@ -488,29 +526,13 @@ impl Fixture {
             client_id: *POLYMARKET_CLIENT_ID,
             ts_init: UnixNanos::default(),
         };
-        let conditions: Vec<_> = chain.sample["conditions"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .enumerate()
-            .map(|(index, row)| {
-                let condition = row[0].as_str().unwrap();
-                let outcome = |token: &Value| {
-                    let token_id = token.as_str().unwrap().parse::<B256>().unwrap();
-                    let symbol = format!("{condition}-{}", U256::from_be_bytes(token_id.0));
-                    NegRiskOutcome {
-                        instrument_id: InstrumentId::from(format!("{symbol}.POLYMARKET").as_str()),
-                        token_id: token_id.0,
-                    }
-                };
-                NegRiskCondition {
-                    index: u8::try_from(index).unwrap(),
-                    condition_id: condition.parse::<B256>().unwrap().0,
-                    yes: outcome(&row[1]),
-                    no: outcome(&row[2]),
-                }
-            })
-            .collect();
+        let fee_bps = if evidence == Evidence::NonZeroFee {
+            NONZERO_FEE_BPS
+        } else {
+            0
+        };
+        let mapping = event_mapping(&chain.sample, 11, fee_bps);
+        let conditions = mapping.conditions();
         let inputs: Vec<_> = conditions[1..10]
             .iter()
             .map(|item| item.no.instrument_id)
@@ -519,17 +541,6 @@ impl Fixture {
             conditions[0].yes.instrument_id,
             conditions[10].yes.instrument_id,
         ];
-        let market = chain.sample["market"]
-            .as_str()
-            .unwrap()
-            .parse::<B256>()
-            .unwrap();
-        let fee_bps = if evidence == Evidence::NonZeroFee {
-            NONZERO_FEE_BPS
-        } else {
-            0
-        };
-        let mapping = CtfNegRiskEvent::new_checked(market.0, fee_bps, conditions).unwrap();
         let scope = mapping.convert_scope(&inputs).unwrap();
         cache.borrow_mut().add_convert_event(mapping).unwrap();
         let mut request = SubmitConvert {
@@ -629,6 +640,7 @@ impl Fixture {
             .funder(WALLET.to_string())
             .signature_type(PolymarketSignatureType::Poly1271)
             .rpc_url(url.clone().into())
+            .base_url_http(url.clone())
             .base_url_relayer(url)
             .http_timeout_secs(1)
             .max_retries(max_retries)
